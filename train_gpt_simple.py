@@ -11,6 +11,7 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
+import subprocess
 from pathlib import Path
 
 import torch
@@ -18,6 +19,7 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
+import wandb
 
 
 ########################################
@@ -224,6 +226,10 @@ dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 # this code can be run equivalently with 1, 2, 4, or 8 gpus.
 assert 8 % dist.get_world_size() == 0
+# the competition targets 80GB H100s; cap the caching allocator so a run on H200s cannot exceed 80GB
+# (the CUDA context and NCCL buffers live outside the allocator, hence the headroom)
+max_alloc_bytes = float(os.environ.get("MAX_ALLOC_GIB", 72)) * 1024**3
+torch.cuda.set_per_process_memory_fraction(max_alloc_bytes / torch.cuda.get_device_properties(device).total_memory, device)
 
 # logging setup
 if dist.get_rank() == 0:
@@ -252,6 +258,20 @@ val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/finew
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
+
+# W&B: log to the team server (WANDB_BASE_URL is exported by run.sbatch)
+wandb_entity = os.environ.get("WANDB_ENTITY", "cerulean-labs")
+wandb_project = os.environ.get("WANDB_PROJECT", "midterm-nanogpt")
+try:
+    git_commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+except Exception:
+    git_commit = None
+
+def peak_mem_gib():
+    # max over ranks of the peak memory reserved by the caching allocator
+    peak = torch.tensor(torch.cuda.max_memory_reserved(device) / 1024**3, device=device)
+    dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+    return peak.item()
 
 
 num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
@@ -314,6 +334,20 @@ for _ in range(num_trials):
     #        Training and Validation       #
     ########################################
 
+    if dist.get_rank() == 0:
+        wandb.init(entity=wandb_entity, project=wandb_project, name=os.environ.get("WANDB_RUN_NAME"),
+                   config=dict(train_steps=train_steps, batch_size=batch_size, mbs=mbs,
+                               world_size=dist.get_world_size(), torch_version=torch.version.__version__,
+                               gpu=torch.cuda.get_device_name(device), git_commit=git_commit,
+                               slurm_job_id=os.environ.get("SLURM_JOB_ID"), logfile=logfile,
+                               max_alloc_gib=max_alloc_bytes / 1024**3,
+                               optimizers=[dict(type=type(opt).__name__, defaults={k: v for k, v in opt.defaults.items()
+                                                                                    if isinstance(v, (int, float, tuple))},
+                                                lrs=[g["initial_lr"] for g in opt.param_groups]) for opt in optimizers]))
+        wandb.define_metric("step")
+        wandb.define_metric("*", step_metric="step")
+    torch.cuda.reset_peak_memory_stats(device)
+
     train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
     for p in model.parameters():
         dist.broadcast(p.detach(), 0)
@@ -343,6 +377,10 @@ for _ in range(num_trials):
             val_loss /= val_tokens
             print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
                    + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+            peak_mem = peak_mem_gib()
+            if dist.get_rank() == 0:
+                wandb.log({"step": step, "val/loss": val_loss.item(), "train_time": training_time,
+                           "step_avg_ms": 1000 * step_avg, "peak_mem_reserved_gib": peak_mem})
             model.train()
             # start the clock again
             dist.barrier()
@@ -355,8 +393,11 @@ for _ in range(num_trials):
         inputs, targets = next(train_loader)
         # accumulate across microbatches in case we are running with fewer than 8 gpus
         assert len(inputs) % mbs == 0
+        train_loss = 0
         for i in range(len(inputs) // mbs):
-            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+            loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+            loss.backward()
+            train_loss += loss.detach()
         for name, p in model.named_parameters():
             assert p.grad is not None, name
             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
@@ -368,5 +409,19 @@ for _ in range(num_trials):
         approx_training_time = training_time + (time.perf_counter() - t0)
         print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
                + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+        dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
+        if dist.get_rank() == 0:
+            wandb.log({"step": step + 1, "train/loss": train_loss.item() / batch_size,
+                       "lr_scale": optimizers[0].param_groups[0]["lr"] / optimizers[0].param_groups[0]["initial_lr"]})
+
+    # summary metrics read by the leaderboard
+    peak_mem = peak_mem_gib()
+    print0(f"peak_mem_reserved:{peak_mem:.2f}GiB", console=True)
+    if dist.get_rank() == 0:
+        wandb.run.summary["total_train_steps"] = train_steps
+        wandb.run.summary["val_loss"] = val_loss.item()
+        wandb.run.summary["peak_mem_reserved_gib"] = peak_mem
+        wandb.save(logfile, policy="now")
+        wandb.finish()
 
 dist.destroy_process_group()
