@@ -16,8 +16,8 @@ source $HOME/.bashrc
 source ${VENV:-$HOME/training-nano-GPT-speed-run/.venv}/bin/activate
 cd $HOME/training-nano-GPT-speed-run  # the script globs data/fineweb10B relative to cwd
 
-# Log to the team W&B server: forge.coreweave.com/wandb/cerulean-labs/midterm-nanogpt
-export WANDB_BASE_URL=${WANDB_BASE_URL:-https://api.forge.coreweave.com}
+# Log to the team W&B server: flock.cerulean.works/cerulean-labs/midterm-nanogpt
+export WANDB_BASE_URL=${WANDB_BASE_URL:-https://flock-api.cerulean.works}
 export WANDB_ENTITY=${WANDB_ENTITY:-cerulean-labs}
 export WANDB_PROJECT=${WANDB_PROJECT:-midterm-nanogpt}
 
