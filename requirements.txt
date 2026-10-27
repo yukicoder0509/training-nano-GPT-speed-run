@@ -2,3 +2,4 @@ torch==2.11.*
 huggingface_hub
 wandb
 numpy
+matplotlib
