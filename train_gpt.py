@@ -1,7 +1,19 @@
 """
-train_gpt_clean.py
+train_gpt_tailema_2720.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
+
+SUBMISSION RECIPE (claim step 2720): the PR #321 clean stack, byte-identical
+through step 2000, plus ONE mechanism: a streaming exponential moving average
+of the non-embedding weights (time constant tau=150 steps, maintained from
+step 2000 -- >= 5*tau before the claim, so the init snapshot is forgotten),
+blended into the parameters once at the claimed step:
+    theta_2720 <- (1 - 0.6) * theta_2720 + 0.6 * EMA_150(theta)
+immediately before the step-2720 validation. This is Polyak-style tail
+averaging with a partial blend; lambda=0.6 trades EMA staleness bias against
+variance reduction. tau follows the schedule's local timescale
+(t_end - S)/p = (2900 - 2720)/1.2 = 150. The original PR #321 header
+follows.
 
 CLEAN / simplified SOTA optimizer for a PR. It is the exp307 SOTA baseline with the
 following components REMOVED (the now-dead code physically deleted for readability):
@@ -12,7 +24,6 @@ following components REMOVED (the now-dead code physically deleted for readabili
   - CenterShrinkAdam (replaced by a minimal bias-correction-free `Adam`, which is
     exactly CenterShrinkAdam at rho=1.0 -- NOT torch.optim.AdamW, which would add
     bias correction that CenterShrinkAdam does not have)
-  - Aurora
 
 This is functionally identical to running the source train_gpt_simple.py with
 CONTRA_COEFF=0, CIRCUIT_OFF=1, AUX_CENTER_SHRINK=1.0 and FINAL_SCHEDULE_STEPS=2900
@@ -57,14 +68,18 @@ args = parser.parse_args()
 SEED = args.seed
 # Hardcoded final schedule constants
 FINAL_TRAIN_STEPS = 2900
-# Cooldown horizon for the LR anneal. SOTA uses 2900.
-FINAL_SCHEDULE_STEPS = 2900   # t_end win (the +25-step SOTA lever; original public was 2960)
+# Cooldown horizon for the LR anneal. PR321 uses 2900; the hot-schedule
+# experiments extend it (e.g. 2950) so a 2730 claim sits mid-cooldown and the
+# tail-control pulses/readout do the final cooling. NOTE: this changes the
+# trajectory from ~step 560 (where PowerCool leaves the flat region), so
+# checkpoints are only valid for tails run at the SAME schedule horizon.
+FINAL_SCHEDULE_STEPS = int(os.environ.get("FINAL_SCHEDULE_STEPS", "2900"))
 FINAL_LR_POWER = 1.2
 ADAM_EMBED_POWER_C = 4.976805410800738e-05
 ADAM_PROJ_POWER_C = 5.184172302917436e-07
 ADAM_OTHER_POWER_C = 1.6589351369335795e-06
 MUON_POWER_C = 3.3169534699576625e-06
-EXPERIMENT_NAME = "clean-simplified-soaph"
+EXPERIMENT_NAME = "tail-ema-2720"
 EXPERIMENT_INTUITION = "SOTA SOAP-all_hidden (freq=1) + u/w-floor + radial scale + EMA-Nesterov, with Soft-Muon / Contra-Muon / Circuit-Muon / CenterShrink / Aurora removed."
 MU = 0.95
 MUON_LR = 0.0375
@@ -83,9 +98,85 @@ ATTN_TRUST_MIN_GRAD_ALIGN = 0.00
 ATTN_TRUST_POWER = 1.00
 TRAIN_PROGRESS_INTERVAL = 0
 LOG_DIR = Path("logs")
+SAVE_CHECKPOINT_STEP = int(os.environ.get("SAVE_CHECKPOINT_STEP", "-1"))
+SAVE_CHECKPOINT_PATH = os.environ.get("SAVE_CHECKPOINT_PATH", "")
+RESUME_CHECKPOINT_PATH = os.environ.get("RESUME_CHECKPOINT_PATH", "")
+TARGET_STEP = int(os.environ.get("TARGET_STEP", os.environ.get("STOP_STEP", str(min(2750, FINAL_TRAIN_STEPS)))))
 RADIAL_OUTWARD_SCALE = 0.5
 RADIAL_INWARD_SCALE = 1.0
 HEAD_DIM = 128
+# Default 0 = exact PR321 baseline. Screening found H5a neutral on this stack
+# (seed2 paired tails from the shared step-2000 checkpoint: 3.27969 vs 3.27972);
+# enable explicitly via env for further probes.
+MUON_HISTORY_STEPS = int(os.environ.get("MUON_HISTORY_STEPS", "0"))
+MUON_HISTORY_START_STEP = int(os.environ.get("MUON_HISTORY_START_STEP", "0"))
+MUON_HISTORY_BLEND = float(os.environ.get("MUON_HISTORY_BLEND", "0.25"))
+MUON_HISTORY_BLEND_LATE = float(os.environ.get("MUON_HISTORY_BLEND_LATE", "0.15"))
+MUON_HISTORY_BLEND_SWITCH_STEP = int(os.environ.get("MUON_HISTORY_BLEND_SWITCH_STEP", "2300"))
+MUON_HISTORY_LOOKAHEAD = float(os.environ.get("MUON_HISTORY_LOOKAHEAD", "1.0"))
+MUON_HISTORY_MIN_COS = float(os.environ.get("MUON_HISTORY_MIN_COS", "0.25"))
+MUON_HISTORY_MAX_DELTA = float(os.environ.get("MUON_HISTORY_MAX_DELTA", "0.25"))
+MUON_HISTORY_DECAY_START_STEP = int(os.environ.get("MUON_HISTORY_DECAY_START_STEP", "2300"))
+MUON_HISTORY_DECAY_END_STEP = int(os.environ.get(
+    "MUON_HISTORY_DECAY_END_STEP",
+    str(TARGET_STEP),
+))
+MUON_HISTORY_FINAL_BLEND_MULT = float(os.environ.get("MUON_HISTORY_FINAL_BLEND_MULT", "0.0"))
+MUON_HISTORY_DELTA_COS_SHRINK = bool(int(os.environ.get("MUON_HISTORY_DELTA_COS_SHRINK", "1")))
+MUON_HISTORY_DELTA_COS_MIN_SCALE = float(os.environ.get("MUON_HISTORY_DELTA_COS_MIN_SCALE", "0.0"))
+# Readout sweep: capture an anchor copy of the (nonembed) weights at ANCHOR_STEP,
+# then at every validation step in [SWEEP_MIN, SWEEP_MAX] also report val loss at
+# theta + alpha*(anchor - theta) for each alpha, reverting exactly afterwards.
+# One tail run yields the full (step x alpha) readout surface. Off by default.
+READOUT_ANCHOR_STEP = int(os.environ.get("READOUT_ANCHOR_STEP", "-1"))
+READOUT_SWEEP_ALPHAS = [float(a) for a in os.environ.get("READOUT_SWEEP_ALPHAS", "").split(",") if a.strip()]
+READOUT_SWEEP_MIN_STEP = int(os.environ.get("READOUT_SWEEP_MIN_STEP", "2700"))
+READOUT_SWEEP_MAX_STEP = int(os.environ.get("READOUT_SWEEP_MAX_STEP", "2800"))
+READOUT_SCOPE = os.environ.get("READOUT_SCOPE", "nonembed")
+# One-shot submission mode: permanently apply theta += alpha*(anchor - theta)
+# right before validation at APPLY_STEP, so the standard step:S val_loss line
+# is the official claim-step measurement (equivalent to the sweep's reading at
+# the same alpha; nothing after the claim step matters).
+READOUT_APPLY_STEP = int(os.environ.get("READOUT_APPLY_STEP", "-1"))
+READOUT_APPLY_ALPHA = float(os.environ.get("READOUT_APPLY_ALPHA", "0.0"))
+# TrailDelta momentum pulses (ported from the 2830 PR311 recipe): capture scoped
+# weights at START_STEP, then every INTERVAL steps pull back along the recent
+# weight delta (plus beta-momentum of previous pulse deltas). Off by default.
+TRAIL_DELTA_START_STEP = int(os.environ.get("TRAIL_DELTA_START_STEP", "-1"))
+TRAIL_DELTA_END_STEP = int(os.environ.get("TRAIL_DELTA_END_STEP", "-1"))
+TRAIL_DELTA_INTERVAL = int(os.environ.get("TRAIL_DELTA_INTERVAL", "100"))
+TRAIL_DELTA_GAMMA_FIRST = float(os.environ.get("TRAIL_DELTA_GAMMA_FIRST", "-0.04"))
+TRAIL_DELTA_GAMMA_FINAL = float(os.environ.get("TRAIL_DELTA_GAMMA_FINAL", "-0.12"))
+TRAIL_DELTA_MOMENTUM_BETA = float(os.environ.get("TRAIL_DELTA_MOMENTUM_BETA", "0.75"))
+TRAIL_DELTA_MAX_MOVE_RATIO = float(os.environ.get("TRAIL_DELTA_MAX_MOVE_RATIO", "0.0"))
+TRAIL_DELTA_SCOPE = os.environ.get("TRAIL_DELTA_SCOPE", "nonembed")
+# Streaming tail average (the principled unification of pulses + readout):
+# maintain EMA_tau of the weights from START_STEP, one buffer per tau; at each
+# validation step in the sweep window also report val loss at
+# theta_eval = (1-lambda)*theta + lambda*EMA_tau for every (tau, lambda),
+# reverting exactly afterwards. Polyak-style tail averaging; one tail run
+# yields the full (tau x lambda x step) surface. Off by default.
+TAIL_EMA_TAUS = [float(x) for x in os.environ.get("TAIL_EMA_TAUS", "150").split(",") if x.strip()]
+TAIL_EMA_START_STEP = int(os.environ.get("TAIL_EMA_START_STEP", "2000"))
+TAIL_EMA_LAMBDAS = [float(x) for x in os.environ.get("TAIL_EMA_LAMBDAS", "").split(",") if x.strip()]
+TAIL_EMA_SWEEP_MIN_STEP = int(os.environ.get("TAIL_EMA_SWEEP_MIN_STEP", "2700"))
+TAIL_EMA_SWEEP_MAX_STEP = int(os.environ.get("TAIL_EMA_SWEEP_MAX_STEP", "2745"))
+TAIL_EMA_SCOPE = os.environ.get("TAIL_EMA_SCOPE", "nonembed")
+# One-shot submission mode: permanently apply theta = (1-lambda)*theta +
+# lambda*EMA_tau right before validation at APPLY_STEP, so the standard
+# step:S val_loss line is the official claim-step measurement.
+TAIL_EMA_APPLY_STEP = int(os.environ.get("TAIL_EMA_APPLY_STEP", "2720"))
+TAIL_EMA_APPLY_TAU = float(os.environ.get("TAIL_EMA_APPLY_TAU", "150"))
+TAIL_EMA_APPLY_LAMBDA = float(os.environ.get("TAIL_EMA_APPLY_LAMBDA", "0.6"))
+
+def _param_in_scope(scope: str, name: str, p: Tensor) -> bool:
+    if scope == "all":
+        return True
+    if scope == "nonembed":
+        return name != "embed.weight"
+    if scope == "muon":
+        return name.startswith("blocks.") and p.ndim >= 2
+    raise RuntimeError(f"unsupported param scope: {scope}")
 
 
 ########################################
@@ -325,6 +416,62 @@ def norm_preserving_blend(raw: Tensor, soap: Tensor, gate: Tensor, eps: float = 
     blended_norm = gram_frobenius_norm_estimate(blended, eps=eps)
     return (blended * (raw_norm / blended_norm).to(blended.dtype)).to(raw.dtype)
 
+def _scheduled_muon_history_blend(step: int) -> float:
+    blend = MUON_HISTORY_BLEND
+    if MUON_HISTORY_BLEND_SWITCH_STEP > 0 and step >= MUON_HISTORY_BLEND_SWITCH_STEP:
+        blend = MUON_HISTORY_BLEND_LATE
+    if MUON_HISTORY_DECAY_END_STEP > MUON_HISTORY_DECAY_START_STEP and step >= MUON_HISTORY_DECAY_START_STEP:
+        progress = min(1.0, max(0.0, (step - MUON_HISTORY_DECAY_START_STEP) / (MUON_HISTORY_DECAY_END_STEP - MUON_HISTORY_DECAY_START_STEP)))
+        blend *= (1.0 - progress) + progress * MUON_HISTORY_FINAL_BLEND_MULT
+    return blend
+
+def apply_muon_history(update: Tensor, state: dict, step: int) -> Tensor:
+    # H5a: fit a short linear trend through recent pre-polar Muon directions,
+    # blend a clipped aligned forecast, then preserve the current direction norm.
+    history_steps = MUON_HISTORY_STEPS
+    if history_steps <= 0:
+        return update
+
+    if "muon_history_buffer" not in state:
+        state["muon_history_buffer"] = torch.zeros(
+            (history_steps, *update.shape), dtype=update.dtype, device=update.device
+        )
+    history = state["muon_history_buffer"]
+    current_g = update
+
+    if step >= MUON_HISTORY_START_STEP and step > history_steps:
+        cur_norm = current_g.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        history_blend = _scheduled_muon_history_blend(step)
+        if history_blend > 0.0:
+            num_points = history_steps + 1
+            x_mean = history_steps / 2.0
+            x_pred = history_steps + MUON_HISTORY_LOOKAHEAD
+            denom = sum((i - x_mean) ** 2 for i in range(num_points))
+            current_weight = 1.0 / num_points + (x_pred - x_mean) * (history_steps - x_mean) / denom
+            pred = current_g * current_weight
+            for i in range(history_steps):
+                weight = 1.0 / num_points + (x_pred - x_mean) * (i - x_mean) / denom
+                pred = pred + history[i].to(current_g.dtype) * weight
+
+            delta = pred - current_g
+            delta_norm = delta.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+            delta_cos = (delta.float() * current_g.float()).sum(dim=(-2, -1), keepdim=True) / (delta_norm * cur_norm)
+            delta_cap = MUON_HISTORY_MAX_DELTA * cur_norm
+            delta = delta * torch.minimum(torch.ones_like(delta_norm), delta_cap / delta_norm).to(delta.dtype)
+            delta_scale = torch.ones_like(delta_norm)
+            if MUON_HISTORY_DELTA_COS_SHRINK:
+                delta_scale = torch.clamp((1.0 + delta_cos) * 0.5, min=MUON_HISTORY_DELTA_COS_MIN_SCALE, max=1.0)
+            candidate = current_g + history_blend * delta_scale.to(delta.dtype) * delta
+            cand_norm = candidate.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+            cos = (candidate.float() * current_g.float()).sum(dim=(-2, -1), keepdim=True) / (cand_norm * cur_norm)
+            update = torch.where(cos >= MUON_HISTORY_MIN_COS, candidate, current_g)
+            update = update * (cur_norm / update.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)).to(update.dtype)
+
+    if history_steps > 1:
+        history[:-1].copy_(history[1:].clone())
+    history[history_steps - 1].copy_(current_g)
+    return update
+
 def scale_radial_update(update: Tensor, param: Tensor, eps: float = 1e-12) -> Tensor:
     update_f = update.float()
     param_f = param.float()
@@ -457,6 +604,7 @@ class Muon(torch.optim.Optimizer):
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
                             momentum_update = soap_precondition_momentum(momentum_update, state)
+                    momentum_update = apply_muon_history(momentum_update, state, self.step_count)
                     update = muon_update(momentum_update)
                     update = scale_radial_update(update, p)
                     # u/w-floor. SOAP and non-SOAP params can use different floors.
@@ -649,6 +797,10 @@ print0(f"Run UTC timestamp={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"
 print0(f"Using seed={SEED}")
 print0(f"Experiment={EXPERIMENT_NAME}")
 print0(f"Intuition={EXPERIMENT_INTUITION}")
+print0(f"Using save_checkpoint_step={SAVE_CHECKPOINT_STEP}")
+print0(f"Using save_checkpoint_path={SAVE_CHECKPOINT_PATH}")
+print0(f"Using resume_checkpoint_path={RESUME_CHECKPOINT_PATH}")
+print0(f"Using target_step={TARGET_STEP}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
 print0(f"Using mu={MU}")
@@ -668,6 +820,43 @@ print0(f"Using attn_trust_min_grad_align={ATTN_TRUST_MIN_GRAD_ALIGN}")
 print0(f"Using attn_trust_power={ATTN_TRUST_POWER}")
 print0(f"Using radial_outward_scale={RADIAL_OUTWARD_SCALE}")
 print0(f"Using radial_inward_scale={RADIAL_INWARD_SCALE}")
+print0(f"Using muon_history_steps={MUON_HISTORY_STEPS}")
+print0(f"Using muon_history_start_step={MUON_HISTORY_START_STEP}")
+print0(f"Using muon_history_blend={MUON_HISTORY_BLEND}")
+print0(f"Using muon_history_blend_late={MUON_HISTORY_BLEND_LATE}")
+print0(f"Using muon_history_blend_switch_step={MUON_HISTORY_BLEND_SWITCH_STEP}")
+print0(f"Using muon_history_lookahead={MUON_HISTORY_LOOKAHEAD}")
+print0(f"Using muon_history_min_cos={MUON_HISTORY_MIN_COS}")
+print0(f"Using muon_history_max_delta={MUON_HISTORY_MAX_DELTA}")
+print0(f"Using muon_history_decay_start_step={MUON_HISTORY_DECAY_START_STEP}")
+print0(f"Using muon_history_decay_end_step={MUON_HISTORY_DECAY_END_STEP}")
+print0(f"Using muon_history_final_blend_mult={MUON_HISTORY_FINAL_BLEND_MULT}")
+print0(f"Using muon_history_delta_cos_shrink={int(MUON_HISTORY_DELTA_COS_SHRINK)}")
+print0(f"Using muon_history_delta_cos_min_scale={MUON_HISTORY_DELTA_COS_MIN_SCALE}")
+print0(f"Using readout_anchor_step={READOUT_ANCHOR_STEP}")
+print0(f"Using readout_sweep_alphas={READOUT_SWEEP_ALPHAS}")
+print0(f"Using readout_sweep_min_step={READOUT_SWEEP_MIN_STEP}")
+print0(f"Using readout_sweep_max_step={READOUT_SWEEP_MAX_STEP}")
+print0(f"Using readout_scope={READOUT_SCOPE}")
+print0(f"Using readout_apply_step={READOUT_APPLY_STEP}")
+print0(f"Using readout_apply_alpha={READOUT_APPLY_ALPHA}")
+print0(f"Using trail_delta_start_step={TRAIL_DELTA_START_STEP}")
+print0(f"Using trail_delta_end_step={TRAIL_DELTA_END_STEP}")
+print0(f"Using trail_delta_interval={TRAIL_DELTA_INTERVAL}")
+print0(f"Using trail_delta_gamma_first={TRAIL_DELTA_GAMMA_FIRST}")
+print0(f"Using trail_delta_gamma_final={TRAIL_DELTA_GAMMA_FINAL}")
+print0(f"Using trail_delta_momentum_beta={TRAIL_DELTA_MOMENTUM_BETA}")
+print0(f"Using trail_delta_max_move_ratio={TRAIL_DELTA_MAX_MOVE_RATIO}")
+print0(f"Using trail_delta_scope={TRAIL_DELTA_SCOPE}")
+print0(f"Using tail_ema_taus={TAIL_EMA_TAUS}")
+print0(f"Using tail_ema_start_step={TAIL_EMA_START_STEP}")
+print0(f"Using tail_ema_lambdas={TAIL_EMA_LAMBDAS}")
+print0(f"Using tail_ema_sweep_min_step={TAIL_EMA_SWEEP_MIN_STEP}")
+print0(f"Using tail_ema_sweep_max_step={TAIL_EMA_SWEEP_MAX_STEP}")
+print0(f"Using tail_ema_scope={TAIL_EMA_SCOPE}")
+print0(f"Using tail_ema_apply_step={TAIL_EMA_APPLY_STEP}")
+print0(f"Using tail_ema_apply_tau={TAIL_EMA_APPLY_TAU}")
+print0(f"Using tail_ema_apply_lambda={TAIL_EMA_APPLY_LAMBDA}")
 print0("Dampened radial gradient component is applied before the u/w floor; post-step radius is corrected to remove tangent drift.")
 print0("="*100)
 
@@ -690,7 +879,7 @@ train_steps = FINAL_TRAIN_STEPS
 # Speed: stop the loop early (trajectory-preserving -- schedule constants stay at FINAL_TRAIN_STEPS,
 # so evals at steps <= STOP_STEP are IDENTICAL to the full run). Target boundary ~2775 only needs evals
 # up to ~2800-2850, so STOP_STEP=2850 saves the unused 2850-2900 tail. Default = full run.
-STOP_STEP = int(os.environ.get("STOP_STEP", FINAL_TRAIN_STEPS))   # default: full schedule; set env to early-stop
+STOP_STEP = int(os.environ.get("STOP_STEP", "2720"))   # stop right after the claimed-step validation
 val_regular_interval = 125
 extra_val_steps = {2700, 2705, 2710, 2715, 2720, 2725, 2730, 2735, 2740, 2745, 2750, 2755, 2760, 2765, 2770, 2775, 2780, 2785, 2790, 2795, 2800, 2805, 2810, 2820, 2830, 2840, 2850, 2860, 2870, 2880, 2890, 2895, 2900, 2910, 2920, 2930, 2940, 2950, 2960, 2965, 2970, 2975, 2980, 2985, 2990, 2995, 2999, 3000, 3010, 3020}
 
@@ -817,7 +1006,9 @@ _MU_MIN = 0.85
 _MU_MAX = 0.95
 _MU_WARMUP_STEPS = 300
 # Muon-momentum cooldown horizon (mu 0.95->0.85 over the last N steps).
-_MU_COOLDOWN_STEPS = 200   # tuned (mu-cooldown extended; original 100)
+# Keyed to FINAL_TRAIN_STEPS (cooldown starts 2700), NOT FINAL_SCHEDULE_STEPS —
+# extending the LR horizon does not move this; env knob for co-tuning probes.
+_MU_COOLDOWN_STEPS = int(os.environ.get("MU_COOLDOWN_STEPS", "200"))   # tuned (original 100)
 
 def _muon_mu_at_step(step, train_steps):
     cd_start = train_steps - _MU_COOLDOWN_STEPS
@@ -843,6 +1034,53 @@ def set_hparams(step):
         group["mu"] = mu
 
 
+def save_screening_checkpoint(path: str, step: int):
+    if not path:
+        return
+    if dist.get_world_size() != 1:
+        raise RuntimeError("SAVE_CHECKPOINT_PATH is a single-GPU screening hook; run with nproc_per_node=1.")
+    outer = optimizers[0]
+    ckpt = {
+        "step": step,
+        "model": model.state_dict(),
+        "outer_optimizer": outer.state_dict(),
+        "inner_optimizers": [opt.state_dict() for opt in outer.inner_optimizer],
+        "outer_attrs": {
+            "it": outer.it,
+            "lookahead_status": outer.lookahead_status,
+            "current_lookahead_stepsize": outer.current_lookahead_stepsize,
+        },
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all(),
+    }
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(ckpt, path_obj)
+    print0(f"saved_screening_checkpoint step:{step} path:{path_obj}", console=True)
+
+
+def load_screening_checkpoint(path: str) -> int:
+    if not path:
+        return 0
+    if dist.get_world_size() != 1:
+        raise RuntimeError("RESUME_CHECKPOINT_PATH is a single-GPU screening hook; run with nproc_per_node=1.")
+    ckpt = torch.load(path, map_location="cuda", weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    outer = optimizers[0]
+    outer.load_state_dict(ckpt["outer_optimizer"])
+    for opt, opt_state in zip(outer.inner_optimizer, ckpt["inner_optimizers"]):
+        opt.load_state_dict(opt_state)
+    outer_attrs = ckpt.get("outer_attrs", {})
+    outer.it = int(outer_attrs.get("it", outer.it))
+    outer.lookahead_status = bool(outer_attrs.get("lookahead_status", False))
+    outer.current_lookahead_stepsize = float(outer_attrs.get("current_lookahead_stepsize", 0.0))
+    torch.set_rng_state(ckpt["torch_rng_state"].cpu())
+    torch.cuda.set_rng_state_all([state.cpu() for state in ckpt["cuda_rng_state"]])
+    resume_step = int(ckpt["step"])
+    print0(f"loaded_screening_checkpoint step:{resume_step} path:{path}", console=True)
+    return resume_step
+
+
 
 
 ########################################
@@ -851,12 +1089,110 @@ def set_hparams(step):
 
 for p in model.parameters():
     dist.broadcast(p.detach(), 0)
+resume_step = load_screening_checkpoint(RESUME_CHECKPOINT_PATH)
+if resume_step > 0:
+    print0(f"advancing_train_loader_batches={resume_step}", console=True)
+    for _ in range(resume_step):
+        next(train_loader)
+def _run_val_loss():
+    # model must already be in eval mode
+    val_loss = 0
+    with torch.no_grad():
+        assert len(val_inputs) % mbs == 0
+        for i in range(len(val_inputs) // mbs):
+            val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+    dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+    return val_loss / val_tokens
+
+readout_scoped = [(n, p) for n, p in model.named_parameters()
+                  if torch.is_floating_point(p) and _param_in_scope(READOUT_SCOPE, n, p)]
+readout_anchor = None
+# Anchor restore for resumed tails: the in-loop capture fires only when the
+# loop crosses ANCHOR_STEP, which a tail starting at/after it never does. The
+# loaded weights at resume_step == ANCHOR_STEP ARE the anchor; resuming past
+# it without an anchor would silently disable the readout.
+if READOUT_ANCHOR_STEP > 0 and resume_step >= READOUT_ANCHOR_STEP:
+    assert resume_step == READOUT_ANCHOR_STEP, (
+        f"resume_step {resume_step} is past READOUT_ANCHOR_STEP {READOUT_ANCHOR_STEP}; "
+        "anchor weights are unavailable -- resume from a checkpoint at or before the anchor step"
+    )
+    readout_anchor = {n: p.detach().clone() for n, p in readout_scoped}
+    print0(f"readout anchor restored from resume checkpoint step:{resume_step}", console=True)
+trail_scoped = [(n, p) for n, p in model.named_parameters()
+                if torch.is_floating_point(p) and _param_in_scope(TRAIL_DELTA_SCOPE, n, p)]
+trail_delta_state = None
+trail_delta_momentum = None
+trail_delta_last_step = -1
+trail_delta_count = 0
+tail_ema_scoped = [(n, p) for n, p in model.named_parameters()
+                   if torch.is_floating_point(p) and _param_in_scope(TAIL_EMA_SCOPE, n, p)]
+tail_ema = None
+
+@torch.no_grad()
+def maybe_update_tail_ema(step: int):
+    global tail_ema
+    if not TAIL_EMA_TAUS or step < TAIL_EMA_START_STEP:
+        return
+    if tail_ema is None:
+        tail_ema = {tau: {n: p.detach().clone() for n, p in tail_ema_scoped}
+                    for tau in TAIL_EMA_TAUS}
+        print0(f"tail_ema initialized step:{step} taus:{TAIL_EMA_TAUS}", console=True)
+        return
+    for tau, bufs in tail_ema.items():
+        a = 1.0 / tau
+        for n, p in tail_ema_scoped:
+            bufs[n].lerp_(p.detach(), a)
+
+@torch.no_grad()
+def maybe_capture_readout_anchor(step: int):
+    global readout_anchor
+    if READOUT_ANCHOR_STEP > 0 and step == READOUT_ANCHOR_STEP and readout_anchor is None:
+        readout_anchor = {n: p.detach().clone() for n, p in readout_scoped}
+        print0(f"readout anchor captured step:{step} tensors:{len(readout_scoped)}", console=True)
+
+@torch.no_grad()
+def maybe_apply_trail_delta(step: int):
+    global trail_delta_state, trail_delta_momentum, trail_delta_last_step, trail_delta_count
+    if TRAIL_DELTA_START_STEP <= 0 or step < TRAIL_DELTA_START_STEP or step > TRAIL_DELTA_END_STEP:
+        return
+    if trail_delta_state is None:
+        trail_delta_state = {n: p.detach().clone() for n, p in trail_scoped}
+        trail_delta_last_step = step
+        print0(f"trail_delta captured step:{step} tensors:{len(trail_scoped)}", console=True)
+        return
+    if step - trail_delta_last_step < TRAIL_DELTA_INTERVAL:
+        return
+    gamma = TRAIL_DELTA_GAMMA_FIRST if trail_delta_count == 0 else TRAIL_DELTA_GAMMA_FINAL
+    if TRAIL_DELTA_MOMENTUM_BETA != 0.0 and trail_delta_momentum is None:
+        trail_delta_momentum = {n: torch.zeros_like(p.detach()) for n, p in trail_scoped}
+    moved_sq = torch.zeros((), device=device)
+    clipped_count = 0
+    for n, p in trail_scoped:
+        delta = p.detach() - trail_delta_state[n]
+        if TRAIL_DELTA_MOMENTUM_BETA != 0.0:
+            delta = delta + TRAIL_DELTA_MOMENTUM_BETA * trail_delta_momentum[n]
+            trail_delta_momentum[n] = delta.detach().clone()
+        move = delta * gamma
+        if TRAIL_DELTA_MAX_MOVE_RATIO > 0.0:
+            max_move = TRAIL_DELTA_MAX_MOVE_RATIO * p.detach().float().norm().clamp_min(1e-12)
+            move_norm = move.float().norm()
+            if move_norm > max_move:
+                move.mul_(max_move / (move_norm + 1e-12))
+                clipped_count += 1
+        p.add_(move.to(dtype=p.dtype))
+        moved_sq += move.float().square().sum()
+    trail_delta_state = {n: p.detach().clone() for n, p in trail_scoped}
+    trail_delta_last_step = step
+    trail_delta_count += 1
+    print0(f"trail_delta step:{step} gamma:{gamma:g} moved_norm:{moved_sq.sqrt().item():.6f}"
+           + f" clipped:{clipped_count}", console=True)
+
 # start the clock
 training_time = 0
 dist.barrier()
 t0 = time.perf_counter()
 H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None, config=dict(train_steps=train_steps))
-for step in range(train_steps + 1):
+for step in range(resume_step, train_steps + 1):
     H.start_step()
 
     # --------------- VALIDATION SECTION -----------------
@@ -866,25 +1202,66 @@ for step in range(train_steps + 1):
         or (step > 0 and step % val_regular_interval == 0)
         or step in extra_val_steps
     )
+    if (TAIL_EMA_APPLY_STEP > 0 and step == TAIL_EMA_APPLY_STEP
+            and TAIL_EMA_APPLY_LAMBDA != 0.0 and tail_ema is not None):
+        assert TAIL_EMA_APPLY_TAU in tail_ema, (
+            f"TAIL_EMA_APPLY_TAU {TAIL_EMA_APPLY_TAU} not among maintained taus {list(tail_ema)}"
+        )
+        with torch.no_grad():
+            for n, p in tail_ema_scoped:
+                p.lerp_(tail_ema[TAIL_EMA_APPLY_TAU][n], TAIL_EMA_APPLY_LAMBDA)
+        print0(f"tail_ema applied step:{step} tau:{TAIL_EMA_APPLY_TAU:g}"
+               + f" lambda:{TAIL_EMA_APPLY_LAMBDA:g} start_step:{TAIL_EMA_START_STEP}", console=True)
+
+    if (READOUT_APPLY_STEP > 0 and step == READOUT_APPLY_STEP
+            and READOUT_APPLY_ALPHA != 0.0 and readout_anchor is not None):
+        with torch.no_grad():
+            for n, p in readout_scoped:
+                p.lerp_(readout_anchor[n], READOUT_APPLY_ALPHA)
+        print0(f"readout applied step:{step} alpha:{READOUT_APPLY_ALPHA:g}"
+               + f" anchor_step:{READOUT_ANCHOR_STEP}", console=True)
+
     if should_validate:
         # stop the clock
         dist.barrier()
         training_time += time.perf_counter() - t0
         model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            assert len(val_inputs) % mbs == 0
-            for i in range(len(val_inputs) // mbs):
-                val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
-        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
-        val_loss /= val_tokens
+        val_loss = _run_val_loss()
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
                + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
+        if (readout_anchor is not None and READOUT_SWEEP_ALPHAS
+                and READOUT_SWEEP_MIN_STEP <= step <= READOUT_SWEEP_MAX_STEP):
+            with torch.no_grad():
+                pristine = {n: p.detach().clone() for n, p in readout_scoped}
+                for alpha in READOUT_SWEEP_ALPHAS:
+                    for n, p in readout_scoped:
+                        p.copy_(pristine[n].lerp(readout_anchor[n], alpha))
+                    r_loss = _run_val_loss()
+                    print0(f"readout step:{step} alpha:{alpha:g} val_loss:{r_loss:.5f}", console=True)
+                for n, p in readout_scoped:
+                    p.copy_(pristine[n])
+                del pristine
+        if (tail_ema is not None and TAIL_EMA_LAMBDAS
+                and TAIL_EMA_SWEEP_MIN_STEP <= step <= TAIL_EMA_SWEEP_MAX_STEP):
+            with torch.no_grad():
+                pristine = {n: p.detach().clone() for n, p in tail_ema_scoped}
+                for tau in TAIL_EMA_TAUS:
+                    for lam in TAIL_EMA_LAMBDAS:
+                        for n, p in tail_ema_scoped:
+                            p.copy_(pristine[n].lerp(tail_ema[tau][n], lam))
+                        t_loss = _run_val_loss()
+                        print0(f"tailavg step:{step} tau:{tau:g} lambda:{lam:g} val_loss:{t_loss:.5f}", console=True)
+                for n, p in tail_ema_scoped:
+                    p.copy_(pristine[n])
+                del pristine
         H.log_val(step, val_loss)
         model.train()
         # start the clock again
         dist.barrier()
         t0 = time.perf_counter()
+
+    if step == SAVE_CHECKPOINT_STEP:
+        save_screening_checkpoint(SAVE_CHECKPOINT_PATH, step)
 
     if step >= STOP_STEP:
         break
@@ -912,6 +1289,11 @@ for step in range(train_steps + 1):
         opt.step()
     H.after_step(step, train_loss / inputs.numel())
     model.zero_grad(set_to_none=True)
+    # step+1 keying matches the PR311 recipe: an anchor/pulse labeled S lands
+    # after the update of loop-step S-1, so validation at step S observes it.
+    maybe_capture_readout_anchor(step + 1)
+    maybe_apply_trail_delta(step + 1)
+    maybe_update_tail_ema(step + 1)
     if TRAIN_PROGRESS_INTERVAL > 0 and (step + 1) % TRAIN_PROGRESS_INTERVAL == 0:
         approx_training_time = training_time + (time.perf_counter() - t0)
         print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
