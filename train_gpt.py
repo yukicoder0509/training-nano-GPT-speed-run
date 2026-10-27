@@ -1,37 +1,19 @@
 """
-radial_scale_then_radius_correct.py
+train_gpt_circuit_muon.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
-It was prepared as a simplified version of the speedrun for use in neural net optimization research.
+Built directly on top of PR #309 (OscarYau525, EMA-Nesterov + Aurora @ 2890), the
+ONLY change is adding a Circuit-Muon coupling on the attention V <-> attn.proj
+pair: per-head partner-scalar post-whitening + trace-only gauge rebalance, applied
+inside a coupled pass that replaces the per-param round-robin for V and O. All
+other PR309 machinery (EMA-Nesterov, Aurora polar, Contra/Soft-Muon, SOAP for
+MLP+V, NorMuon-lite, radial scale, u/w-floor, rescale-to-radius) is unchanged.
 
----
-
-dampen radial gradient component
-
----
-
-This submission incorporates features from the following previous submissions
-
-@nilin PR291
-
-@kumarkrishna PR274 / Skylight-001
-  NorMuon-lite row/column variance normalization
-  u/w floor postprocessing
-  lr=0.0375 style Muon setup
-
-@nilin (me): PR275 / Contra-Muon
-  Introduces Contra-Muon update term
-
-@samacqua: PR278 / MLP SOAP preconditioning 
-  SOAP preconditioning machinery / MLP SOAP idea.
-  Our script uses that SOAP machinery and extends the selected SOAP set to MLP+V.
-
-@yash-oai: PR287 / power law LR schedule
-  Power-law LR schedule PowerCool:
-  min(flat_lr, c * (t_end - step)^1.2)
-  PR287-style cooldown constants / schedule tuning.
-
-The SOAP-like preconditioning from samacqua / PR 278 is also applied to the attention value-projection (V) matrices in this submission.
+PR309 itself incorporates:
+  @nilin    PR275 (Contra-Muon), PR291 (Contra-to-Soft interpolation)
+  @kumarkrishna PR274 / Skylight-001 (NorMuon-lite + u/w-floor + lr=0.0375)
+  @samacqua PR278 (SOAP preconditioning on MLP, extended here to V)
+  @yash-oai PR287 (PowerCool power-law LR schedule)
 """
 
 import os
@@ -71,8 +53,8 @@ ADAM_PROJ_POWER_C = 5.184172302917436e-07
 ADAM_OTHER_POWER_C = 1.6589351369335795e-06
 MUON_POWER_C = 3.3169534699576625e-06
 FINAL_MUON_WD = 0.025
-EXPERIMENT_NAME = "contra-muon-to-soft-muon"
-EXPERIMENT_INTUITION = "PR291 plus dampened radial gradient component before the u/w floor, followed by post-step radius correction for tangent drift."
+EXPERIMENT_NAME = "circuit-muon"
+EXPERIMENT_INTUITION = "PR309 (EMA-Nesterov + Aurora) plus Circuit-Muon on attn.v <-> attn.proj: per-head partner-scalar post-whitening (norm-preserving) + trace-only gauge rebalance."
 CONTRA_MUON_COEFF = -0.2
 SOFT_MUON_P = 0.1
 SOFT_MUON_SCALE = "none"
@@ -114,6 +96,13 @@ TRAIN_PROGRESS_INTERVAL = 0
 LOG_DIR = Path("logs")
 RADIAL_OUTWARD_SCALE = 0.5
 RADIAL_INWARD_SCALE = 1.0
+# Circuit-Muon (OV pair: attn.v <-> attn.proj). The damping sets the floor on the
+# per-head Gram-root scalar c^2 = ||W_h||_F^2 / hd. The chosen value 1e-3 keeps
+# s_partner = 1/sqrt(c^2 + lam) bounded at init (~32 with zero-init proj) while
+# preserving per-head anisotropy of s; it was selected from a sweep over
+# {1e-6, 1e-5, 1e-4, 1e-3, 1e-2} (1e-3 best mean@end, lowest std).
+HEAD_DIM = 128
+CIRCUIT_OV_DAMPING = 1e-3
 
 
 ########################################
@@ -600,6 +589,49 @@ def muon_update(update, second_moment, step, beta2=NOR_BETA2, use_contra=True, u
     update = update * (vnorm / vnorm_new)
     return update
 
+def circuit_muon(uV, uO, WV, WO, head_dim=HEAD_DIM, lam=CIRCUIT_OV_DAMPING):
+    """Circuit-Muon for one OV pair (attn.v, attn.proj).
+
+    Approximates each head's Gram root as isotropic C = c*I with c^2 = ||W_h||^2/hd,
+    so the partner inverse-Gram-root collapses to one Frobenius-norm scalar
+    s = 1/sqrt(c^2 + lam). Newton-Schulz msign is scale invariant, so the partner
+    pre-whiten cancels and only post-whitening + gauge rebalance remain:
+      (a) per-head post-whiten: delta_V *= s_O, delta_O *= s_V
+      (b) restore each leg's pre-scale Frobenius norm — preserves the per-head
+          anisotropy of s while letting PR309's u/w-floor + rescale-to-radius set
+          the absolute step magnitude downstream
+      (c) trace-only gauge: x_h = (<W_V, dV> - <W_O, dO>) / (||W_V||^2 + ||W_O||^2 + 2*hd*lam)
+          dV -= x_h * W_V,   dO += x_h * W_O   (per head; conserves the per-head
+          trace gap ||W_V_h||^2 - ||W_O_h||^2)
+
+    WV shape (n_heads*hd, dim) with heads on rows; WO shape (dim, n_heads*hd) with
+    heads on columns. uV/uO have matching shapes.
+    """
+    hd = head_dim
+    H = WV.size(0) // hd
+    WVh = WV.view(H, hd, WV.size(1)).float()             # (H, hd, dim)
+    WOh = WO.view(WO.size(0), H, hd).float()             # (dim, H, hd)
+    uVh = uV.view(H, hd, uV.size(1))
+    uOh = uO.view(uO.size(0), H, hd)
+    sqV = WVh.pow(2).sum(dim=(1, 2))                     # ||W_V_h||^2, (H,)
+    sqO = WOh.pow(2).sum(dim=(0, 2))                     # ||W_O_h||^2, (H,)
+    s_V = (sqV / hd + lam).clamp_min(1e-12).rsqrt()      # scalar C_V^-1, (H,)
+    s_O = (sqO / hd + lam).clamp_min(1e-12).rsqrt()      # scalar C_O^-1, (H,)
+    # (a)+(b): partner post-whiten then renorm to pre-scale Frobenius norm
+    nV, nO = uVh.float().norm(), uOh.float().norm()
+    uVh = uVh * s_O[:, None, None].to(uVh.dtype)
+    uOh = uOh * s_V[None, :, None].to(uOh.dtype)
+    uVh = uVh * (nV / uVh.float().norm().clamp_min(1e-12)).to(uVh.dtype)
+    uOh = uOh * (nO / uOh.float().norm().clamp_min(1e-12)).to(uOh.dtype)
+    # (c): trace-only gauge rebalance, per head
+    aV = (WVh * uVh.float()).sum(dim=(1, 2))             # <W_V_h, dV_h>
+    aO = (WOh * uOh.float()).sum(dim=(0, 2))             # <W_O_h, dO_h>
+    x = (aV - aO) / (sqV + sqO + 2.0 * hd * lam).clamp_min(1e-12)
+    uVh = uVh - x[:, None, None].to(uVh.dtype) * WVh.to(uVh.dtype)
+    uOh = uOh + x[None, :, None].to(uOh.dtype) * WOh.to(uOh.dtype)
+    return uVh.reshape_as(uV), uOh.reshape_as(uO)
+
+
 class Muon(torch.optim.Optimizer):
     def __init__(self, named_params, lr=0.02, weight_decay=0, mu=0.95):
         assert isinstance(named_params, list) and len(named_params) >= 1
@@ -611,15 +643,115 @@ class Muon(torch.optim.Optimizer):
         self.no_soft_params = {p for n, p in named_params if param_matches_spec(n, NO_SOFTMUON_PARAM)}
         self.step_count = 0
         params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
+        # Circuit-Muon: pair each attn.v with its block's attn.proj for a coupled
+        # update; these params are processed in _circuit_muon_step and skipped in
+        # the main round-robin below.
+        by_name = dict(named_params)
+        self.ov_pairs = []
+        self.ov_params = set()
+        for n, p in named_params:
+            if n.endswith(".attn.v.weight"):
+                o = by_name.get(n[:-len(".attn.v.weight")] + ".attn.proj.weight")
+                if o is not None:
+                    self.ov_pairs.append((p, o))
+                    self.ov_params.update({p, o})
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         super().__init__(params, defaults)
+
+    def _ensure_state(self, p):
+        state = self.state[p]
+        if len(state) == 0:
+            state["momentum"] = torch.zeros_like(p)
+            if p in self.soap_params:
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                state["row_gg"] = torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device)
+                state["col_gg"] = torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device)
+                state["q_row"] = None
+                state["q_col"] = None
+                state["soap_step"] = 0
+            if p.size(-2) >= p.size(-1):
+                state["second_moment"] = torch.zeros((*p.shape[:-1], 1),
+                    dtype=torch.float32, device=p.device)
+            else:
+                state["second_moment"] = torch.zeros((*p.shape[:-2], 1, p.shape[-1]),
+                    dtype=torch.float32, device=p.device)
+
+    def _direction(self, p, group):
+        """Momentum -> SOAP -> muon_update; returns the raw (pre-radial) update.
+        Mirrors the per-param body in step() — used by _circuit_muon_step so the
+        coupled V/O update goes through exactly the same direction pipeline."""
+        state = self.state[p]
+        grad = p.grad
+        state["momentum"].lerp_(grad, 1 - group["mu"])
+        momentum_update = grad.lerp(state["momentum"], group["mu"])
+        is_attn_soap = p in self.attn_soap_params
+        use_soap = p in self.soap_params
+        if use_soap and SOAP_UPDATE_BEFORE_USE:
+            soap_update_preconditioner(grad, state)
+        if use_soap:
+            if is_attn_soap:
+                soap_blend = V_SOAP_BLEND if p in self.v_params else ATTN_SOAP_BLEND
+                if p in self.v_params and V_SOAP_BLEND_RAMP_END_STEP > 0:
+                    soap_blend *= _linear_ramp(self.step_count, 0, V_SOAP_BLEND_RAMP_END_STEP)
+                soap_update = soap_precondition_momentum(
+                    momentum_update, state, blend=soap_blend,
+                    denom_floor_ratio=ATTN_SOAP_DENOM_FLOOR
+                )
+                if p in self.attn_proj_soap_params:
+                    gate = bounded_trust_gate(
+                        trust_gate(momentum_update, soap_update, grad),
+                        self.step_count
+                    )
+                else:
+                    gate = torch.ones((), dtype=torch.float32, device=p.device)
+                gate = gate * attention_soap_blend_for_step(self.step_count)
+                momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
+            else:
+                momentum_update = soap_precondition_momentum(momentum_update, state, blend=SOAP_BLEND)
+        return muon_update(
+            momentum_update,
+            state["second_moment"],
+            self.step_count,
+            use_contra=p not in self.no_contra_params,
+            use_soft=p not in self.no_soft_params,
+        )
+
+    def _finish(self, p, group, update):
+        """Radial scale -> u/w floor -> apply -> radius correction -> SOAP refresh."""
+        use_soap = p in self.soap_params
+        update = scale_radial_update(update, p)
+        p_fro = p.float().norm().clamp_min(1e-8)
+        u_fro = update.float().norm().clamp_min(1e-8)
+        cur_uw = u_fro / p_fro
+        target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
+        scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
+        update = update * scale.to(update.dtype)
+        target_radius = target_radius_after_update(p, update, group["lr"])
+        p.add_(update, alpha=-group["lr"])
+        rescale_to_radius(p, target_radius)
+        if use_soap and not SOAP_UPDATE_BEFORE_USE:
+            soap_update_preconditioner(p.grad, self.state[p])
+
+    @torch.no_grad()
+    def _circuit_muon_step(self, group):
+        """Circuit-Muon coupled update for each (attn.v, attn.proj) pair.
+        Computed redundantly on every rank — params are replicated and grads are
+        all-reduced, so the two legs stay in sync without a separate all_gather."""
+        for v, o in self.ov_pairs:
+            self._ensure_state(v); self._ensure_state(o)
+            uV = self._direction(v, group)
+            uO = self._direction(o, group)
+            uV, uO = circuit_muon(uV, uO, v.data, o.data)
+            self._finish(v, group, uV)
+            self._finish(o, group, uO)
 
     @torch.no_grad()
     def step(self):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         for group in self.param_groups:
-            params = group["params"]
+            self._circuit_muon_step(group)   # coupled update for OV pairs
+            params = [p for p in group["params"] if p not in self.ov_params]   # skip them below
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
             for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
@@ -874,7 +1006,9 @@ print0(f"Using no_contra_param={NO_CONTRA_PARAM}")
 print0(f"Using no_softmuon_param={NO_SOFTMUON_PARAM}")
 print0(f"Using radial_outward_scale={RADIAL_OUTWARD_SCALE}")
 print0(f"Using radial_inward_scale={RADIAL_INWARD_SCALE}")
+print0(f"Using circuit_ov_damping={CIRCUIT_OV_DAMPING}  head_dim={HEAD_DIM}")
 print0("Dampened radial gradient component is applied before the u/w floor; post-step radius is corrected to remove tangent drift.")
+print0("Circuit-Muon couples each attn.v <-> attn.proj pair: per-head partner-scalar post-whitening (norm-preserving) + trace-only gauge rebalance.")
 print0("="*100)
 
 val_tokens = 20 * 524288
@@ -1058,4 +1192,5 @@ for step in range(train_steps + 1):
 
 H.finish()
 dist.destroy_process_group()
+
 
