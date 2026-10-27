@@ -1,26 +1,45 @@
 """
-idea_10e_attnproj_bounded_trust_floor_soapish.py
+contra-muon-to-soft-muon.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
 It was prepared as a simplified version of the speedrun for use in neural net optimization research.
 
-Contra Muon (https://github.com/nilin/contra-muon):
-Newton-Schulz momentum update subtracts CONTRA_MUON / 2 times the operator-normalized
-momentum gradient before the PR 274 NorMuon-lite row/column variance normalization and
-u/w-floor postprocessing. Here CONTRA_MUON=0.4, so the subtracted component is 0.2 times
-the normalized gradient.
+---
 
-This prototype keeps PR 278 MLP SOAP unchanged. For attention-output SOAP, it
-keeps the tail-cap from step 0, then blends SOAP with raw momentum using a
-geometric trust gate. Unlike idea 10c, it gives attention SOAP a bounded early
-floor and cap: enough SOAP to recover some fast-start benefit, never enough to
-let full whitening dominate the trajectory.
+Contra-Muon-to-Soft-Muon.
+
+Start with contra-muon for diversity/exploration, interpolate through standard muon to soft-muon for exploitation
+https://web.archive.org/web/20260505070142/https://nilin.github.io/contra-muon-and-soft-muon/
+
+---
+
+This submission incorporates features from the following previous submissions
+
+@kumarkrishna PR274 / Skylight-001
+  NorMuon-lite row/column variance normalization
+  u/w floor postprocessing
+  lr=0.0375 style Muon setup
+
+@nilin (me): PR275 / Contra-Muon
+  Introduces Contra-Muon update term
+
+@samacqua: PR278 / MLP SOAP preconditioning 
+  SOAP preconditioning machinery / MLP SOAP idea.
+  Our script uses that SOAP machinery and extends the selected SOAP set to MLP+V.
+
+@yash-oai: PR287 / power law LR schedule
+  Power-law LR schedule PowerCool:
+  min(flat_lr, c * (t_end - step)^1.2)
+  PR287-style cooldown constants / schedule tuning.
+
+The SOAP-like preconditioning from samacqua / PR 278 is also applied to the attention value-projection (V) matrices in this submission.
 """
 
 import os
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
+import argparse
 import uuid
 import time
 from pathlib import Path
@@ -37,49 +56,61 @@ import harness
 # enabled and only remove the cuDNN backend from consideration.
 torch.backends.cuda.enable_cudnn_sdp(False)
 
-SEED = int(os.environ.get("SEED", "0"))
-EXPERIMENT_NAME = "idea_10e_attnproj_bounded_trust_floor_soapish"
-EXPERIMENT_INTUITION = "Tail-cap attention SOAP from step 0, with a bounded early trust floor to regain speed without the full-SOAP bad path."
-CONTRA_MUON = 0.4
+parser = argparse.ArgumentParser()
+parser.add_argument("--seed", type=int, default=0)
+args = parser.parse_args()
+
+SEED = args.seed
+# Hardcoded final schedule constants
+FINAL_TRAIN_STEPS = 3040
+FINAL_SCHEDULE_STEPS = 3105
+FINAL_LR_POWER = 1.2
+ADAM_EMBED_POWER_C = 4.976805410800738e-05
+ADAM_PROJ_POWER_C = 5.184172302917436e-07
+ADAM_OTHER_POWER_C = 1.6589351369335795e-06
+MUON_POWER_C = 3.3169534699576625e-06
+FINAL_MUON_WD = 0.025
+EXPERIMENT_NAME = "contra-muon-to-soft-muon"
+EXPERIMENT_INTUITION = "Interpolate Muon update from Contra Muon to normal Muon, then from normal Muon to p=0.1 soft Muon."
+CONTRA_MUON_COEFF = -0.2
+SOFT_MUON_P = 0.1
+SOFT_MUON_SCALE = "none"
+SOFT_MUON_INPUT_NORM = "frobenius_schatten4"
+SOFT_MUON_CEIL = 0.80
+CONTRA_HOLD_END_STEP = 0
+CONTRA_TO_NORMAL_END_STEP = 2000
+NORMAL_TO_SOFT_START_STEP = 2500
+NORMAL_TO_SOFT_END_STEP = 3010
 MU = 0.95
 MUON_LR = 0.0375
-MUON_WEIGHT_DECAY = 0.025
-TARGET_UW = 0.35
+MUON_WEIGHT_DECAY = FINAL_MUON_WD
+TARGET_UW = 0.3825
+SOAP_TARGET_UW = TARGET_UW
+NONSOAP_TARGET_UW = TARGET_UW
 NOR_BETA2 = 0.95
 SOAP_BETA2 = 0.90
 SOAP_PRECONDITION_FREQUENCY = 10
 SOAP_DENOM_POWER = 0.50
 SOAP_BLEND = 1.00
 SOAP_UPDATE_BEFORE_USE = False
-SOAP_PARAM_MODE = "mlp_plus_attn_proj"
-ATTN_SOAP_DENOM_FLOOR = float(os.environ.get("ATTN_SOAP_DENOM_FLOOR", "0.20"))
-ATTN_EARLY_TRUST_FLOOR = float(os.environ.get("ATTN_EARLY_TRUST_FLOOR", "0.45"))
-ATTN_EARLY_TRUST_CAP = float(os.environ.get("ATTN_EARLY_TRUST_CAP", "0.85"))
-ATTN_TRUST_FLOOR_END_STEP = int(os.environ.get("ATTN_TRUST_FLOOR_END_STEP", "1375"))
-ATTN_TRUST_FLOOR_FADE_END_STEP = int(os.environ.get("ATTN_TRUST_FLOOR_FADE_END_STEP", "1625"))
-ATTN_TRUST_MIN_AGREE = float(os.environ.get("ATTN_TRUST_MIN_AGREE", "0.20"))
-ATTN_TRUST_MIN_GRAD_ALIGN = float(os.environ.get("ATTN_TRUST_MIN_GRAD_ALIGN", "0.00"))
-ATTN_TRUST_POWER = float(os.environ.get("ATTN_TRUST_POWER", "1.00"))
-
-# Exploratory compute-saving screen. Disable for official evidence runs because
-# the benchmark rules disallow per-run early stopping based on val loss.
-EARLY_STOP = os.environ.get("EARLY_STOP", "0") == "1"
-EARLY_STOP_CATASTROPHIC_STEPS = int(os.environ.get("EARLY_STOP_CATASTROPHIC_STEPS", "125"))
-EARLY_STOP_CATASTROPHIC_MARGIN = float(os.environ.get("EARLY_STOP_CATASTROPHIC_MARGIN", "0.50"))
-EARLY_STOP_GRACE_STEPS = int(os.environ.get("EARLY_STOP_GRACE_STEPS", "1000"))
-EARLY_STOP_MARGIN = float(os.environ.get("EARLY_STOP_MARGIN", "0.03"))
-EARLY_STOP_PATIENCE = int(os.environ.get("EARLY_STOP_PATIENCE", "2"))
-TARGET_VAL_LOSS = float(os.environ.get("TARGET_VAL_LOSS", "0"))
-TRAIN_PROGRESS_INTERVAL = int(os.environ.get("TRAIN_PROGRESS_INTERVAL", "0"))
-SOTA_VAL_BY_STEP = {
-    125: 4.51874, 250: 4.05652, 375: 3.90008, 500: 3.81916,
-    625: 3.76341, 750: 3.72655, 875: 3.69846, 1000: 3.66557,
-    1125: 3.63985, 1250: 3.60786, 1375: 3.58225, 1500: 3.54816,
-    1625: 3.52684, 1750: 3.49950, 1875: 3.47572, 2000: 3.45172,
-    2125: 3.42949, 2250: 3.40805, 2375: 3.38724, 2500: 3.36632,
-    2625: 3.34535, 2750: 3.32580, 2875: 3.30741, 3000: 3.29107,
-    3100: 3.28049, 3125: 3.27861, 3150: 3.27720, 3175: 3.27659,
-}
+SOAP_PARAM_MODE = "mlp_plus_v"
+ATTN_SOAP_DENOM_FLOOR = 0.55
+ATTN_SOAP_BLEND = 1.00
+V_SOAP_BLEND = 0.95
+V_SOAP_BLEND_RAMP_END_STEP = 0
+ATTN_EARLY_TRUST_FLOOR = 0.45
+ATTN_EARLY_TRUST_CAP = 0.85
+ATTN_TRUST_FLOOR_END_STEP = 1375
+ATTN_TRUST_FLOOR_FADE_END_STEP = 1625
+ATTN_TRUST_MIN_AGREE = 0.20
+ATTN_TRUST_MIN_GRAD_ALIGN = 0.00
+ATTN_TRUST_POWER = 1.00
+ATTN_SOAP_FADE_START_STEP = 1000000000
+ATTN_SOAP_FADE_END_STEP = 1000000000
+NO_CONTRA_PARAM = ""
+NO_SOFTMUON_PARAM = ""
+TRAIN_PROGRESS_INTERVAL = 0
+LOG_DIR = Path("experiment-logs/all-runs/2026-05-09/validation-ceil-0.8")
 
 
 ########################################
@@ -227,14 +258,20 @@ class GPT(nn.Module):
 #              Optimizer               #
 ########################################
 
+def gram_frobenius_norm_estimate(G: Tensor, keepdim: bool = False, eps: float = 1e-10) -> Tensor:
+    X = G.float()
+    gram = X.mT @ X if X.size(-2) > X.size(-1) else X @ X.mT
+    return gram.norm(dim=(-2, -1), keepdim=keepdim).sqrt().clamp_min(eps)
+
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     assert G.ndim >= 2
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Use the Gram-Frobenius estimate sqrt(||X X^T||_F) instead of direct
+    # Frobenius norm or power iteration.
+    X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
     # Perform the NS iterations, not optimizing for wallclock speed
     a, b, c = 2, -1.5, 0.5
     for _ in range(12):
@@ -246,17 +283,62 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
+def _soft_coefficients(p: float) -> tuple[float, tuple[float, ...]]:
+    if p == 0.0:
+        return 1.0, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if p == 0.1:
+        return 0.0, (0.1091613623, 0.07085664498, 0.05210528973, 0.05457295795, 0.05011334061, 0.03334622198, 0.05022104481, 0.1053727358, 0.1187323776, 0.1185061091, 0.1185059576, 0.1185059576)
+    raise ValueError(f"unsupported soft-muon singular-value power: {p}")
+
+def zeropower_frobenius_norm_like(G: Tensor) -> float:
+    return (G.numel() / max(G.size(-2), G.size(-1)))**0.5
+
+def soft_via_newtonschulz5(G: Tensor, p: float, scale_mode: str, input_norm: str) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    if input_norm == "frobenius_schatten4":
+        X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
+    elif input_norm != "frobenius":
+        raise ValueError(f"unsupported soft_muon input_norm: {input_norm}")
+    else:
+        X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
+    constant, coeffs = _soft_coefficients(p)
+
+    a, b, c = 2, -1.5, 0.5
+    basis = [X]
+    for _ in range(len(coeffs)):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+        basis.append(X)
+
+    out = constant * basis[-1]
+    for coeff, basis_term in zip(coeffs, basis[:-1]):
+        out = out + coeff * basis_term
+
+    value_at_one = constant + sum(coeffs)
+    if scale_mode == "top":
+        out = out / value_at_one
+    elif scale_mode == "top_sqrt":
+        out = out / value_at_one**0.5
+    elif scale_mode == "frobenius":
+        theoretical_opower_norm = zeropower_frobenius_norm_like(out)
+        out = out * theoretical_opower_norm / gram_frobenius_norm_estimate(out)
+    elif scale_mode == "frobenius_sqrt":
+        theoretical_opower_norm = zeropower_frobenius_norm_like(out)
+        out = out * (theoretical_opower_norm / gram_frobenius_norm_estimate(out))**0.5
+    elif scale_mode != "none":
+        raise ValueError(f"unsupported soft_muon scale: {scale_mode}")
+
+    if G.size(-2) > G.size(-1):
+        out = out.mT
+    return out
+
 def scale_to_unit_operator_norm(G: Tensor, eps: float = 1e-10) -> Tensor:
-    X = G.float()
-    v = torch.ones(X.size(-1), dtype=X.dtype, device=X.device)
-    v = v / torch.clamp(v.norm(), min=eps)
-    for _ in range(5):
-        u = X @ v
-        u = u / torch.clamp(u.norm(), min=eps)
-        v = X.mT @ u
-        v = v / torch.clamp(v.norm(), min=eps)
-    op_norm = torch.clamp((X @ v).norm(), min=eps)
-    return G / op_norm.to(G.dtype)
+    return G / gram_frobenius_norm_estimate(G, eps=eps).to(G.dtype)
 
 def should_soap_param(name: str) -> bool:
     is_mlp_fc = name.endswith(".mlp.fc.weight")
@@ -267,6 +349,9 @@ def should_soap_param(name: str) -> bool:
         or name.endswith(".attn.k.weight")
         or name.endswith(".attn.v.weight")
     )
+    is_q = name.endswith(".attn.q.weight")
+    is_k = name.endswith(".attn.k.weight")
+    is_v = name.endswith(".attn.v.weight")
     if SOAP_PARAM_MODE == "mlp_all":
         return is_mlp_fc or is_mlp_proj
     if SOAP_PARAM_MODE == "mlp_fc":
@@ -275,6 +360,12 @@ def should_soap_param(name: str) -> bool:
         return is_mlp_proj
     if SOAP_PARAM_MODE == "mlp_plus_attn_proj":
         return is_mlp_fc or is_mlp_proj or is_attn_proj
+    if SOAP_PARAM_MODE == "mlp_plus_q":
+        return is_mlp_fc or is_mlp_proj or is_q
+    if SOAP_PARAM_MODE == "mlp_plus_k":
+        return is_mlp_fc or is_mlp_proj or is_k
+    if SOAP_PARAM_MODE == "mlp_plus_v":
+        return is_mlp_fc or is_mlp_proj or is_v
     if SOAP_PARAM_MODE == "mlp_plus_qkv":
         return is_mlp_fc or is_mlp_proj or is_qkv
     if SOAP_PARAM_MODE == "all_hidden":
@@ -283,6 +374,26 @@ def should_soap_param(name: str) -> bool:
 
 def is_attn_proj_param(name: str) -> bool:
     return name.endswith(".attn.proj.weight")
+
+def is_attn_param(name: str) -> bool:
+    return (
+        name.endswith(".attn.q.weight")
+        or name.endswith(".attn.k.weight")
+        or name.endswith(".attn.v.weight")
+        or name.endswith(".attn.proj.weight")
+    )
+
+def is_v_param(name: str) -> bool:
+    return name.endswith(".attn.v.weight")
+
+def param_matches_spec(name: str, spec: str) -> bool:
+    keys = {part.strip() for part in spec.split(",") if part.strip()}
+    return (
+        ("q" in keys and name.endswith(".attn.q.weight"))
+        or ("k" in keys and name.endswith(".attn.k.weight"))
+        or ("v" in keys and name.endswith(".attn.v.weight"))
+        or ("attn_proj" in keys and name.endswith(".attn.proj.weight"))
+    )
 
 def tensor_cosine(a: Tensor, b: Tensor, eps: float = 1e-8) -> Tensor:
     a_f, b_f = a.float(), b.float()
@@ -319,10 +430,21 @@ def bounded_trust_gate(gate: Tensor, step: int) -> Tensor:
     cap = ATTN_EARLY_TRUST_CAP if step < ATTN_TRUST_FLOOR_FADE_END_STEP else 1.0
     return gate.clamp(min=floor, max=cap)
 
+def attention_soap_blend_for_step(step: int) -> float:
+    if step < ATTN_SOAP_FADE_START_STEP:
+        return 1.0
+    if step >= ATTN_SOAP_FADE_END_STEP:
+        return 0.0
+    if ATTN_SOAP_FADE_END_STEP <= ATTN_SOAP_FADE_START_STEP:
+        return 0.0
+    return (
+        ATTN_SOAP_FADE_END_STEP - step
+    ) / (ATTN_SOAP_FADE_END_STEP - ATTN_SOAP_FADE_START_STEP)
+
 def norm_preserving_blend(raw: Tensor, soap: Tensor, gate: Tensor, eps: float = 1e-8) -> Tensor:
     blended = raw + (soap - raw) * gate.to(raw.dtype)
-    raw_norm = raw.float().norm().clamp_min(eps)
-    blended_norm = blended.float().norm().clamp_min(eps)
+    raw_norm = gram_frobenius_norm_estimate(raw, eps=eps)
+    blended_norm = gram_frobenius_norm_estimate(blended, eps=eps)
     return (blended * (raw_norm / blended_norm).to(blended.dtype)).to(raw.dtype)
 
 def soap_eigenbasis(mat: Tensor) -> Tensor:
@@ -362,7 +484,7 @@ def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8,
     precond = q_row @ (projected / denom) @ q_col.T
     if blend != 1.0:
         precond = blend * precond + (1 - blend) * update_f
-    precond.mul_(update_f.norm() / precond.norm().clamp_min(eps))
+    precond.mul_(gram_frobenius_norm_estimate(update_f, eps=eps) / gram_frobenius_norm_estimate(precond, eps=eps))
     return precond.to(update.dtype)
 
 def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, precondition_frequency=SOAP_PRECONDITION_FREQUENCY):
@@ -378,18 +500,35 @@ def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, preconditio
         )
     state["soap_step"] += 1
 
-# NorMuon-lite (port from track_1 2025-10-24): per-row variance EMA on top of NS,
-# normalize each row by 1/sqrt(EMA), then renormalize Frobenius back to original.
-# This is Adam-style 2nd moment but per-ROW (not per-element), preserving Muon's spectral
-# structure while adaptively reweighting between rows.
-def muon_update(update, second_moment, beta2=NOR_BETA2):
-    normalized_grad = scale_to_unit_operator_norm(update.clone())
-    update = zeropower_via_newtonschulz5(update)
-    opower_frobenius_norm = update.norm()
+def _linear_ramp(step: int, start_step: int, end_step: int) -> float:
+    if end_step <= start_step:
+        return 1.0 if step >= end_step else 0.0
+    return min(1.0, max(0.0, (step - start_step) / (end_step - start_step)))
 
-    # https://github.com/nilin/contra-muon
-    update = update - CONTRA_MUON / 2 * normalized_grad
-    update = update * opower_frobenius_norm / torch.clamp(update.norm(), min=1e-10)
+def contra_coeff_for_step(step: int) -> float:
+    contra_to_normal = _linear_ramp(step, CONTRA_HOLD_END_STEP, CONTRA_TO_NORMAL_END_STEP)
+    return CONTRA_MUON_COEFF * (1.0 - contra_to_normal)
+
+def soft_blend_for_step(step: int) -> float:
+    return min(SOFT_MUON_CEIL, _linear_ramp(step, NORMAL_TO_SOFT_START_STEP, NORMAL_TO_SOFT_END_STEP))
+
+def muon_update(update, second_moment, step, beta2=NOR_BETA2, use_contra=True, use_soft=True):
+    normalized_grad = scale_to_unit_operator_norm(update.clone())
+    ns_update = zeropower_via_newtonschulz5(update)
+    update_norm_estimate = gram_frobenius_norm_estimate(ns_update)
+
+    contra_coeff = contra_coeff_for_step(step) if use_contra else 0.0
+    contra_update = ns_update + contra_coeff * normalized_grad
+    contra_update = contra_update * update_norm_estimate / gram_frobenius_norm_estimate(contra_update)
+    if use_soft:
+        soft_update = soft_via_newtonschulz5(update, SOFT_MUON_P, SOFT_MUON_SCALE, SOFT_MUON_INPUT_NORM)
+        soft_update = soft_update * update_norm_estimate / gram_frobenius_norm_estimate(soft_update)
+        blend = soft_blend_for_step(step)
+    else:
+        soft_update = contra_update
+        blend = 0.0
+    update = contra_update + (soft_update - contra_update) * blend
+    update = update * update_norm_estimate / gram_frobenius_norm_estimate(update)
     update *= max(1, update.size(-2) / update.size(-1))**0.5
     # Per-row variance (or per-col if matrix is wide). Keep along the longer dim.
     if update.size(-2) >= update.size(-1):
@@ -397,9 +536,9 @@ def muon_update(update, second_moment, beta2=NOR_BETA2):
     else:
         per_row_var = (update * update).mean(dim=-2, keepdim=True)  # shape (..., 1, n)
     second_moment.lerp_(per_row_var.float(), 1 - beta2)
-    vnorm = update.norm()
+    vnorm = gram_frobenius_norm_estimate(update)
     update = update * second_moment.clamp_min(1e-10).rsqrt().to(update.dtype)
-    vnorm_new = update.norm().clamp_min(1e-10)
+    vnorm_new = gram_frobenius_norm_estimate(update)
     update = update * (vnorm / vnorm_new)
     return update
 
@@ -407,7 +546,11 @@ class Muon(torch.optim.Optimizer):
     def __init__(self, named_params, lr=0.02, weight_decay=0, mu=0.95):
         assert isinstance(named_params, list) and len(named_params) >= 1
         self.soap_params = {p for n, p in named_params if should_soap_param(n)}
-        self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
+        self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_param(n)}
+        self.attn_proj_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
+        self.v_params = {p for n, p in named_params if is_v_param(n)}
+        self.no_contra_params = {p for n, p in named_params if param_matches_spec(n, NO_CONTRA_PARAM)}
+        self.no_soft_params = {p for n, p in named_params if param_matches_spec(n, NO_SOFTMUON_PARAM)}
         self.step_count = 0
         params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
@@ -449,24 +592,37 @@ class Muon(torch.optim.Optimizer):
                         soap_update_preconditioner(grad, state)
                     if use_soap:
                         if is_attn_soap:
+                            soap_blend = V_SOAP_BLEND if p in self.v_params else ATTN_SOAP_BLEND
+                            if p in self.v_params and V_SOAP_BLEND_RAMP_END_STEP > 0:
+                                soap_blend *= _linear_ramp(self.step_count, 0, V_SOAP_BLEND_RAMP_END_STEP)
                             soap_update = soap_precondition_momentum(
-                                momentum_update, state, blend=1.0,
+                                momentum_update, state, blend=soap_blend,
                                 denom_floor_ratio=ATTN_SOAP_DENOM_FLOOR
                             )
-                            gate = bounded_trust_gate(
-                                trust_gate(momentum_update, soap_update, grad),
-                                self.step_count
-                            )
+                            if p in self.attn_proj_soap_params:
+                                gate = bounded_trust_gate(
+                                    trust_gate(momentum_update, soap_update, grad),
+                                    self.step_count
+                                )
+                            else:
+                                gate = torch.ones((), dtype=torch.float32, device=p.device)
+                            gate = gate * attention_soap_blend_for_step(self.step_count)
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
                             momentum_update = soap_precondition_momentum(momentum_update, state, blend=SOAP_BLEND)
-                    update = muon_update(momentum_update, state["second_moment"])
-                    # u/w-floor. If u/w would be below TARGET (0.35), scale UP to maintain 0.35.
-                    # If u/w >= TARGET (early training when weights are small), leave update alone.
+                    update = muon_update(
+                        momentum_update,
+                        state["second_moment"],
+                        self.step_count,
+                        use_contra=p not in self.no_contra_params,
+                        use_soft=p not in self.no_soft_params,
+                    )
+                    # u/w-floor. SOAP and non-SOAP params can use different floors.
                     p_fro = p.float().norm().clamp_min(1e-8)
                     u_fro = update.float().norm().clamp_min(1e-8)
                     cur_uw = u_fro / p_fro
-                    scale = torch.where(cur_uw < TARGET_UW, TARGET_UW * p_fro / u_fro, torch.ones_like(p_fro))
+                    target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
+                    scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
                     update = update * scale.to(update.dtype)
                     # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
                     p.add_(update, alpha=-group["lr"])
@@ -492,7 +648,7 @@ assert 8 % dist.get_world_size() == 0
 
 # logging setup
 if dist.get_rank() == 0:
-    log_dir = Path(os.environ.get("LOG_DIR", "logs"))
+    log_dir = LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)
     logfile = str(log_dir / f"{uuid.uuid4()}.txt")
     print(logfile, flush=True)
@@ -512,16 +668,25 @@ print0(f"Running on device_name={torch.cuda.get_device_name(device)} with world_
 print0(f"Using seed={SEED}")
 print0(f"Experiment={EXPERIMENT_NAME}")
 print0(f"Intuition={EXPERIMENT_INTUITION}")
-print0("Contra Muon modifies Muon by subtracting CONTRA_MUON/2 times the operator-normalized momentum gradient.")
+print0("Muon update linearly changes from Contra Muon to normal Muon, then normal Muon to soft Muon.")
 print0("This script retains the PR 274 NorMuon-lite row/column variance normalization and u/w-floor postprocessing.")
-print0("MLP SOAP stays on all run; attention projection SOAP is tail-capped with a bounded early trust floor.")
-print0("Schedule cools to zero at train_steps=3175, matching PR 278 v18.")
-print0(f"Using contra_muon={CONTRA_MUON}")
-print0(f"Using opnorm_grad_subtraction={CONTRA_MUON / 2}")
+print0("MLP and V SOAP stay on all run; V SOAP blend is fixed at 0.95.")
+print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
+print0(f"Using contra_muon_coeff={CONTRA_MUON_COEFF}")
+print0(f"Using soft_muon_p={SOFT_MUON_P}")
+print0(f"Using soft_muon_scale={SOFT_MUON_SCALE}")
+print0(f"Using soft_muon_input_norm={SOFT_MUON_INPUT_NORM}")
+print0(f"Using soft_muon_ceil={SOFT_MUON_CEIL}")
+print0(f"Using contra_hold_end_step={CONTRA_HOLD_END_STEP}")
+print0(f"Using contra_to_normal_end_step={CONTRA_TO_NORMAL_END_STEP}")
+print0(f"Using normal_to_soft_start_step={NORMAL_TO_SOFT_START_STEP}")
+print0(f"Using normal_to_soft_end_step={NORMAL_TO_SOFT_END_STEP}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
 print0(f"Using muon_weight_decay={MUON_WEIGHT_DECAY}")
 print0(f"Using target_uw={TARGET_UW}")
+print0(f"Using soap_target_uw={SOAP_TARGET_UW}")
+print0(f"Using nonsoap_target_uw={NONSOAP_TARGET_UW}")
 print0(f"Using nor_beta2={NOR_BETA2}")
 print0(f"Using soap_beta2={SOAP_BETA2}")
 print0(f"Using soap_precondition_frequency={SOAP_PRECONDITION_FREQUENCY}")
@@ -530,6 +695,9 @@ print0(f"Using soap_blend={SOAP_BLEND}")
 print0(f"Using soap_update_before_use={SOAP_UPDATE_BEFORE_USE}")
 print0(f"Using soap_param_mode={SOAP_PARAM_MODE}")
 print0(f"Using attn_soap_denom_floor={ATTN_SOAP_DENOM_FLOOR}")
+print0(f"Using attn_soap_blend={ATTN_SOAP_BLEND}")
+print0(f"Using v_soap_blend={V_SOAP_BLEND}")
+print0(f"Using v_soap_blend_ramp_end_step={V_SOAP_BLEND_RAMP_END_STEP}")
 print0(f"Using attn_early_trust_floor={ATTN_EARLY_TRUST_FLOOR}")
 print0(f"Using attn_early_trust_cap={ATTN_EARLY_TRUST_CAP}")
 print0(f"Using attn_trust_floor_end_step={ATTN_TRUST_FLOOR_END_STEP}")
@@ -537,7 +705,10 @@ print0(f"Using attn_trust_floor_fade_end_step={ATTN_TRUST_FLOOR_FADE_END_STEP}")
 print0(f"Using attn_trust_min_agree={ATTN_TRUST_MIN_AGREE}")
 print0(f"Using attn_trust_min_grad_align={ATTN_TRUST_MIN_GRAD_ALIGN}")
 print0(f"Using attn_trust_power={ATTN_TRUST_POWER}")
-print0(f"Using target_val_loss={TARGET_VAL_LOSS}")
+print0(f"Using attn_soap_fade_start_step={ATTN_SOAP_FADE_START_STEP}")
+print0(f"Using attn_soap_fade_end_step={ATTN_SOAP_FADE_END_STEP}")
+print0(f"Using no_contra_param={NO_CONTRA_PARAM}")
+print0(f"Using no_softmuon_param={NO_SOFTMUON_PARAM}")
 print0("="*100)
 
 val_tokens = 20 * 524288
@@ -555,11 +726,9 @@ model.compile(dynamic=False)
 ########################################
 
 # we want to minimize this while still reaching 3.28 val loss
-train_steps = 3175
+train_steps = FINAL_TRAIN_STEPS
 val_regular_interval = 125
-tail_val_start_step = 3000
-tail_val_interval = 2
-extra_val_steps = {3100, 3125, 3150, 3175}
+extra_val_steps = {3000, 3010, 3020, 3030, 3040}
 
 # initialize model parameters
 for name, p in model.named_parameters():
@@ -580,18 +749,26 @@ assert set(p for opt in optimizers for group in opt.param_groups
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+optimizer1.param_groups[0]["power_c"] = ADAM_EMBED_POWER_C
+optimizer1.param_groups[1]["power_c"] = ADAM_PROJ_POWER_C
+optimizer1.param_groups[2]["power_c"] = ADAM_OTHER_POWER_C
+optimizer2.param_groups[0]["power_c"] = MUON_POWER_C
 
 # learning rate schedule: stable then decay
-def set_hparams(step, cooldown_frac=0.7):
-    progress = step / train_steps
+def _lr(step, initial_lr, power_c, power=1.0):
+    t_end = FINAL_SCHEDULE_STEPS
+    flat_lr = initial_lr
+    downward_lr = power_c * max(0.0, t_end - step) ** power
+    return min(flat_lr, downward_lr)
+
+def set_hparams(step):
+    progress = step / FINAL_SCHEDULE_STEPS
     assert 0 <= progress < 1
-    if progress < 1 - cooldown_frac:
-        eta = 1.0
-    else:
-        eta = (1 - progress) / cooldown_frac
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * eta
+            group["lr"] = _lr(step, group["initial_lr"], group["power_c"], FINAL_LR_POWER)
+
+
 
 
 ########################################
@@ -601,7 +778,6 @@ def set_hparams(step, cooldown_frac=0.7):
 for p in model.parameters():
     dist.broadcast(p.detach(), 0)
 # start the clock
-early_stop_bad_points = 0
 training_time = 0
 dist.barrier()
 t0 = time.perf_counter()
@@ -614,7 +790,6 @@ for step in range(train_steps + 1):
         step == train_steps
         or H.should_stop(step)
         or (step > 0 and step % val_regular_interval == 0)
-        or (step >= tail_val_start_step and step % tail_val_interval == 0)
         or step in extra_val_steps
     )
     if should_validate:
@@ -631,26 +806,6 @@ for step in range(train_steps + 1):
         val_loss /= val_tokens
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
                + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
-        current_val_loss = float(val_loss.item())
-        if TARGET_VAL_LOSS > 0 and current_val_loss <= TARGET_VAL_LOSS:
-            print0(f"target_reached step:{step}/{train_steps} val_loss:{current_val_loss:.5f} "
-                   + f"target_val_loss:{TARGET_VAL_LOSS:.5f}", console=True)
-            break
-        if EARLY_STOP and step < train_steps and step in SOTA_VAL_BY_STEP:
-            sota_val_loss = SOTA_VAL_BY_STEP[step]
-            sota_gap = current_val_loss - sota_val_loss
-            catastrophically_behind = (
-                step >= EARLY_STOP_CATASTROPHIC_STEPS
-                and sota_gap > EARLY_STOP_CATASTROPHIC_MARGIN
-            )
-            meaningfully_behind = step >= EARLY_STOP_GRACE_STEPS and sota_gap > EARLY_STOP_MARGIN
-            early_stop_bad_points = early_stop_bad_points + 1 if meaningfully_behind else 0
-            if catastrophically_behind or early_stop_bad_points >= EARLY_STOP_PATIENCE:
-                reason = "catastrophic_gap" if catastrophically_behind else "patience_gap"
-                print0(f"early_stop:{reason} step:{step}/{train_steps} val_loss:{current_val_loss:.5f} "
-                       + f"sota_mean:{sota_val_loss:.5f} gap:{sota_gap:.5f} "
-                       + f"bad_points:{early_stop_bad_points}/{EARLY_STOP_PATIENCE}", console=True)
-                break
         H.log_val(step, val_loss)
         model.train()
         # start the clock again
@@ -689,3 +844,4 @@ for step in range(train_steps + 1):
 
 H.finish()
 dist.destroy_process_group()
+
