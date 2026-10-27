@@ -1,19 +1,18 @@
 """
-contra-muon-to-soft-muon.py
+radial_scale_then_radius_correct.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
 It was prepared as a simplified version of the speedrun for use in neural net optimization research.
 
 ---
 
-Contra-Muon-to-Soft-Muon.
-
-Start with contra-muon for diversity/exploration, interpolate through standard muon to soft-muon for exploitation
-https://web.archive.org/web/20260505070142/https://nilin.github.io/contra-muon-and-soft-muon/
+dampen radial gradient component
 
 ---
 
 This submission incorporates features from the following previous submissions
+
+@nilin PR291
 
 @kumarkrishna PR274 / Skylight-001
   NorMuon-lite row/column variance normalization
@@ -62,7 +61,7 @@ args = parser.parse_args()
 
 SEED = args.seed
 # Hardcoded final schedule constants
-FINAL_TRAIN_STEPS = 3040
+FINAL_TRAIN_STEPS = 3020
 FINAL_SCHEDULE_STEPS = 3105
 FINAL_LR_POWER = 1.2
 ADAM_EMBED_POWER_C = 4.976805410800738e-05
@@ -71,7 +70,7 @@ ADAM_OTHER_POWER_C = 1.6589351369335795e-06
 MUON_POWER_C = 3.3169534699576625e-06
 FINAL_MUON_WD = 0.025
 EXPERIMENT_NAME = "contra-muon-to-soft-muon"
-EXPERIMENT_INTUITION = "Interpolate Muon update from Contra Muon to normal Muon, then from normal Muon to p=0.1 soft Muon."
+EXPERIMENT_INTUITION = "PR291 plus dampened radial gradient component before the u/w floor, followed by post-step radius correction for tangent drift."
 CONTRA_MUON_COEFF = -0.2
 SOFT_MUON_P = 0.1
 SOFT_MUON_SCALE = "none"
@@ -110,7 +109,9 @@ ATTN_SOAP_FADE_END_STEP = 1000000000
 NO_CONTRA_PARAM = ""
 NO_SOFTMUON_PARAM = ""
 TRAIN_PROGRESS_INTERVAL = 0
-LOG_DIR = Path("experiment-logs/all-runs/2026-05-09/validation-ceil-0.8")
+LOG_DIR = Path("logs")
+RADIAL_OUTWARD_SCALE = 0.5
+RADIAL_INWARD_SCALE = 1.0
 
 
 ########################################
@@ -447,6 +448,35 @@ def norm_preserving_blend(raw: Tensor, soap: Tensor, gate: Tensor, eps: float = 
     blended_norm = gram_frobenius_norm_estimate(blended, eps=eps)
     return (blended * (raw_norm / blended_norm).to(blended.dtype)).to(raw.dtype)
 
+def scale_radial_update(update: Tensor, param: Tensor, eps: float = 1e-12) -> Tensor:
+    update_f = update.float()
+    param_f = param.float()
+    denom = (param_f * param_f).sum().clamp_min(eps)
+    coeff = (update_f * param_f).sum() / denom
+    radial = coeff * param_f
+    tangential = update_f - radial
+    # p.add_(update, alpha=-lr), so actual movement is -update.
+    # Outward movement means (-update) is aligned with p, i.e. coeff < 0.
+    radial_scale = torch.where(
+        coeff < 0,
+        update_f.new_tensor(RADIAL_OUTWARD_SCALE),
+        update_f.new_tensor(RADIAL_INWARD_SCALE),
+    )
+    return (tangential + radial_scale * radial).to(update.dtype)
+
+def target_radius_after_update(param: Tensor, update: Tensor, lr: float, eps: float = 1e-8) -> Tensor:
+    param_f = param.float()
+    update_f = update.float()
+    before_norm = param_f.norm().clamp_min(eps)
+    # Use only the radial component's first-order radius change as the intended
+    # radius change; the post-step rescale below removes finite tangent drift.
+    radial_delta = -lr * (update_f * param_f).sum() / before_norm
+    return (before_norm + radial_delta).clamp_min(eps)
+
+def rescale_to_radius(param: Tensor, target_norm: Tensor, eps: float = 1e-8):
+    after_norm = param.float().norm().clamp_min(eps)
+    param.mul_((target_norm / after_norm).to(param.dtype))
+
 def soap_eigenbasis(mat: Tensor) -> Tensor:
     try:
         _, q = torch.linalg.eigh(mat + 1e-30 * torch.eye(mat.size(0), device=mat.device))
@@ -617,6 +647,7 @@ class Muon(torch.optim.Optimizer):
                         use_contra=p not in self.no_contra_params,
                         use_soft=p not in self.no_soft_params,
                     )
+                    update = scale_radial_update(update, p)
                     # u/w-floor. SOAP and non-SOAP params can use different floors.
                     p_fro = p.float().norm().clamp_min(1e-8)
                     u_fro = update.float().norm().clamp_min(1e-8)
@@ -624,8 +655,10 @@ class Muon(torch.optim.Optimizer):
                     target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
                     scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
                     update = update * scale.to(update.dtype)
+                    target_radius = target_radius_after_update(p, update, group["lr"])
                     # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
                     p.add_(update, alpha=-group["lr"])
+                    rescale_to_radius(p, target_radius)
                     if use_soap and not SOAP_UPDATE_BEFORE_USE:
                         soap_update_preconditioner(grad, state)
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
@@ -665,6 +698,7 @@ print0(code)
 print0("="*100)
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running on device_name={torch.cuda.get_device_name(device)} with world_size={dist.get_world_size()}")
+print0(f"Run UTC timestamp={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
 print0(f"Using seed={SEED}")
 print0(f"Experiment={EXPERIMENT_NAME}")
 print0(f"Intuition={EXPERIMENT_INTUITION}")
@@ -709,6 +743,9 @@ print0(f"Using attn_soap_fade_start_step={ATTN_SOAP_FADE_START_STEP}")
 print0(f"Using attn_soap_fade_end_step={ATTN_SOAP_FADE_END_STEP}")
 print0(f"Using no_contra_param={NO_CONTRA_PARAM}")
 print0(f"Using no_softmuon_param={NO_SOFTMUON_PARAM}")
+print0(f"Using radial_outward_scale={RADIAL_OUTWARD_SCALE}")
+print0(f"Using radial_inward_scale={RADIAL_INWARD_SCALE}")
+print0("Dampened radial gradient component is applied before the u/w floor; post-step radius is corrected to remove tangent drift.")
 print0("="*100)
 
 val_tokens = 20 * 524288
@@ -728,7 +765,7 @@ model.compile(dynamic=False)
 # we want to minimize this while still reaching 3.28 val loss
 train_steps = FINAL_TRAIN_STEPS
 val_regular_interval = 125
-extra_val_steps = {3000, 3010, 3020, 3030, 3040}
+extra_val_steps = {2990, 2995, 2999, 3000, 3010, 3020}
 
 # initialize model parameters
 for name, p in model.named_parameters():
