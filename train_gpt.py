@@ -62,7 +62,7 @@ args = parser.parse_args()
 SEED = args.seed
 # Hardcoded final schedule constants
 FINAL_TRAIN_STEPS = 3020
-FINAL_SCHEDULE_STEPS = 3105
+FINAL_SCHEDULE_STEPS = 3050
 FINAL_LR_POWER = 1.2
 ADAM_EMBED_POWER_C = 4.976805410800738e-05
 ADAM_PROJ_POWER_C = 5.184172302917436e-07
@@ -75,9 +75,9 @@ CONTRA_MUON_COEFF = -0.2
 SOFT_MUON_P = 0.1
 SOFT_MUON_SCALE = "none"
 SOFT_MUON_INPUT_NORM = "frobenius_schatten4"
-SOFT_MUON_CEIL = 0.80
+SOFT_MUON_CEIL = 0.00
 CONTRA_HOLD_END_STEP = 0
-CONTRA_TO_NORMAL_END_STEP = 2000
+CONTRA_TO_NORMAL_END_STEP = 2500
 NORMAL_TO_SOFT_START_STEP = 2500
 NORMAL_TO_SOFT_END_STEP = 3010
 MU = 0.95
@@ -86,7 +86,7 @@ MUON_WEIGHT_DECAY = FINAL_MUON_WD
 TARGET_UW = 0.3825
 SOAP_TARGET_UW = TARGET_UW
 NONSOAP_TARGET_UW = TARGET_UW
-NOR_BETA2 = 0.95
+NOR_BETA2 = 1.0
 SOAP_BETA2 = 0.90
 SOAP_PRECONDITION_FREQUENCY = 10
 SOAP_DENOM_POWER = 0.50
@@ -264,21 +264,47 @@ def gram_frobenius_norm_estimate(G: Tensor, keepdim: bool = False, eps: float = 
     gram = X.mT @ X if X.size(-2) > X.size(-1) else X @ X.mT
     return gram.norm(dim=(-2, -1), keepdim=keepdim).sqrt().clamp_min(eps)
 
-def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
-    assert G.ndim >= 2
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Use the Gram-Frobenius estimate sqrt(||X X^T||_F) instead of direct
-    # Frobenius norm or power iteration.
-    X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
-    # Perform the NS iterations, not optimizing for wallclock speed
+def _ns_inner(X: Tensor) -> Tensor:
     a, b, c = 2, -1.5, 0.5
     for _ in range(12):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
+    return X
+
+# v93: Aurora-on-mlp.proj (K=3 outer iterations with D row rescaling)
+_AURORA_K = 3
+_AURORA_BETA = 0.25
+_AURORA_EPS = 1e-7
+
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    is_originally_wide = G.size(-2) < G.size(-1)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    if is_originally_wide:
+        Xt = X.mT
+        Xt32 = Xt.to(torch.float32)
+        target_row_sq = Xt.size(-1) / Xt.size(-2)
+        row_norm = Xt32.norm(dim=-1, keepdim=True).clamp_(min=_AURORA_EPS)
+        D = 1.0 / row_norm
+        U = None
+        for k in range(_AURORA_K):
+            scaled = (D * Xt32).to(Xt.dtype)
+            scaled_wide = scaled.mT
+            scaled_wide = scaled_wide / gram_frobenius_norm_estimate(scaled_wide, keepdim=True, eps=1e-7).to(scaled_wide.dtype)
+            U_wide = _ns_inner(scaled_wide)
+            U = U_wide.mT
+            if k < _AURORA_K - 1:
+                U32 = U.to(torch.float32)
+                row_sq = U32.pow(2).sum(dim=-1, keepdim=True).clamp_(min=_AURORA_EPS * _AURORA_EPS)
+                D = D * (target_row_sq / row_sq).pow(_AURORA_BETA)
+        X = U.mT
+    else:
+        X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
+        X = _ns_inner(X)
 
     if G.size(-2) > G.size(-1):
         X = X.mT
@@ -765,18 +791,36 @@ model.compile(dynamic=False)
 # we want to minimize this while still reaching 3.28 val loss
 train_steps = FINAL_TRAIN_STEPS
 val_regular_interval = 125
-extra_val_steps = {2990, 2995, 2999, 3000, 3010, 3020}
+extra_val_steps = {2820, 2830, 2840, 2850, 2860, 2870, 2880, 2890, 2895, 2900, 2910, 2920, 2930, 2940, 2950, 2960, 2965, 2970, 2975, 2980, 2985, 2990, 2995, 2999, 3000, 3010, 3020}
 
 # initialize model parameters
 for name, p in model.named_parameters():
     if "proj" in name:
         p.data.zero_()
 
+# v44: v13 depth-scaled mlp.fc init alpha=0.30 (ported from opus v15)
+_DI_FC_ALPHA = 0.30
+_NUM_BLOCKS = len(model.blocks)
+with torch.no_grad():
+    for l_idx, block in enumerate(model.blocks):
+        ramp = l_idx / (_NUM_BLOCKS - 1) if _NUM_BLOCKS > 1 else 0.0
+        s_l = 1.0 - _DI_FC_ALPHA * ramp
+        block.mlp.fc.weight.data.mul_(s_l)
+
+# v44: v14 CGI Rademacher channel-gain split alpha=0.14 (ported from opus v15)
+_CGI_ALPHA = 0.14
+with torch.no_grad():
+    for block in model.blocks:
+        s = (torch.randint(0, 2, block.norm1.gains.shape,
+                           device=block.norm1.gains.device, dtype=torch.float32) * 2 - 1)
+        block.norm1.gains.data.copy_((1.0 - _CGI_ALPHA * s).to(block.norm1.gains.dtype))
+        block.norm2.gains.data.copy_((1.0 + _CGI_ALPHA * s).to(block.norm2.gains.dtype))
+
 # create the optimizer(s)
 optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
                     dict(params=[model.proj.weight], lr=1/320),
                     dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
-                   betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+                   betas=(0.8, 0.99), eps=1e-10, weight_decay=0, fused=True)
 # Skylight-001: NorMuon-lite (per-row variance) + u/w-floor=0.35 + lr=0.0375 + wd=0.025.
 optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
                   lr=MUON_LR, weight_decay=MUON_WEIGHT_DECAY, mu=MU)
@@ -798,12 +842,32 @@ def _lr(step, initial_lr, power_c, power=1.0):
     downward_lr = power_c * max(0.0, t_end - step) ** power
     return min(flat_lr, downward_lr)
 
+# v49: v15 Muon mu schedule (warmup 0.85->0.95 over 300 steps, cooldown 0.95->0.85 over last 50)
+_MU_MIN = 0.85
+_MU_MAX = 0.95
+_MU_WARMUP_STEPS = 300
+_MU_COOLDOWN_STEPS = 100
+
+def _muon_mu_at_step(step, train_steps):
+    cd_start = train_steps - _MU_COOLDOWN_STEPS
+    if step < _MU_WARMUP_STEPS:
+        frac = step / max(_MU_WARMUP_STEPS, 1)
+        return _MU_MIN + frac * (_MU_MAX - _MU_MIN)
+    elif step > cd_start:
+        frac = (step - cd_start) / max(_MU_COOLDOWN_STEPS, 1)
+        return _MU_MAX - frac * (_MU_MAX - _MU_MIN)
+    else:
+        return _MU_MAX
+
 def set_hparams(step):
     progress = step / FINAL_SCHEDULE_STEPS
     assert 0 <= progress < 1
+    mu = _muon_mu_at_step(step, FINAL_TRAIN_STEPS)
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = _lr(step, group["initial_lr"], group["power_c"], FINAL_LR_POWER)
+    for group in optimizer2.param_groups:
+        group["mu"] = mu
 
 
 
