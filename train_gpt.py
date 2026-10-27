@@ -50,6 +50,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import harness
 
+
 # cuDNN SDPA can fail to build an execution plan for this compiled causal-attention
 # layout on some PyTorch/CUDA/cuDNN combinations. Leave Flash/mem-efficient/math SDPA
 # enabled and only remove the cuDNN backend from consideration.
@@ -59,10 +60,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
 
+
 SEED = args.seed
 # Hardcoded final schedule constants
-FINAL_TRAIN_STEPS = 3020
-FINAL_SCHEDULE_STEPS = 3050
+FINAL_TRAIN_STEPS = 2900
+FINAL_SCHEDULE_STEPS = 2980
 FINAL_LR_POWER = 1.2
 ADAM_EMBED_POWER_C = 4.976805410800738e-05
 ADAM_PROJ_POWER_C = 5.184172302917436e-07
@@ -691,6 +693,106 @@ class Muon(torch.optim.Optimizer):
         self.step_count += 1
 
 
+class EMA_Nesterov(torch.optim.Optimizer):
+    def __init__(self, params, inner_optimizer, lookahead_stepsize=0, use_scheduled_lookahead_stepsize=True, lookahead_ema=0.9, prefill_steps=0, rest_steps=0):
+        if lookahead_stepsize < 0.0:
+            raise ValueError("Invalid momentum value: {}".format(lookahead_stepsize))
+
+        super(EMA_Nesterov, self).__init__(params, {})
+        self.inner_optimizer = inner_optimizer
+        self.use_scheduled_lookahead_stepsize = use_scheduled_lookahead_stepsize
+        self.lookahead_stepsize = lookahead_stepsize
+        self.lookahead_ema = lookahead_ema
+        self.prefill_steps = prefill_steps
+        self.rest_steps = rest_steps
+        self.it = 0
+        self.lookahead_status = False
+        self.current_lookahead_stepsize = 0
+        self.initialize_buffers()
+
+    def __setstate__(self, state):
+        super(EMA_Nesterov, self).__setstate__(state)
+
+    @torch.no_grad()
+    def initialize_buffers(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                param_state = self.state[p]
+                if 'prev_params' not in param_state:
+                    param_state['prev_params'] = (p.clone(), self.it)
+
+                if 'lookahead_buffer' not in param_state:
+                    param_state['lookahead_buffer'] = (torch.zeros_like(p), -1)
+    
+    def get_lr_lambda(self):
+        if isinstance(self.inner_optimizer, list):
+            lr_lambda = self.inner_optimizer[0].param_groups[0]["lr"] / self.inner_optimizer[0].param_groups[0]["initial_lr"]
+        else:
+            lr_lambda = self.inner_optimizer.param_groups[0]["lr"] / self.inner_optimizer.param_groups[0]["initial_lr"]
+        return lr_lambda
+
+    @torch.no_grad()
+    def lookahead_step(self):
+        """Performs nesterov's lookahead."""
+        if self.use_scheduled_lookahead_stepsize:
+            lookahead_stepsize = self.lookahead_stepsize * self.get_lr_lambda()
+        else:
+            lookahead_stepsize = self.lookahead_stepsize
+        self.current_lookahead_stepsize = lookahead_stepsize
+
+        for group in self.param_groups:
+            for p in group['params']:
+
+                param_state = self.state[p]         
+
+                lookahead = param_state['lookahead_buffer'][0]
+       
+                p.add_(lookahead, alpha=lookahead_stepsize)
+
+
+
+    @torch.no_grad()
+    def accum_lookahead(self):
+        """Update nesterov's lookahead direction."""
+        lookahead_ema = self.lookahead_ema
+        for group in self.param_groups:
+            for p in group['params']:
+                param_state = self.state[p]
+                look = p.add(param_state['prev_params'][0], alpha=-1)
+
+                # update lookahead buffer
+                buf = param_state['lookahead_buffer'][0]
+
+                param_state['lookahead_buffer'] = (buf.lerp_(look, 1 - lookahead_ema), self.it) # m^{t+1} = beta * m^t + (1-beta) * look
+
+                # update prev_params buffer
+                param_state['prev_params'] = (param_state['prev_params'][0].copy_(p), self.it)
+
+    
+    @torch.no_grad()
+    def nesterov_step(self):
+        if self.it + 1 > self.prefill_steps and self.it < self.rest_steps and not self.lookahead_status:
+            self.lookahead_step()
+        else:
+            self.current_lookahead_stepsize = 0
+        self.lookahead_status = True
+
+    @torch.no_grad()
+    def step(self):
+        if not self.lookahead_status:
+            raise ValueError("optimizer.nesterov_step() should be invoked before model forward pass.")
+        if isinstance(self.inner_optimizer, list):
+            for opt in self.inner_optimizer:
+                opt.step()
+        else:
+            self.inner_optimizer.step()
+        
+        self.accum_lookahead()
+
+        self.lookahead_status = False
+        self.it += 1
+    
+
 ########################################
 #                Setup                 #
 ########################################
@@ -711,6 +813,7 @@ if dist.get_rank() == 0:
     log_dir.mkdir(parents=True, exist_ok=True)
     logfile = str(log_dir / f"{uuid.uuid4()}.txt")
     print(logfile, flush=True)
+
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
         if console:
@@ -825,9 +928,18 @@ optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
 optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
                   lr=MUON_LR, weight_decay=MUON_WEIGHT_DECAY, mu=MU)
 optimizers = [optimizer1, optimizer2]
+optimizers = [EMA_Nesterov(
+        [p for p in model.parameters()],
+        optimizers,
+        lookahead_stepsize=0.3,
+        use_scheduled_lookahead_stepsize=True,
+        lookahead_ema=0.99,
+        prefill_steps=300,
+        rest_steps=train_steps - 950,
+    )]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
-for opt in optimizers:
+for opt in optimizers[0].inner_optimizer:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 optimizer1.param_groups[0]["power_c"] = ADAM_EMBED_POWER_C
@@ -863,7 +975,7 @@ def set_hparams(step):
     progress = step / FINAL_SCHEDULE_STEPS
     assert 0 <= progress < 1
     mu = _muon_mu_at_step(step, FINAL_TRAIN_STEPS)
-    for opt in optimizers:
+    for opt in optimizers[0].inner_optimizer:
         for group in opt.param_groups:
             group["lr"] = _lr(step, group["initial_lr"], group["power_c"], FINAL_LR_POWER)
     for group in optimizer2.param_groups:
@@ -920,6 +1032,7 @@ for step in range(train_steps + 1):
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
+    optimizers[0].nesterov_step()
     train_loss = 0
     for i in range(len(inputs) // mbs):
         loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
