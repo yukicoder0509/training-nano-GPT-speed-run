@@ -1,11 +1,16 @@
 """
-train_gpt_simple.py
+train_gpt_simple_contra_muon_2.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
 It was prepared as a simplified version of the speedrun for use in neural net optimization research.
 
-Skylight-001 — rule-compliant variant of iter078 with diagnostics stripped so the
-self-embedded source in the logfile is fully self-contained (Rule 4).
+Contra Muon (https://github.com/nilin/contra-muon):
+Newton-Schulz momentum update subtracts CONTRA_MUON / 2 times the operator-normalized
+momentum gradient before the PR 274 NorMuon-lite row/column variance normalization and
+u/w-floor postprocessing. Here CONTRA_MUON=0.4, so the subtracted component is 0.2 times
+the normalized gradient.
+
+rebased onto the PR 274 Skylight-001 script: the Muon
 """
 
 import os
@@ -22,6 +27,18 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
 import harness
+
+# cuDNN SDPA can fail to build an execution plan for this compiled causal-attention
+# layout on some PyTorch/CUDA/cuDNN combinations. Leave Flash/mem-efficient/math SDPA
+# enabled and only remove the cuDNN backend from consideration.
+torch.backends.cuda.enable_cudnn_sdp(False)
+
+SEED = int(os.environ.get("SEED", "0"))
+CONTRA_MUON = 0.4
+MU = 0.95
+MUON_LR = 0.0375
+MUON_WEIGHT_DECAY = 0.025
+TARGET_UW = 0.35
 
 
 ########################################
@@ -188,6 +205,18 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
+def scale_to_unit_operator_norm(G: Tensor, eps: float = 1e-10) -> Tensor:
+    X = G.float()
+    v = torch.ones(X.size(-1), dtype=X.dtype, device=X.device)
+    v = v / torch.clamp(v.norm(), min=eps)
+    for _ in range(5):
+        u = X @ v
+        u = u / torch.clamp(u.norm(), min=eps)
+        v = X.mT @ u
+        v = v / torch.clamp(v.norm(), min=eps)
+    op_norm = torch.clamp((X @ v).norm(), min=eps)
+    return G / op_norm.to(G.dtype)
+
 # NorMuon-lite (port from track_1 2025-10-24): per-row variance EMA on top of NS,
 # normalize each row by 1/sqrt(EMA), then renormalize Frobenius back to original.
 # This is Adam-style 2nd moment but per-ROW (not per-element), preserving Muon's spectral
@@ -196,7 +225,13 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
 def muon_update(grad, momentum, second_moment, mu=0.95, beta2=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - mu)
     update = grad.lerp_(momentum, mu) if nesterov else momentum
+    normalized_grad = scale_to_unit_operator_norm(update.clone())
     update = zeropower_via_newtonschulz5(update)
+    opower_frobenius_norm = update.norm()
+
+    # https://github.com/nilin/contra-muon
+    update = update - CONTRA_MUON / 2 * normalized_grad
+    update = update * opower_frobenius_norm / torch.clamp(update.norm(), min=1e-10)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     # Per-row variance (or per-col if matrix is wide). Keep along the longer dim.
     if update.size(-2) >= update.size(-1):
@@ -241,7 +276,6 @@ class Muon(torch.optim.Optimizer):
                                          mu=group["mu"])
                     # u/w-floor. If u/w would be below TARGET (0.35), scale UP to maintain 0.35.
                     # If u/w >= TARGET (early training when weights are small), leave update alone.
-                    TARGET_UW = 0.35
                     p_fro = p.float().norm().clamp_min(1e-8)
                     u_fro = update.float().norm().clamp_min(1e-8)
                     cur_uw = u_fro / p_fro
@@ -260,6 +294,7 @@ class Muon(torch.optim.Optimizer):
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 harness.setup(device)
+torch.manual_seed(SEED)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 # this code can be run equivalently with 1, 2, 4, or 8 gpus.
@@ -283,6 +318,15 @@ print0(code)
 print0("="*100)
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running on device_name={torch.cuda.get_device_name(device)} with world_size={dist.get_world_size()}")
+print0(f"Using seed={SEED}")
+print0("Contra Muon modifies Muon by subtracting CONTRA_MUON/2 times the operator-normalized momentum gradient.")
+print0("This script retains the PR 274 NorMuon-lite row/column variance normalization and u/w-floor postprocessing.")
+print0(f"Using contra_muon={CONTRA_MUON}")
+print0(f"Using opnorm_grad_subtraction={CONTRA_MUON / 2}")
+print0(f"Using mu={MU}")
+print0(f"Using muon_lr={MUON_LR}")
+print0(f"Using muon_weight_decay={MUON_WEIGHT_DECAY}")
+print0(f"Using target_uw={TARGET_UW}")
 print0("="*100)
 
 val_tokens = 20 * 524288
@@ -300,7 +344,9 @@ model.compile(dynamic=False)
 ########################################
 
 # we want to minimize this while still reaching 3.28 val loss
-train_steps = 3250
+train_steps = 3225
+val_regular_interval = 125
+extra_val_steps = {3150, 3175, 3200, 3225}
 
 # initialize model parameters
 for name, p in model.named_parameters():
@@ -314,7 +360,7 @@ optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
                    betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
 # Skylight-001: NorMuon-lite (per-row variance) + u/w-floor=0.35 + lr=0.0375 + wd=0.025.
 optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                  lr=0.0375, weight_decay=0.025)
+                  lr=MUON_LR, weight_decay=MUON_WEIGHT_DECAY, mu=MU)
 optimizers = [optimizer1, optimizer2]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
@@ -350,7 +396,13 @@ for step in range(train_steps + 1):
     H.start_step()
 
     # --------------- VALIDATION SECTION -----------------
-    if step == train_steps or step % 125 == 0 or H.should_stop(step):
+    should_validate = (
+        step == train_steps
+        or H.should_stop(step)
+        or (step > 0 and step % val_regular_interval == 0)
+        or step in extra_val_steps
+    )
+    if should_validate:
         # stop the clock
         dist.barrier()
         training_time += time.perf_counter() - t0
