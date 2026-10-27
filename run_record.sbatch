@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96  # 12 per GPU (partition max)
 #SBATCH --gpus-per-node=8
-#SBATCH --exclude=25a-hgpn001,25a-hgpn003,25a-hgpn157
+#SBATCH --exclude=25a-hgpn001,25a-hgpn003,25a-hgpn062,25a-hgpn157  # hgpn062: a rank saw 7 GPUs (job 618348)
 #SBATCH --time=6:00:00
 #SBATCH --output=logs/%x-%j.out
 
@@ -37,6 +37,7 @@ export WANDB_ENTITY=${WANDB_ENTITY:-bendoris0509-national-yang-ming-chiao-tung-u
 export WANDB_PROJECT=${WANDB_PROJECT:-nano-gpt}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$REF}
 export RECORD=$REF
+export RECORD_COMMIT=$(git rev-parse --short $REF)
 
 # Single-node jobs: NCCL bootstrap over loopback (some nodes pick an unroutable interface and hang)
 export NCCL_SOCKET_IFNAME=lo

@@ -75,7 +75,7 @@ class Harness:
                                "set OPTIM_DYNAMICS=0 or use the personal project")
         self.run = wandb.init(entity=entity, project=os.environ.get("WANDB_PROJECT"),
                               name=os.environ.get("WANDB_RUN_NAME"),
-                              config=dict(config or {}, stop_step=self.stop_step, git_commit=_git_commit(),
+                              config=dict(config or {}, stop_step=self.stop_step, git_commit=os.environ.get("RECORD_COMMIT") or _git_commit(),
                                           record=os.environ.get("RECORD"), slurm_job_id=os.environ.get("SLURM_JOB_ID"),
                                           world_size=dist.get_world_size(), torch_version=torch.version.__version__,
                                           gpu=torch.cuda.get_device_name(self.device), logfile=logfile))

@@ -26,7 +26,7 @@ if "STOP_STEP" not in s:
     else:
         sub(r"^(    if step == train_steps or [^\n]*?):\n", r"\1 or H.should_stop(step):\n", "val cond")
     sub(r"^    if step == train_steps:\n        break\n", "    if step == train_steps or H.should_stop(step):\n        break\n", "break")
-extras = {"val_loss": "", "val_ema_loss": ", val_raw_loss=val_loss, val_avg_loss=val_avg_loss"}[metric]
+extras = {"val_loss": "", "val_ema_loss": ", val_raw_loss=val_loss"}[metric]
 sub(r"^(        model\.train\(\)\n        # start the clock again\n)", f"        H.log_val(step, {metric}{extras})\n" + r"\1", "log_val")
 # training loss
 sub(r"^(    for i in range\(len\(inputs\) // mbs\):\n)", r"    train_loss = 0\n\1", "train_loss init")
