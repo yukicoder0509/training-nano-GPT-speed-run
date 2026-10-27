@@ -1,19 +1,30 @@
 """
-train_gpt_circuit_muon.py
+train_gpt_clean.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
-Built directly on top of PR #309 (OscarYau525, EMA-Nesterov + Aurora @ 2890), the
-ONLY change is adding a Circuit-Muon coupling on the attention V <-> attn.proj
-pair: per-head partner-scalar post-whitening + trace-only gauge rebalance, applied
-inside a coupled pass that replaces the per-param round-robin for V and O. All
-other PR309 machinery (EMA-Nesterov, Aurora polar, Contra/Soft-Muon, SOAP for
-MLP+V, NorMuon-lite, radial scale, u/w-floor, rescale-to-radius) is unchanged.
 
-PR309 itself incorporates:
-  @nilin    PR275 (Contra-Muon), PR291 (Contra-to-Soft interpolation)
-  @kumarkrishna PR274 / Skylight-001 (NorMuon-lite + u/w-floor + lr=0.0375)
-  @samacqua PR278 (SOAP preconditioning on MLP, extended here to V)
-  @yash-oai PR287 (PowerCool power-law LR schedule)
+CLEAN / simplified SOTA optimizer for a PR. It is the exp307 SOTA baseline with the
+following components REMOVED (the now-dead code physically deleted for readability):
+  - Soft-Muon (soft_via_newtonschulz5 blend)
+  - MUON_WEIGHT_DECAY passthrough (never read in the step)
+  - Contra-Muon (CONTRA_MUON_COEFF coupling)
+  - Circuit-Muon OV coupling (attn.v <-> attn.proj per-head partner-scalar)
+  - CenterShrinkAdam (replaced by a minimal bias-correction-free `Adam`, which is
+    exactly CenterShrinkAdam at rho=1.0 -- NOT torch.optim.AdamW, which would add
+    bias correction that CenterShrinkAdam does not have)
+  - Aurora
+
+This is functionally identical to running the source train_gpt_simple.py with
+CONTRA_COEFF=0, CIRCUIT_OFF=1, AUX_CENTER_SHRINK=1.0 and FINAL_SCHEDULE_STEPS=2900
+(the aux-group Adam matches up to ~1e-7 float rounding from a dropped redundant
+rms-rescale that is the identity at rho=1.0).
+
+Retained machinery:
+  - SOAP preconditioning on all hidden matrices (all_hidden, freq=1)
+  - u/w-floor hyperball constraint (TARGET_UW=0.3825)
+  - radial scaling + rescale-to-radius
+  - EMA-Nesterov outer wrapper
+  - PowerCool LR schedule, mu schedule, val schedule
 """
 
 import os
@@ -46,41 +57,23 @@ args = parser.parse_args()
 SEED = args.seed
 # Hardcoded final schedule constants
 FINAL_TRAIN_STEPS = 2900
-FINAL_SCHEDULE_STEPS = 2980
+# Cooldown horizon for the LR anneal. SOTA uses 2900.
+FINAL_SCHEDULE_STEPS = 2900   # t_end win (the +25-step SOTA lever; original public was 2960)
 FINAL_LR_POWER = 1.2
 ADAM_EMBED_POWER_C = 4.976805410800738e-05
 ADAM_PROJ_POWER_C = 5.184172302917436e-07
 ADAM_OTHER_POWER_C = 1.6589351369335795e-06
 MUON_POWER_C = 3.3169534699576625e-06
-FINAL_MUON_WD = 0.025
-EXPERIMENT_NAME = "circuit-muon"
-EXPERIMENT_INTUITION = "PR309 (EMA-Nesterov + Aurora) plus Circuit-Muon on attn.v <-> attn.proj: per-head partner-scalar post-whitening (norm-preserving) + trace-only gauge rebalance."
-CONTRA_MUON_COEFF = -0.2
-SOFT_MUON_P = 0.1
-SOFT_MUON_SCALE = "none"
-SOFT_MUON_INPUT_NORM = "frobenius_schatten4"
-SOFT_MUON_CEIL = 0.00
-CONTRA_HOLD_END_STEP = 0
-CONTRA_TO_NORMAL_END_STEP = 2500
-NORMAL_TO_SOFT_START_STEP = 2500
-NORMAL_TO_SOFT_END_STEP = 3010
+EXPERIMENT_NAME = "clean-simplified-soaph"
+EXPERIMENT_INTUITION = "SOTA SOAP-all_hidden (freq=1) + u/w-floor + radial scale + EMA-Nesterov, with Soft-Muon / Contra-Muon / Circuit-Muon / CenterShrink / Aurora removed."
 MU = 0.95
 MUON_LR = 0.0375
-MUON_WEIGHT_DECAY = FINAL_MUON_WD
 TARGET_UW = 0.3825
 SOAP_TARGET_UW = TARGET_UW
 NONSOAP_TARGET_UW = TARGET_UW
-NOR_BETA2 = 1.0
 SOAP_BETA2 = 0.90
-SOAP_PRECONDITION_FREQUENCY = 10
+SOAP_PRECONDITION_FREQUENCY = 1
 SOAP_DENOM_POWER = 0.50
-SOAP_BLEND = 1.00
-SOAP_UPDATE_BEFORE_USE = False
-SOAP_PARAM_MODE = "mlp_plus_v"
-ATTN_SOAP_DENOM_FLOOR = 0.55
-ATTN_SOAP_BLEND = 1.00
-V_SOAP_BLEND = 0.95
-V_SOAP_BLEND_RAMP_END_STEP = 0
 ATTN_EARLY_TRUST_FLOOR = 0.45
 ATTN_EARLY_TRUST_CAP = 0.85
 ATTN_TRUST_FLOOR_END_STEP = 1375
@@ -88,21 +81,11 @@ ATTN_TRUST_FLOOR_FADE_END_STEP = 1625
 ATTN_TRUST_MIN_AGREE = 0.20
 ATTN_TRUST_MIN_GRAD_ALIGN = 0.00
 ATTN_TRUST_POWER = 1.00
-ATTN_SOAP_FADE_START_STEP = 1000000000
-ATTN_SOAP_FADE_END_STEP = 1000000000
-NO_CONTRA_PARAM = ""
-NO_SOFTMUON_PARAM = ""
 TRAIN_PROGRESS_INTERVAL = 0
 LOG_DIR = Path("logs")
 RADIAL_OUTWARD_SCALE = 0.5
 RADIAL_INWARD_SCALE = 1.0
-# Circuit-Muon (OV pair: attn.v <-> attn.proj). The damping sets the floor on the
-# per-head Gram-root scalar c^2 = ||W_h||_F^2 / hd. The chosen value 1e-3 keeps
-# s_partner = 1/sqrt(c^2 + lam) bounded at init (~32 with zero-init proj) while
-# preserving per-head anisotropy of s; it was selected from a sweep over
-# {1e-6, 1e-5, 1e-4, 1e-3, 1e-2} (1e-3 best mean@end, lowest std).
 HEAD_DIM = 128
-CIRCUIT_OV_DAMPING = 1e-3
 
 
 ########################################
@@ -263,100 +246,18 @@ def _ns_inner(X: Tensor) -> Tensor:
         X = a * X + B @ X
     return X
 
-# v93: Aurora-on-mlp.proj (K=3 outer iterations with D row rescaling)
-_AURORA_K = 3
-_AURORA_BETA = 0.25
-_AURORA_EPS = 1e-7
-
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    # Standard Muon Newton-Schulz orthogonalization. (Aurora wide-matrix row-rescale
+    # removed -- ablated neutral; this is exactly the AURORA_K=0 path.)
     assert G.ndim >= 2
-    is_originally_wide = G.size(-2) < G.size(-1)
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
         X = X.mT
-
-    if is_originally_wide:
-        Xt = X.mT
-        Xt32 = Xt.to(torch.float32)
-        target_row_sq = Xt.size(-1) / Xt.size(-2)
-        row_norm = Xt32.norm(dim=-1, keepdim=True).clamp_(min=_AURORA_EPS)
-        D = 1.0 / row_norm
-        U = None
-        for k in range(_AURORA_K):
-            scaled = (D * Xt32).to(Xt.dtype)
-            scaled_wide = scaled.mT
-            scaled_wide = scaled_wide / gram_frobenius_norm_estimate(scaled_wide, keepdim=True, eps=1e-7).to(scaled_wide.dtype)
-            U_wide = _ns_inner(scaled_wide)
-            U = U_wide.mT
-            if k < _AURORA_K - 1:
-                U32 = U.to(torch.float32)
-                row_sq = U32.pow(2).sum(dim=-1, keepdim=True).clamp_(min=_AURORA_EPS * _AURORA_EPS)
-                D = D * (target_row_sq / row_sq).pow(_AURORA_BETA)
-        X = U.mT
-    else:
-        X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
-        X = _ns_inner(X)
-
+    X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
+    X = _ns_inner(X)
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
-
-def _soft_coefficients(p: float) -> tuple[float, tuple[float, ...]]:
-    if p == 0.0:
-        return 1.0, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    if p == 0.1:
-        return 0.0, (0.1091613623, 0.07085664498, 0.05210528973, 0.05457295795, 0.05011334061, 0.03334622198, 0.05022104481, 0.1053727358, 0.1187323776, 0.1185061091, 0.1185059576, 0.1185059576)
-    raise ValueError(f"unsupported soft-muon singular-value power: {p}")
-
-def zeropower_frobenius_norm_like(G: Tensor) -> float:
-    return (G.numel() / max(G.size(-2), G.size(-1)))**0.5
-
-def soft_via_newtonschulz5(G: Tensor, p: float, scale_mode: str, input_norm: str) -> Tensor:
-    assert G.ndim >= 2
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    if input_norm == "frobenius_schatten4":
-        X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
-    elif input_norm != "frobenius":
-        raise ValueError(f"unsupported soft_muon input_norm: {input_norm}")
-    else:
-        X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
-    constant, coeffs = _soft_coefficients(p)
-
-    a, b, c = 2, -1.5, 0.5
-    basis = [X]
-    for _ in range(len(coeffs)):
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-        basis.append(X)
-
-    out = constant * basis[-1]
-    for coeff, basis_term in zip(coeffs, basis[:-1]):
-        out = out + coeff * basis_term
-
-    value_at_one = constant + sum(coeffs)
-    if scale_mode == "top":
-        out = out / value_at_one
-    elif scale_mode == "top_sqrt":
-        out = out / value_at_one**0.5
-    elif scale_mode == "frobenius":
-        theoretical_opower_norm = zeropower_frobenius_norm_like(out)
-        out = out * theoretical_opower_norm / gram_frobenius_norm_estimate(out)
-    elif scale_mode == "frobenius_sqrt":
-        theoretical_opower_norm = zeropower_frobenius_norm_like(out)
-        out = out * (theoretical_opower_norm / gram_frobenius_norm_estimate(out))**0.5
-    elif scale_mode != "none":
-        raise ValueError(f"unsupported soft_muon scale: {scale_mode}")
-
-    if G.size(-2) > G.size(-1):
-        out = out.mT
-    return out
-
-def scale_to_unit_operator_norm(G: Tensor, eps: float = 1e-10) -> Tensor:
-    return G / gram_frobenius_norm_estimate(G, eps=eps).to(G.dtype)
 
 def should_soap_param(name: str) -> bool:
     is_mlp_fc = name.endswith(".mlp.fc.weight")
@@ -370,25 +271,7 @@ def should_soap_param(name: str) -> bool:
     is_q = name.endswith(".attn.q.weight")
     is_k = name.endswith(".attn.k.weight")
     is_v = name.endswith(".attn.v.weight")
-    if SOAP_PARAM_MODE == "mlp_all":
-        return is_mlp_fc or is_mlp_proj
-    if SOAP_PARAM_MODE == "mlp_fc":
-        return is_mlp_fc
-    if SOAP_PARAM_MODE == "mlp_proj":
-        return is_mlp_proj
-    if SOAP_PARAM_MODE == "mlp_plus_attn_proj":
-        return is_mlp_fc or is_mlp_proj or is_attn_proj
-    if SOAP_PARAM_MODE == "mlp_plus_q":
-        return is_mlp_fc or is_mlp_proj or is_q
-    if SOAP_PARAM_MODE == "mlp_plus_k":
-        return is_mlp_fc or is_mlp_proj or is_k
-    if SOAP_PARAM_MODE == "mlp_plus_v":
-        return is_mlp_fc or is_mlp_proj or is_v
-    if SOAP_PARAM_MODE == "mlp_plus_qkv":
-        return is_mlp_fc or is_mlp_proj or is_qkv
-    if SOAP_PARAM_MODE == "all_hidden":
-        return is_mlp_fc or is_mlp_proj or is_attn_proj or is_qkv
-    raise ValueError(f"unknown SOAP_PARAM_MODE={SOAP_PARAM_MODE}")
+    return is_mlp_fc or is_mlp_proj or is_attn_proj or is_qkv  # SOAP on all hidden 2D matrices
 
 def is_attn_proj_param(name: str) -> bool:
     return name.endswith(".attn.proj.weight")
@@ -399,18 +282,6 @@ def is_attn_param(name: str) -> bool:
         or name.endswith(".attn.k.weight")
         or name.endswith(".attn.v.weight")
         or name.endswith(".attn.proj.weight")
-    )
-
-def is_v_param(name: str) -> bool:
-    return name.endswith(".attn.v.weight")
-
-def param_matches_spec(name: str, spec: str) -> bool:
-    keys = {part.strip() for part in spec.split(",") if part.strip()}
-    return (
-        ("q" in keys and name.endswith(".attn.q.weight"))
-        or ("k" in keys and name.endswith(".attn.k.weight"))
-        or ("v" in keys and name.endswith(".attn.v.weight"))
-        or ("attn_proj" in keys and name.endswith(".attn.proj.weight"))
     )
 
 def tensor_cosine(a: Tensor, b: Tensor, eps: float = 1e-8) -> Tensor:
@@ -447,17 +318,6 @@ def bounded_trust_gate(gate: Tensor, step: int) -> Tensor:
     floor = early_trust_floor_for_step(step)
     cap = ATTN_EARLY_TRUST_CAP if step < ATTN_TRUST_FLOOR_FADE_END_STEP else 1.0
     return gate.clamp(min=floor, max=cap)
-
-def attention_soap_blend_for_step(step: int) -> float:
-    if step < ATTN_SOAP_FADE_START_STEP:
-        return 1.0
-    if step >= ATTN_SOAP_FADE_END_STEP:
-        return 0.0
-    if ATTN_SOAP_FADE_END_STEP <= ATTN_SOAP_FADE_START_STEP:
-        return 0.0
-    return (
-        ATTN_SOAP_FADE_END_STEP - step
-    ) / (ATTN_SOAP_FADE_END_STEP - ATTN_SOAP_FADE_START_STEP)
 
 def norm_preserving_blend(raw: Tensor, soap: Tensor, gate: Tensor, eps: float = 1e-8) -> Tensor:
     blended = raw + (soap - raw) * gate.to(raw.dtype)
@@ -516,8 +376,7 @@ def soap_basis_qr(row_gg, col_gg, q_row, q_col, exp_avg_sq):
     q_col, _ = torch.linalg.qr(col_gg @ q_col)
     return q_row, q_col, exp_avg_sq
 
-def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8,
-                               blend=SOAP_BLEND, denom_floor_ratio=0.0):
+def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8):
     update_f = update.float()
     if state["q_row"] is None:
         return update
@@ -525,12 +384,7 @@ def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8,
     projected = q_row.T @ update_f @ q_col
     state["exp_avg_sq"].mul_(beta2).add_(projected.square(), alpha=1 - beta2)
     denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(SOAP_DENOM_POWER)
-    if denom_floor_ratio > 0:
-        denom_floor = denom.float().square().mean().sqrt().mul(denom_floor_ratio).clamp_min(eps)
-        denom = denom.clamp_min(denom_floor.to(denom.dtype))
     precond = q_row @ (projected / denom) @ q_col.T
-    if blend != 1.0:
-        precond = blend * precond + (1 - blend) * update_f
     precond.mul_(gram_frobenius_norm_estimate(update_f, eps=eps) / gram_frobenius_norm_estimate(precond, eps=eps))
     return precond.to(update.dtype)
 
@@ -547,89 +401,11 @@ def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, preconditio
         )
     state["soap_step"] += 1
 
-def _linear_ramp(step: int, start_step: int, end_step: int) -> float:
-    if end_step <= start_step:
-        return 1.0 if step >= end_step else 0.0
-    return min(1.0, max(0.0, (step - start_step) / (end_step - start_step)))
-
-def contra_coeff_for_step(step: int) -> float:
-    contra_to_normal = _linear_ramp(step, CONTRA_HOLD_END_STEP, CONTRA_TO_NORMAL_END_STEP)
-    return CONTRA_MUON_COEFF * (1.0 - contra_to_normal)
-
-def soft_blend_for_step(step: int) -> float:
-    return min(SOFT_MUON_CEIL, _linear_ramp(step, NORMAL_TO_SOFT_START_STEP, NORMAL_TO_SOFT_END_STEP))
-
-def muon_update(update, second_moment, step, beta2=NOR_BETA2, use_contra=True, use_soft=True):
-    normalized_grad = scale_to_unit_operator_norm(update.clone())
-    ns_update = zeropower_via_newtonschulz5(update)
-    update_norm_estimate = gram_frobenius_norm_estimate(ns_update)
-
-    contra_coeff = contra_coeff_for_step(step) if use_contra else 0.0
-    contra_update = ns_update + contra_coeff * normalized_grad
-    contra_update = contra_update * update_norm_estimate / gram_frobenius_norm_estimate(contra_update)
-    if use_soft:
-        soft_update = soft_via_newtonschulz5(update, SOFT_MUON_P, SOFT_MUON_SCALE, SOFT_MUON_INPUT_NORM)
-        soft_update = soft_update * update_norm_estimate / gram_frobenius_norm_estimate(soft_update)
-        blend = soft_blend_for_step(step)
-    else:
-        soft_update = contra_update
-        blend = 0.0
-    update = contra_update + (soft_update - contra_update) * blend
-    update = update * update_norm_estimate / gram_frobenius_norm_estimate(update)
+def muon_update(update):
+    # Newton-Schulz orthogonalization + aspect-ratio scale.
+    update = zeropower_via_newtonschulz5(update)
     update *= max(1, update.size(-2) / update.size(-1))**0.5
-    # Per-row variance (or per-col if matrix is wide). Keep along the longer dim.
-    if update.size(-2) >= update.size(-1):
-        per_row_var = (update * update).mean(dim=-1, keepdim=True)  # shape (..., m, 1)
-    else:
-        per_row_var = (update * update).mean(dim=-2, keepdim=True)  # shape (..., 1, n)
-    second_moment.lerp_(per_row_var.float(), 1 - beta2)
-    vnorm = gram_frobenius_norm_estimate(update)
-    update = update * second_moment.clamp_min(1e-10).rsqrt().to(update.dtype)
-    vnorm_new = gram_frobenius_norm_estimate(update)
-    update = update * (vnorm / vnorm_new)
     return update
-
-def circuit_muon(uV, uO, WV, WO, head_dim=HEAD_DIM, lam=CIRCUIT_OV_DAMPING):
-    """Circuit-Muon for one OV pair (attn.v, attn.proj).
-
-    Approximates each head's Gram root as isotropic C = c*I with c^2 = ||W_h||^2/hd,
-    so the partner inverse-Gram-root collapses to one Frobenius-norm scalar
-    s = 1/sqrt(c^2 + lam). Newton-Schulz msign is scale invariant, so the partner
-    pre-whiten cancels and only post-whitening + gauge rebalance remain:
-      (a) per-head post-whiten: delta_V *= s_O, delta_O *= s_V
-      (b) restore each leg's pre-scale Frobenius norm — preserves the per-head
-          anisotropy of s while letting PR309's u/w-floor + rescale-to-radius set
-          the absolute step magnitude downstream
-      (c) trace-only gauge: x_h = (<W_V, dV> - <W_O, dO>) / (||W_V||^2 + ||W_O||^2 + 2*hd*lam)
-          dV -= x_h * W_V,   dO += x_h * W_O   (per head; conserves the per-head
-          trace gap ||W_V_h||^2 - ||W_O_h||^2)
-
-    WV shape (n_heads*hd, dim) with heads on rows; WO shape (dim, n_heads*hd) with
-    heads on columns. uV/uO have matching shapes.
-    """
-    hd = head_dim
-    H = WV.size(0) // hd
-    WVh = WV.view(H, hd, WV.size(1)).float()             # (H, hd, dim)
-    WOh = WO.view(WO.size(0), H, hd).float()             # (dim, H, hd)
-    uVh = uV.view(H, hd, uV.size(1))
-    uOh = uO.view(uO.size(0), H, hd)
-    sqV = WVh.pow(2).sum(dim=(1, 2))                     # ||W_V_h||^2, (H,)
-    sqO = WOh.pow(2).sum(dim=(0, 2))                     # ||W_O_h||^2, (H,)
-    s_V = (sqV / hd + lam).clamp_min(1e-12).rsqrt()      # scalar C_V^-1, (H,)
-    s_O = (sqO / hd + lam).clamp_min(1e-12).rsqrt()      # scalar C_O^-1, (H,)
-    # (a)+(b): partner post-whiten then renorm to pre-scale Frobenius norm
-    nV, nO = uVh.float().norm(), uOh.float().norm()
-    uVh = uVh * s_O[:, None, None].to(uVh.dtype)
-    uOh = uOh * s_V[None, :, None].to(uOh.dtype)
-    uVh = uVh * (nV / uVh.float().norm().clamp_min(1e-12)).to(uVh.dtype)
-    uOh = uOh * (nO / uOh.float().norm().clamp_min(1e-12)).to(uOh.dtype)
-    # (c): trace-only gauge rebalance, per head
-    aV = (WVh * uVh.float()).sum(dim=(1, 2))             # <W_V_h, dV_h>
-    aO = (WOh * uOh.float()).sum(dim=(0, 2))             # <W_O_h, dO_h>
-    x = (aV - aO) / (sqV + sqO + 2.0 * hd * lam).clamp_min(1e-12)
-    uVh = uVh - x[:, None, None].to(uVh.dtype) * WVh.to(uVh.dtype)
-    uOh = uOh + x[None, :, None].to(uOh.dtype) * WOh.to(uOh.dtype)
-    return uVh.reshape_as(uV), uOh.reshape_as(uO)
 
 
 class Muon(torch.optim.Optimizer):
@@ -638,120 +414,17 @@ class Muon(torch.optim.Optimizer):
         self.soap_params = {p for n, p in named_params if should_soap_param(n)}
         self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_param(n)}
         self.attn_proj_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
-        self.v_params = {p for n, p in named_params if is_v_param(n)}
-        self.no_contra_params = {p for n, p in named_params if param_matches_spec(n, NO_CONTRA_PARAM)}
-        self.no_soft_params = {p for n, p in named_params if param_matches_spec(n, NO_SOFTMUON_PARAM)}
         self.step_count = 0
         params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
-        # Circuit-Muon: pair each attn.v with its block's attn.proj for a coupled
-        # update; these params are processed in _circuit_muon_step and skipped in
-        # the main round-robin below.
-        by_name = dict(named_params)
-        self.ov_pairs = []
-        self.ov_params = set()
-        for n, p in named_params:
-            if n.endswith(".attn.v.weight"):
-                o = by_name.get(n[:-len(".attn.v.weight")] + ".attn.proj.weight")
-                if o is not None:
-                    self.ov_pairs.append((p, o))
-                    self.ov_params.update({p, o})
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         super().__init__(params, defaults)
-
-    def _ensure_state(self, p):
-        state = self.state[p]
-        if len(state) == 0:
-            state["momentum"] = torch.zeros_like(p)
-            if p in self.soap_params:
-                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-                state["row_gg"] = torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device)
-                state["col_gg"] = torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device)
-                state["q_row"] = None
-                state["q_col"] = None
-                state["soap_step"] = 0
-            if p.size(-2) >= p.size(-1):
-                state["second_moment"] = torch.zeros((*p.shape[:-1], 1),
-                    dtype=torch.float32, device=p.device)
-            else:
-                state["second_moment"] = torch.zeros((*p.shape[:-2], 1, p.shape[-1]),
-                    dtype=torch.float32, device=p.device)
-
-    def _direction(self, p, group):
-        """Momentum -> SOAP -> muon_update; returns the raw (pre-radial) update.
-        Mirrors the per-param body in step() — used by _circuit_muon_step so the
-        coupled V/O update goes through exactly the same direction pipeline."""
-        state = self.state[p]
-        grad = p.grad
-        state["momentum"].lerp_(grad, 1 - group["mu"])
-        momentum_update = grad.lerp(state["momentum"], group["mu"])
-        is_attn_soap = p in self.attn_soap_params
-        use_soap = p in self.soap_params
-        if use_soap and SOAP_UPDATE_BEFORE_USE:
-            soap_update_preconditioner(grad, state)
-        if use_soap:
-            if is_attn_soap:
-                soap_blend = V_SOAP_BLEND if p in self.v_params else ATTN_SOAP_BLEND
-                if p in self.v_params and V_SOAP_BLEND_RAMP_END_STEP > 0:
-                    soap_blend *= _linear_ramp(self.step_count, 0, V_SOAP_BLEND_RAMP_END_STEP)
-                soap_update = soap_precondition_momentum(
-                    momentum_update, state, blend=soap_blend,
-                    denom_floor_ratio=ATTN_SOAP_DENOM_FLOOR
-                )
-                if p in self.attn_proj_soap_params:
-                    gate = bounded_trust_gate(
-                        trust_gate(momentum_update, soap_update, grad),
-                        self.step_count
-                    )
-                else:
-                    gate = torch.ones((), dtype=torch.float32, device=p.device)
-                gate = gate * attention_soap_blend_for_step(self.step_count)
-                momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
-            else:
-                momentum_update = soap_precondition_momentum(momentum_update, state, blend=SOAP_BLEND)
-        return muon_update(
-            momentum_update,
-            state["second_moment"],
-            self.step_count,
-            use_contra=p not in self.no_contra_params,
-            use_soft=p not in self.no_soft_params,
-        )
-
-    def _finish(self, p, group, update):
-        """Radial scale -> u/w floor -> apply -> radius correction -> SOAP refresh."""
-        use_soap = p in self.soap_params
-        update = scale_radial_update(update, p)
-        p_fro = p.float().norm().clamp_min(1e-8)
-        u_fro = update.float().norm().clamp_min(1e-8)
-        cur_uw = u_fro / p_fro
-        target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
-        scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
-        update = update * scale.to(update.dtype)
-        target_radius = target_radius_after_update(p, update, group["lr"])
-        p.add_(update, alpha=-group["lr"])
-        rescale_to_radius(p, target_radius)
-        if use_soap and not SOAP_UPDATE_BEFORE_USE:
-            soap_update_preconditioner(p.grad, self.state[p])
-
-    @torch.no_grad()
-    def _circuit_muon_step(self, group):
-        """Circuit-Muon coupled update for each (attn.v, attn.proj) pair.
-        Computed redundantly on every rank — params are replicated and grads are
-        all-reduced, so the two legs stay in sync without a separate all_gather."""
-        for v, o in self.ov_pairs:
-            self._ensure_state(v); self._ensure_state(o)
-            uV = self._direction(v, group)
-            uO = self._direction(o, group)
-            uV, uO = circuit_muon(uV, uO, v.data, o.data)
-            self._finish(v, group, uV)
-            self._finish(o, group, uO)
 
     @torch.no_grad()
     def step(self):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         for group in self.param_groups:
-            self._circuit_muon_step(group)   # coupled update for OV pairs
-            params = [p for p in group["params"] if p not in self.ov_params]   # skip them below
+            params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
             for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
@@ -766,29 +439,14 @@ class Muon(torch.optim.Optimizer):
                             state["q_row"] = None
                             state["q_col"] = None
                             state["soap_step"] = 0
-                        # Second-moment buffer matches per-row-or-col shape.
-                        if p.size(-2) >= p.size(-1):
-                            state["second_moment"] = torch.zeros((*p.shape[:-1], 1),
-                                dtype=torch.float32, device=p.device)
-                        else:
-                            state["second_moment"] = torch.zeros((*p.shape[:-2], 1, p.shape[-1]),
-                                dtype=torch.float32, device=p.device)
                     grad = p.grad
                     state["momentum"].lerp_(grad, 1 - group["mu"])
                     momentum_update = grad.lerp(state["momentum"], group["mu"])
                     is_attn_soap = p in self.attn_soap_params
                     use_soap = p in self.soap_params
-                    if use_soap and SOAP_UPDATE_BEFORE_USE:
-                        soap_update_preconditioner(grad, state)
                     if use_soap:
                         if is_attn_soap:
-                            soap_blend = V_SOAP_BLEND if p in self.v_params else ATTN_SOAP_BLEND
-                            if p in self.v_params and V_SOAP_BLEND_RAMP_END_STEP > 0:
-                                soap_blend *= _linear_ramp(self.step_count, 0, V_SOAP_BLEND_RAMP_END_STEP)
-                            soap_update = soap_precondition_momentum(
-                                momentum_update, state, blend=soap_blend,
-                                denom_floor_ratio=ATTN_SOAP_DENOM_FLOOR
-                            )
+                            soap_update = soap_precondition_momentum(momentum_update, state)
                             if p in self.attn_proj_soap_params:
                                 gate = bounded_trust_gate(
                                     trust_gate(momentum_update, soap_update, grad),
@@ -796,17 +454,10 @@ class Muon(torch.optim.Optimizer):
                                 )
                             else:
                                 gate = torch.ones((), dtype=torch.float32, device=p.device)
-                            gate = gate * attention_soap_blend_for_step(self.step_count)
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
-                            momentum_update = soap_precondition_momentum(momentum_update, state, blend=SOAP_BLEND)
-                    update = muon_update(
-                        momentum_update,
-                        state["second_moment"],
-                        self.step_count,
-                        use_contra=p not in self.no_contra_params,
-                        use_soft=p not in self.no_soft_params,
-                    )
+                            momentum_update = soap_precondition_momentum(momentum_update, state)
+                    update = muon_update(momentum_update)
                     update = scale_radial_update(update, p)
                     # u/w-floor. SOAP and non-SOAP params can use different floors.
                     p_fro = p.float().norm().clamp_min(1e-8)
@@ -819,10 +470,45 @@ class Muon(torch.optim.Optimizer):
                     # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
                     p.add_(update, alpha=-group["lr"])
                     rescale_to_radius(p, target_radius)
-                    if use_soap and not SOAP_UPDATE_BEFORE_USE:
+                    if use_soap:
                         soap_update_preconditioner(grad, state)
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
         self.step_count += 1
+
+
+class Adam(torch.optim.Optimizer):
+    """Bias-correction-free Adam for the aux (<2D) param groups.
+
+    This is exactly the SOTA's CenterShrinkAdam with center_shrink (rho) = 1.0:
+    at rho=1.0 the center-shrink collapses to the identity (mixed == adam_dir and
+    the rms-rescale ratio is 1), leaving plain Adam with raw (uncorrected) EMAs.
+    NOTE: this intentionally does NOT apply the (1-beta^t) bias correction, so it
+    is NOT the same as torch.optim.AdamW. It matches the source under
+    AUX_CENTER_SHRINK=1.0 bit-for-bit.
+    """
+    def __init__(self, params, lr=0.01, betas=(0.8, 0.99), eps=1e-10):
+        defaults = dict(lr=lr, betas=betas, eps=eps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            for p in group["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                exp_avg.lerp_(grad, 1 - beta1)
+                exp_avg_sq.lerp_(grad.float().square(), 1 - beta2)
+                adam_dir = exp_avg.float() / (exp_avg_sq.sqrt() + eps)
+                p.add_(adam_dir.to(p.dtype), alpha=-group["lr"])
 
 
 class EMA_Nesterov(torch.optim.Optimizer):
@@ -855,7 +541,7 @@ class EMA_Nesterov(torch.optim.Optimizer):
 
                 if 'lookahead_buffer' not in param_state:
                     param_state['lookahead_buffer'] = (torch.zeros_like(p), -1)
-    
+
     def get_lr_lambda(self):
         if isinstance(self.inner_optimizer, list):
             lr_lambda = self.inner_optimizer[0].param_groups[0]["lr"] / self.inner_optimizer[0].param_groups[0]["initial_lr"]
@@ -875,10 +561,10 @@ class EMA_Nesterov(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group['params']:
 
-                param_state = self.state[p]         
+                param_state = self.state[p]
 
                 lookahead = param_state['lookahead_buffer'][0]
-       
+
                 p.add_(lookahead, alpha=lookahead_stepsize)
 
 
@@ -900,7 +586,7 @@ class EMA_Nesterov(torch.optim.Optimizer):
                 # update prev_params buffer
                 param_state['prev_params'] = (param_state['prev_params'][0].copy_(p), self.it)
 
-    
+
     @torch.no_grad()
     def nesterov_step(self):
         if self.it + 1 > self.prefill_steps and self.it < self.rest_steps and not self.lookahead_status:
@@ -918,12 +604,12 @@ class EMA_Nesterov(torch.optim.Optimizer):
                 opt.step()
         else:
             self.inner_optimizer.step()
-        
+
         self.accum_lookahead()
 
         self.lookahead_status = False
         self.it += 1
-    
+
 
 ########################################
 #                Setup                 #
@@ -963,36 +649,16 @@ print0(f"Run UTC timestamp={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"
 print0(f"Using seed={SEED}")
 print0(f"Experiment={EXPERIMENT_NAME}")
 print0(f"Intuition={EXPERIMENT_INTUITION}")
-print0("Muon update linearly changes from Contra Muon to normal Muon, then normal Muon to soft Muon.")
-print0("This script retains the PR 274 NorMuon-lite row/column variance normalization and u/w-floor postprocessing.")
-print0("MLP and V SOAP stay on all run; V SOAP blend is fixed at 0.95.")
+print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
-print0(f"Using contra_muon_coeff={CONTRA_MUON_COEFF}")
-print0(f"Using soft_muon_p={SOFT_MUON_P}")
-print0(f"Using soft_muon_scale={SOFT_MUON_SCALE}")
-print0(f"Using soft_muon_input_norm={SOFT_MUON_INPUT_NORM}")
-print0(f"Using soft_muon_ceil={SOFT_MUON_CEIL}")
-print0(f"Using contra_hold_end_step={CONTRA_HOLD_END_STEP}")
-print0(f"Using contra_to_normal_end_step={CONTRA_TO_NORMAL_END_STEP}")
-print0(f"Using normal_to_soft_start_step={NORMAL_TO_SOFT_START_STEP}")
-print0(f"Using normal_to_soft_end_step={NORMAL_TO_SOFT_END_STEP}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
-print0(f"Using muon_weight_decay={MUON_WEIGHT_DECAY}")
 print0(f"Using target_uw={TARGET_UW}")
 print0(f"Using soap_target_uw={SOAP_TARGET_UW}")
 print0(f"Using nonsoap_target_uw={NONSOAP_TARGET_UW}")
-print0(f"Using nor_beta2={NOR_BETA2}")
 print0(f"Using soap_beta2={SOAP_BETA2}")
 print0(f"Using soap_precondition_frequency={SOAP_PRECONDITION_FREQUENCY}")
 print0(f"Using soap_denom_power={SOAP_DENOM_POWER}")
-print0(f"Using soap_blend={SOAP_BLEND}")
-print0(f"Using soap_update_before_use={SOAP_UPDATE_BEFORE_USE}")
-print0(f"Using soap_param_mode={SOAP_PARAM_MODE}")
-print0(f"Using attn_soap_denom_floor={ATTN_SOAP_DENOM_FLOOR}")
-print0(f"Using attn_soap_blend={ATTN_SOAP_BLEND}")
-print0(f"Using v_soap_blend={V_SOAP_BLEND}")
-print0(f"Using v_soap_blend_ramp_end_step={V_SOAP_BLEND_RAMP_END_STEP}")
 print0(f"Using attn_early_trust_floor={ATTN_EARLY_TRUST_FLOOR}")
 print0(f"Using attn_early_trust_cap={ATTN_EARLY_TRUST_CAP}")
 print0(f"Using attn_trust_floor_end_step={ATTN_TRUST_FLOOR_END_STEP}")
@@ -1000,15 +666,9 @@ print0(f"Using attn_trust_floor_fade_end_step={ATTN_TRUST_FLOOR_FADE_END_STEP}")
 print0(f"Using attn_trust_min_agree={ATTN_TRUST_MIN_AGREE}")
 print0(f"Using attn_trust_min_grad_align={ATTN_TRUST_MIN_GRAD_ALIGN}")
 print0(f"Using attn_trust_power={ATTN_TRUST_POWER}")
-print0(f"Using attn_soap_fade_start_step={ATTN_SOAP_FADE_START_STEP}")
-print0(f"Using attn_soap_fade_end_step={ATTN_SOAP_FADE_END_STEP}")
-print0(f"Using no_contra_param={NO_CONTRA_PARAM}")
-print0(f"Using no_softmuon_param={NO_SOFTMUON_PARAM}")
 print0(f"Using radial_outward_scale={RADIAL_OUTWARD_SCALE}")
 print0(f"Using radial_inward_scale={RADIAL_INWARD_SCALE}")
-print0(f"Using circuit_ov_damping={CIRCUIT_OV_DAMPING}  head_dim={HEAD_DIM}")
 print0("Dampened radial gradient component is applied before the u/w floor; post-step radius is corrected to remove tangent drift.")
-print0("Circuit-Muon couples each attn.v <-> attn.proj pair: per-head partner-scalar post-whitening (norm-preserving) + trace-only gauge rebalance.")
 print0("="*100)
 
 val_tokens = 20 * 524288
@@ -1027,8 +687,12 @@ model.compile(dynamic=False)
 
 # we want to minimize this while still reaching 3.28 val loss
 train_steps = FINAL_TRAIN_STEPS
+# Speed: stop the loop early (trajectory-preserving -- schedule constants stay at FINAL_TRAIN_STEPS,
+# so evals at steps <= STOP_STEP are IDENTICAL to the full run). Target boundary ~2775 only needs evals
+# up to ~2800-2850, so STOP_STEP=2850 saves the unused 2850-2900 tail. Default = full run.
+STOP_STEP = int(os.environ.get("STOP_STEP", FINAL_TRAIN_STEPS))   # default: full schedule; set env to early-stop
 val_regular_interval = 125
-extra_val_steps = {2820, 2830, 2840, 2850, 2860, 2870, 2880, 2890, 2895, 2900, 2910, 2920, 2930, 2940, 2950, 2960, 2965, 2970, 2975, 2980, 2985, 2990, 2995, 2999, 3000, 3010, 3020}
+extra_val_steps = {2700, 2705, 2710, 2715, 2720, 2725, 2730, 2735, 2740, 2745, 2750, 2755, 2760, 2765, 2770, 2775, 2780, 2785, 2790, 2795, 2800, 2805, 2810, 2820, 2830, 2840, 2850, 2860, 2870, 2880, 2890, 2895, 2900, 2910, 2920, 2930, 2940, 2950, 2960, 2965, 2970, 2975, 2980, 2985, 2990, 2995, 2999, 3000, 3010, 3020}
 
 # initialize model parameters
 for name, p in model.named_parameters():
@@ -1045,23 +709,81 @@ with torch.no_grad():
         block.mlp.fc.weight.data.mul_(s_l)
 
 # v44: v14 CGI Rademacher channel-gain split alpha=0.14 (ported from opus v15)
-_CGI_ALPHA = 0.14
+_CGI_ALPHA = 0.125
+_CGI_PAIR_FROM_LAYER = 6
+_CGI_HEAD_MEAN_SHRINK = 0.50
+
+def headmean_antithetic_pair(shape, *, device, layer_idx: int, seed: int, head_dim: int = HEAD_DIM):
+    width = shape[-1]
+    if width % head_dim != 0:
+        s0 = (torch.randint(0, 2, shape, device=device, dtype=torch.float32) * 2 - 1)
+        return s0, -s0
+    gen = torch.Generator(device=device)
+    gen.manual_seed(0xA9170000 + seed * 1009 + layer_idx * 9176)
+    heads0 = []
+    heads1 = []
+    for _ in range(width // head_dim):
+        h0 = (torch.randint(0, 2, (head_dim,), device=device, generator=gen, dtype=torch.int64) * 2 - 1).float()
+        plus0 = int((h0 > 0).sum().item())
+        plus0 = int(round(head_dim / 2 + _CGI_HEAD_MEAN_SHRINK * (plus0 - head_dim / 2)))
+        plus0 = max(0, min(head_dim, plus0))
+        h0 = torch.cat([
+            torch.ones(plus0, device=device, dtype=torch.float32),
+            -torch.ones(head_dim - plus0, device=device, dtype=torch.float32),
+        ])
+        h0 = h0[torch.randperm(head_dim, device=device, generator=gen)]
+        plus1 = head_dim - plus0
+        h1 = torch.cat([
+            torch.ones(plus1, device=device, dtype=torch.float32),
+            -torch.ones(head_dim - plus1, device=device, dtype=torch.float32),
+        ])
+        h1 = h1[torch.randperm(head_dim, device=device, generator=gen)]
+        heads0.append(h0)
+        heads1.append(h1)
+    return torch.cat(heads0).reshape(shape), torch.cat(heads1).reshape(shape)
+
 with torch.no_grad():
-    for block in model.blocks:
-        s = (torch.randint(0, 2, block.norm1.gains.shape,
-                           device=block.norm1.gains.device, dtype=torch.float32) * 2 - 1)
+    pair_next = None
+    for l_idx, block in enumerate(model.blocks):
+        if l_idx >= _CGI_PAIR_FROM_LAYER and (l_idx - _CGI_PAIR_FROM_LAYER) % 2 == 1:
+            s = pair_next
+            pair_next = None
+        elif l_idx >= _CGI_PAIR_FROM_LAYER:
+            s, pair_next = headmean_antithetic_pair(
+                block.norm1.gains.shape,
+                device=block.norm1.gains.device,
+                layer_idx=l_idx,
+                seed=SEED,
+            )
+        else:
+            s = (torch.randint(0, 2, block.norm1.gains.shape,
+                               device=block.norm1.gains.device, dtype=torch.float32) * 2 - 1)
         block.norm1.gains.data.copy_((1.0 - _CGI_ALPHA * s).to(block.norm1.gains.dtype))
         block.norm2.gains.data.copy_((1.0 + _CGI_ALPHA * s).to(block.norm2.gains.dtype))
 
 # create the optimizer(s)
 optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
-                    dict(params=[model.proj.weight], lr=1/320),
-                    dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+                    dict(params=[model.proj.weight], lr=1/320)],
                    betas=(0.8, 0.99), eps=1e-10, weight_decay=0, fused=True)
-# Skylight-001: NorMuon-lite (per-row variance) + u/w-floor=0.35 + lr=0.0375 + wd=0.025.
+gain_aux_params = [p for n, p in model.named_parameters() if p.ndim < 2 and n.endswith(".gains")]
+attn_proj_bias_params = [p for n, p in model.named_parameters() if n.endswith(".attn.proj.bias")]
+other_aux_params = [p for n, p in model.named_parameters()
+                    if p.ndim < 2 and not n.endswith(".gains")
+                    and not n.endswith(".attn.proj.bias")]
+# Aux (<2D) param groups. CenterShrink with rho=1.0 is plain (bias-correction-free)
+# Adam, so this is the minimal `Adam` class above with the per-group betas preserved.
+# NOTE: we do NOT use torch.optim.AdamW here because AdamW applies (1-beta^t) bias
+# correction, which CenterShrinkAdam does not -- they are not equivalent.
+optimizer3 = Adam([
+        dict(params=gain_aux_params, lr=0.01, betas=(0.8, 0.99)),
+        dict(params=other_aux_params, lr=0.01, betas=(0.8, 0.997)),
+        dict(params=attn_proj_bias_params, lr=0.01, betas=(0.8, 0.9965)),
+    ],
+    lr=0.01, betas=(0.8, 0.99), eps=1e-10)
+# Skylight-001: NorMuon-lite (per-row variance) + u/w-floor + lr=0.0375.
 optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
-                  lr=MUON_LR, weight_decay=MUON_WEIGHT_DECAY, mu=MU)
-optimizers = [optimizer1, optimizer2]
+                  lr=MUON_LR, mu=MU)
+optimizers = [optimizer1, optimizer2, optimizer3]
 optimizers = [EMA_Nesterov(
         [p for p in model.parameters()],
         optimizers,
@@ -1078,7 +800,9 @@ for opt in optimizers[0].inner_optimizer:
         group["initial_lr"] = group["lr"]
 optimizer1.param_groups[0]["power_c"] = ADAM_EMBED_POWER_C
 optimizer1.param_groups[1]["power_c"] = ADAM_PROJ_POWER_C
-optimizer1.param_groups[2]["power_c"] = ADAM_OTHER_POWER_C
+optimizer3.param_groups[0]["power_c"] = ADAM_OTHER_POWER_C
+optimizer3.param_groups[1]["power_c"] = ADAM_OTHER_POWER_C
+optimizer3.param_groups[2]["power_c"] = ADAM_OTHER_POWER_C
 optimizer2.param_groups[0]["power_c"] = MUON_POWER_C
 
 # learning rate schedule: stable then decay
@@ -1092,7 +816,8 @@ def _lr(step, initial_lr, power_c, power=1.0):
 _MU_MIN = 0.85
 _MU_MAX = 0.95
 _MU_WARMUP_STEPS = 300
-_MU_COOLDOWN_STEPS = 100
+# Muon-momentum cooldown horizon (mu 0.95->0.85 over the last N steps).
+_MU_COOLDOWN_STEPS = 200   # tuned (mu-cooldown extended; original 100)
 
 def _muon_mu_at_step(step, train_steps):
     cd_start = train_steps - _MU_COOLDOWN_STEPS
@@ -1107,7 +832,9 @@ def _muon_mu_at_step(step, train_steps):
 
 def set_hparams(step):
     progress = step / FINAL_SCHEDULE_STEPS
-    assert 0 <= progress < 1
+    # progress >= 1 is allowed when t_end (FINAL_SCHEDULE_STEPS) < train end: LR is clamped to 0
+    # by _lr's max(0, t_end-step) for those tail steps (the harmless frozen coast).
+    assert 0 <= progress
     mu = _muon_mu_at_step(step, FINAL_TRAIN_STEPS)
     for opt in optimizers[0].inner_optimizer:
         for group in opt.param_groups:
@@ -1135,7 +862,7 @@ for step in range(train_steps + 1):
     # --------------- VALIDATION SECTION -----------------
     should_validate = (
         step == train_steps
-        or H.should_stop(step)
+        or step == STOP_STEP
         or (step > 0 and step % val_regular_interval == 0)
         or step in extra_val_steps
     )
@@ -1159,7 +886,7 @@ for step in range(train_steps + 1):
         dist.barrier()
         t0 = time.perf_counter()
 
-    if step == train_steps or H.should_stop(step):
+    if step >= STOP_STEP:
         break
 
     # --------------- TRAINING SECTION -----------------
@@ -1192,5 +919,4 @@ for step in range(train_steps + 1):
 
 H.finish()
 dist.destroy_process_group()
-
 
