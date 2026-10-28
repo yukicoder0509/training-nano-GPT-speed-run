@@ -1502,6 +1502,7 @@ def run_readout_lab(step):
 
 _rowstat_prev = {}
 _radial = {}   # param name -> (EMA of g_i, EMA of g_i^2), g_i = <grad_i, W_i/|W_i|> per output row (rank 0)
+_radial_sum = {}   # param name -> [sum g_i, sum g_i^2, log|W_i| at the first tracked step]: whole-run statistics
 
 @torch.no_grad()
 def track_radial():
@@ -1514,6 +1515,10 @@ def track_radial():
             continue
         w = p.float()
         g = (p.grad.float() * w).sum(dim=1) / w.norm(dim=1).clamp_min(1e-8)
+        if n not in _radial_sum:
+            _radial_sum[n] = [torch.zeros_like(g), torch.zeros_like(g), w.norm(dim=1).clamp_min(1e-8).log()]
+        _radial_sum[n][0] += g
+        _radial_sum[n][1] += g.square()
         if n not in _radial:
             _radial[n] = (g.clone(), g.square())
         else:
@@ -1543,6 +1548,23 @@ def log_rowstats(step):
     for n, (m1, m2) in _radial.items():
         typ = n.split(".", 1)[1].rsplit(".", 1)[0].replace(".", "_")
         snr.setdefault(typ, []).append(m1.abs() / (m2 - m1.square()).clamp_min(1e-30).sqrt())
+    tst, cor = {}, {}
+    for n, (s1, s2, logr0) in _radial_sum.items():
+        typ = n.split(".", 1)[1].rsplit(".", 1)[0].replace(".", "_")
+        t = s1 / s2.clamp_min(1e-30).sqrt()   # whole-run t-statistic of the radial gradient per row (noise: |N(0,1)|)
+        tst.setdefault(typ, []).append(t.abs())
+        dlog = dict(model.blocks.named_parameters())[n].float().norm(dim=1).clamp_min(1e-8).log() - logr0
+        cor.setdefault(typ, []).append((t, dlog))
+    for typ, v in tst.items():
+        v = torch.cat(v)
+        rec[f"{typ}/radial_t_median"], rec[f"{typ}/radial_t_frac_gt3"] = v.median().item(), (v > 3).float().mean().item()
+        t = torch.cat([a for a, _ in cor[typ]]); d = torch.cat([b for _, b in cor[typ]])
+        # does a row's norm move against its accumulated radial gradient (descent on the norm)?
+        rec[f"{typ}/corr_t_dlogr"] = torch.corrcoef(torch.stack([t, d]))[0, 1].item()
+    if step == STOP_STEP:
+        torch.save({n: dict(t=(v[0] / v[1].clamp_min(1e-30).sqrt()).cpu(), logr0=v[2].cpu(),
+                            logr=dict(model.blocks.named_parameters())[n].float().norm(dim=1).clamp_min(1e-8).log().cpu())
+                    for n, v in _radial_sum.items()}, logfile.replace(".txt", ".rows.pt"))
     for typ, v in snr.items():
         v = torch.cat(v)
         rec[f"{typ}/radial_snr_median"], rec[f"{typ}/radial_snr_frac_gt1"] = v.median().item(), (v > 1).float().mean().item()
