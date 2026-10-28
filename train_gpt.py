@@ -104,13 +104,16 @@ CKPT_DIR = os.environ.get("CKPT_DIR", f"/work/{os.environ.get('USER', 'user')}/n
                                       f"{os.environ.get('WANDB_RUN_NAME', 'run')}-seed{args.seed}")
 RESUME_FROM = os.environ.get("RESUME_FROM", "")
 RESUME_STEP = json.load(open(f"{RESUME_FROM}/meta.json"))["step"] if RESUME_FROM else 0
-# Readout lab (eval only): READOUT_LAB=1 keeps weight snapshots after LAB_REF_STEPS and update-EMAs from LAB_VEL_START,
-# then at STOP_STEP scores a grid of late-trajectory readouts (Tail-EMA lambda, reference interpolation/extrapolation
-# as in #42, update-velocity readout as in #38, and their combination with Tail-EMA). Training is unchanged.
+# Readout lab (eval only): READOUT_LAB=1 keeps weight snapshots after LAB_REF_STEPS, extra weight EMAs (LAB_EMAS,
+# "start:tau" pairs, non-embedding params like Tail-EMA) and the last RRE iterates, then at STOP_STEP scores a grid of
+# late-trajectory readouts on the val set AND on a held-out set (the last train shard, past the probe/GNS batches),
+# so a readout picked on val can be confirmed on data it was not picked on. Training is unchanged.
+# (The update-velocity readout of #38 was removed: every setting was worse than Tail-EMA alone on 3 seeds.)
 READOUT_LAB = os.environ.get("READOUT_LAB", "0") == "1"
-LAB_REF_STEPS = [int(x) for x in os.environ.get("LAB_REF_STEPS", "2000,2200,2375,2500,2600").split(",") if x]
-LAB_VEL_START = int(os.environ.get("LAB_VEL_START", 2500))
-LAB_VEL_BETAS = (0.9, 0.97)
+LAB_REF_STEPS = [int(x) for x in os.environ.get("LAB_REF_STEPS", "2000,2200,2375").split(",") if x]
+LAB_EMAS = [tuple(int(v) for v in x.split(":")) for x in
+            os.environ.get("LAB_EMAS", "2000:300,2200:150,2200:250,2400:100,2400:250").split(",") if x]
+LAB_RRE_K, LAB_RRE_EVERY = 4, 5   # RRE (#34) from the iterates at STOP_STEP - k*every, ..., STOP_STEP
 # Dense validation near the end, "lo:hi:stride" (inclusive), to score a run at the earliest step that passes.
 DENSE_VAL = os.environ.get("DENSE_VAL", "2650:2690:5")
 RADIAL_OUTWARD_SCALE = 0.5
@@ -1392,65 +1395,93 @@ def load_checkpoint(path):
         H.dyn.t = meta["step"]
     print0(f"resumed from {path} (step {meta['step']}, parent run {meta['run']}, parent env {meta['env']})", console=True)
 
-_lab_ref, _lab_vel, _lab_prev = {}, {}, None
+_lab_ref, _lab_ema, _lab_rre = {}, {}, {}
+_lab_ho = None   # held-out eval set (inputs, targets), built lazily
 
 @torch.no_grad()
 def lab_track(t):
-    """After step t-1 (weights = after t steps): keep reference snapshots and update-EMAs (velocity)."""
-    global _lab_prev
+    """After step t-1 (weights = after t steps): reference snapshots, extra EMAs, RRE iterates."""
     params = list(model.parameters())
     if t in LAB_REF_STEPS:
         _lab_ref[t] = [p.detach().float().clone() for p in params]
-    if t >= LAB_VEL_START:
-        if _lab_prev is not None:
-            for b in LAB_VEL_BETAS:
-                m = _lab_vel.setdefault(b, [torch.zeros_like(q) for q in _lab_prev])
-                for mi, p, q in zip(m, params, _lab_prev):
-                    mi.lerp_(p.detach().float() - q, 1 - b)
-            for q, p in zip(_lab_prev, params):
-                q.copy_(p.detach().float())
-        else:
-            _lab_prev = [p.detach().float().clone() for p in params]
+    for start, tau in LAB_EMAS:
+        if start <= t:
+            e = _lab_ema.get((start, tau))
+            if e is None:
+                _lab_ema[(start, tau)] = [None if p is model.embed.weight else p.detach().float().clone() for p in params]
+            else:
+                for ej, p in zip(e, params):
+                    if ej is not None:
+                        ej.add_(p.detach().float() - ej, alpha=1.0 / tau)
+    if STOP_STEP - t >= 0 and (STOP_STEP - t) % LAB_RRE_EVERY == 0 and (STOP_STEP - t) // LAB_RRE_EVERY <= LAB_RRE_K:
+        _lab_rre[t] = [p.detach().float().clone() for p in params]
 
 @torch.no_grad()
-def lab_val():
+def lab_eval(inputs, targets):
     loss = 0
-    for i in range(len(val_inputs) // mbs):
-        loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+    for i in range(len(inputs) // mbs):
+        loss += model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
     dist.all_reduce(loss, op=dist.ReduceOp.SUM)
     return (loss / val_tokens).item()
 
+def rre_extrapolate(xs, damping, max_rel):
+    """Reduced-rank extrapolation from iterates xs[0..k] (lists of tensors): c = argmin |sum c_i u_i|, sum c = 1,
+    u_i = x_{i+1} - x_i; x* = sum c_i x_i; returns x_k + damping * (x* - x_k), the step capped at max_rel * |x_k|."""
+    k = len(xs) - 1
+    us = [[b - a for a, b in zip(xs[i], xs[i + 1])] for i in range(k)]
+    G = torch.tensor([[sum((a * b).sum().item() for a, b in zip(us[i], us[j])) for j in range(k)] for i in range(k)],
+                     dtype=torch.float64)
+    G += torch.eye(k, dtype=torch.float64) * G.diagonal().mean() * 1e-8
+    c = torch.linalg.solve(G, torch.ones(k, dtype=torch.float64))
+    c = (c / c.sum()).tolist()
+    xstar = [sum(ci * xs[i][j] for i, ci in enumerate(c)) for j in range(len(xs[0]))]
+    delta = [damping * (a - b) for a, b in zip(xstar, xs[-1])]
+    dn = sum(d.square().sum().item() for d in delta) ** 0.5
+    xn = sum(x.square().sum().item() for x in xs[-1]) ** 0.5
+    scale = min(1.0, max_rel * xn / max(dn, 1e-30)) if max_rel else 1.0
+    return [d * scale for d in delta], c
+
 @torch.no_grad()
 def run_readout_lab(step):
-    """Score readouts theta_eval = f(theta, Tail-EMA, references, velocities) on the val set; weights are restored."""
+    """Score readouts theta_eval = f(theta, EMAs, references, RRE) on val and held-out data; weights are restored."""
+    global _lab_ho
+    if _lab_ho is None:
+        _lab_ho = next(distributed_data_generator(str(_train_files[-1].relative_to(Path.cwd())), val_tokens, skip=5))
     model.eval()
     params = list(model.parameters())
     theta = [p.detach().float().clone() for p in params]
-    ema = [t if e is None else e for t, e in zip(theta, _tailema)] if _tailema is not None else theta
-    blend = lambda lam: [(1 - lam) * t + lam * e for t, e in zip(theta, ema)]
-    results = []
+    mix = lambda e, lam: [t if ej is None else (1 - lam) * t + lam * ej for t, ej in zip(theta, e)]
+    results, heldout = [], []
 
     def score(name, ws):
         for p, w in zip(params, ws):
             p.copy_(w.to(p.dtype))
-        results.append((name, lab_val()))
-        print0(f"readout step:{step} {name} val:{results[-1][1]:.5f}", console=True)
+        results.append((name, lab_eval(val_inputs, val_targets)))
+        heldout.append((name, lab_eval(*_lab_ho)))
+        print0(f"readout step:{step} {name} val:{results[-1][1]:.5f} heldout:{heldout[-1][1]:.5f}", console=True)
 
-    for lam in (0.0, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0):
-        score(f"tailema lam={lam}", blend(lam))
-    base_t = blend(TAILEMA_LAMBDA)
-    for base_name, base in (("raw", theta), (f"tailema{TAILEMA_LAMBDA}", base_t)):
-        for r, ref in sorted(_lab_ref.items()):
-            for g in (-0.15, -0.1, -0.075, -0.05, -0.025, 0.025, 0.05, 0.1):
-                score(f"{base_name}+ref{r} gamma={g}", [b + g * (b - q) for b, q in zip(base, ref)])
-        for b, m in sorted(_lab_vel.items()):
-            for g in (-6.0, -3.0, 3.0):
-                score(f"{base_name}+vel{b} gamma={g}", [w + g * mi for w, mi in zip(base, m)])
+    tail = _tailema if _tailema is not None else [None] * len(theta)
+    for lam in (0.0, 0.5, 0.6, 0.7):
+        score(f"tailema lam={lam}", mix(tail, lam))
+    base_t = mix(tail, TAILEMA_LAMBDA)
+    for (start, tau), e in sorted(_lab_ema.items()):
+        for lam in (0.5, 0.6, 0.7, 0.8):
+            score(f"ema{start}:{tau} lam={lam}", mix(e, lam))
+    for r, ref in sorted(_lab_ref.items()):
+        for g in (-0.1, -0.075, -0.05, -0.025):
+            score(f"tailema{TAILEMA_LAMBDA}+ref{r} gamma={g}", [b + g * (b - q) for b, q in zip(base_t, ref)])
+    if len(_lab_rre) == LAB_RRE_K + 1:
+        xs = [v for _, v in sorted(_lab_rre.items())]
+        for damping, cap in ((0.875, 0.001), (0.5, 0.001), (0.875, 0.0)):
+            delta, c = rre_extrapolate(xs, damping, cap)
+            print0(f"readout rre damping={damping} cap={cap} coeffs={[round(x, 3) for x in c]}", console=True)
+            for base_name, base in (("raw", theta), (f"tailema{TAILEMA_LAMBDA}", base_t)):
+                score(f"{base_name}+rre d={damping} cap={cap}", [b + d for b, d in zip(base, delta)])
     for p, t in zip(params, theta):
         p.copy_(t.to(p.dtype))
     if dist.get_rank() == 0:
         with open(logfile.replace(".txt", ".readout.json"), "w") as f:
-            json.dump(dict(step=step, results=results), f)
+            json.dump(dict(step=step, results=results, heldout=heldout), f)
     model.train()
 
 if RESUME_FROM:

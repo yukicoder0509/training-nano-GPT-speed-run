@@ -17,13 +17,19 @@ For each variant, checkpoint step k and seed:
   pass        first dense-val step with val_ema <= --target (3.28), variant vs controls
 Then the mean and standard error over seeds, and the control-fork noise (pooled SD of the replicas).
 
+Readout lab (--readouts <prefix>): reads the <log>.readout.json of each run <prefix>-s<seed>-k<k> (READOUT_LAB=1)
+and ranks every readout by its paired difference from the rec-46 readout (Tail-EMA lambda=0.6), mean and SE over
+seeds, also converted to steps with the controls' end-of-run slope.
+
 Example
   python fork_compare.py fork-vgate fork-vohead --parent ckpt-rec46 --control fork-ctrl
+  python fork_compare.py --readouts lab --ks 2000
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import glob
 import os
 import re
@@ -61,7 +67,9 @@ def first_pass(v: dict[int, float], target: float, end: int):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("variants", nargs="+", help="variant run-name prefixes (e.g. fork-vgate)")
+    ap.add_argument("--readouts", help="readout-lab run-name prefix")
+    ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("variants", nargs="*", help="variant run-name prefixes (e.g. fork-vgate)")
     ap.add_argument("--parent", default="ckpt-rec46", help="parent run-name prefix (also a control replica)")
     ap.add_argument("--control", default="fork-ctrl", help="control-fork run-name prefix")
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
@@ -70,6 +78,8 @@ def main():
     ap.add_argument("--target", type=float, default=3.28)
     args = ap.parse_args()
     E = args.end
+    if args.readouts:
+        return readouts(args)
 
     # control replicas per (seed, k)
     ctrl = {}
@@ -118,6 +128,52 @@ def main():
             if sv:
                 line += f"   mean steps_saved {st.mean(sv):+.1f}"
             print(line + "\n")
+
+
+def uuid_of(out_path: str) -> str | None:
+    with open(out_path, errors="replace") as f:
+        m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", f.read())
+    return m.group(0) if m else None
+
+
+def readouts(args):
+    per = {}  # readout -> {seed: val}
+    base_name = "tailema lam=0.6"
+    slopes = []
+    for s in args.seeds:
+        for k in args.ks:
+            for out in logs(args.readouts, s, k):
+                u = uuid_of(out)
+                path = os.path.join(ROOT, "logs", f"{u}.readout.json")
+                if not u or not os.path.exists(path):
+                    continue
+                js = json.load(open(path))
+                ho = dict(js.get("heldout", []))
+                for name, v in dict(js["results"]).items():
+                    per.setdefault(name, {})[s] = (v, ho.get(name))
+                v = read(out)
+                if args.end - 40 in v and args.end in v:
+                    slopes.append((v[args.end - 40] - v[args.end]) / 40)
+    if base_name not in per:
+        print("no readout results found")
+        return
+    sl = st.mean(slopes) if slopes else float("nan")
+    rows = []
+    for name, d in per.items():
+        seeds = sorted(set(d) & set(per[base_name]))
+        diffs = [d[s][0] - per[base_name][s][0] for s in seeds]
+        hdiffs = [d[s][1] - per[base_name][s][1] for s in seeds if d[s][1] is not None and per[base_name][s][1] is not None]
+        if len(diffs) < 1:
+            continue
+        se = st.stdev(diffs) / len(diffs) ** .5 if len(diffs) > 1 else float("nan")
+        rows.append((st.mean(diffs), se, st.mean(hdiffs) if hdiffs else None, name, len(diffs)))
+    rows.sort(key=lambda r: r[0])
+    print(f"readouts vs '{base_name}' at the stop step (negative = better); val slope {sl:.6f}/step\n"
+          "  val = the selection set; heldout = last train shard, not used for selection\n")
+    print(f"  {'val diff':>10} {'SE':>8} {'steps':>7} {'heldout':>10} {'n':>2}  readout")
+    for m, se, h, name, n in rows[:args.top]:
+        hs = "-" if h is None else f"{h:+.5f}"
+        print(f"  {m:>+10.5f} {se:>8.5f} {-m / sl:>+7.1f} {hs:>10} {n:>2}  {name}")
 
 
 if __name__ == "__main__":
