@@ -1501,6 +1501,24 @@ def run_readout_lab(step):
     model.train()
 
 _rowstat_prev = {}
+_radial = {}   # param name -> (EMA of g_i, EMA of g_i^2), g_i = <grad_i, W_i/|W_i|> per output row (rank 0)
+
+@torch.no_grad()
+def track_radial():
+    """Per-row radial gradient g_i = <grad_i, W_i/|W_i|> of the hidden matrices, EMA(0.98) of g and g^2 (rank 0).
+    |E g| / std(g) per row says whether a row feels a persistent pull to grow or shrink (signal) or only noise."""
+    if dist.get_rank() != 0:
+        return
+    for n, p in model.blocks.named_parameters():
+        if p.ndim != 2:
+            continue
+        w = p.float()
+        g = (p.grad.float() * w).sum(dim=1) / w.norm(dim=1).clamp_min(1e-8)
+        if n not in _radial:
+            _radial[n] = (g.clone(), g.square())
+        else:
+            _radial[n][0].lerp_(g, 0.02)
+            _radial[n][1].lerp_(g.square(), 0.02)
 
 @torch.no_grad()
 def log_rowstats(step):
@@ -1521,6 +1539,13 @@ def log_rowstats(step):
             rec.setdefault(f"{typ}/dlog_per_step", []).append(
                 ((r.log() - prev[1].log()).abs().mean() / max(step - prev[0], 1)).item())
         _rowstat_prev[n] = (step, r)
+    snr = {}
+    for n, (m1, m2) in _radial.items():
+        typ = n.split(".", 1)[1].rsplit(".", 1)[0].replace(".", "_")
+        snr.setdefault(typ, []).append(m1.abs() / (m2 - m1.square()).clamp_min(1e-30).sqrt())
+    for typ, v in snr.items():
+        v = torch.cat(v)
+        rec[f"{typ}/radial_snr_median"], rec[f"{typ}/radial_snr_frac_gt1"] = v.median().item(), (v > 1).float().mean().item()
     for typ, rs in by_type.items():
         r = torch.cat(rs)
         rec[f"{typ}/mean"], rec[f"{typ}/cv"] = r.mean().item(), (r.std() / r.mean()).item()
@@ -1608,6 +1633,7 @@ for step in range(RESUME_STEP, train_steps + 1):
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+    track_radial()
     # set optimization hyperparameters and take a step
     set_hparams(step)
     H.before_step()
