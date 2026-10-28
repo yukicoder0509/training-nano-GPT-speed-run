@@ -568,6 +568,10 @@ class ProbeQuadratic:
         probe_<dir>_opt_rel = (a/c) ||u_G|| / ||theta0_G||, the size of the greedy-optimal step relative to the weights.
                              The quadratic model is only probed at +-eps_rel; when opt_rel >> eps_rel, D and a/c are
                              extrapolations (trust their ranking, not their values)
+        probe_<dir>_c_desc, probe_<dir>_c_asc = one-sided curvatures <u, g0 - g(theta0 - eps u)>/eps (the side the
+                             step goes to) and <u, g(theta0 + eps u) - g0>/eps (no extra passes). Their gap is the
+                             third derivative T = (c_asc - c_desc)/eps that the central c cancels; for "step"
+        probe_step_dL_pred3 = -a + c/2 - T/6 (cubic model of the realized step)
         probe_<dir>_c_half = c re-measured with eps/2 (global group only): |c_half/c - 1| >> 0 means the finite
                              difference is not in its quadratic regime (or is dominated by bf16 rounding)
     For the realized step v = theta0 - theta1 (dir "step"; includes every floor/pin/decay/lookahead the optimizer
@@ -630,11 +634,11 @@ class ProbeQuadratic:
                     groups["type/hidden"].append(n)
             jobs += [(d, g, ns) for g, ns in groups.items()]
         dev = g0[names_all[0]].device
-        # a, c, <u,v>, |u||v|, c at eps/2 (step/global only), opt_rel numerator (|u| / |theta|)
-        vals = torch.zeros(len(jobs), 6, dtype=torch.float64, device=dev)
+        # a, c, <u,v>, |u||v|, c at eps/2 (step/global only), |u|/|theta|, c_desc, c_asc, eps
+        vals = torch.zeros(len(jobs), 9, dtype=torch.float64, device=dev)
         vals[:, 4] = float("nan")
 
-        def curvature(ns, u, eps):
+        def curvature(ns, u, eps):  # -> central c, descent-side c, ascent-side c
             gpm = []
             for sign in (1.0, -1.0):
                 with torch.no_grad():
@@ -644,7 +648,9 @@ class ProbeQuadratic:
             with torch.no_grad():
                 for n in ns:
                     self.p_of[n].copy_(theta0[n])
-            return sum((u[n].double() * (gpm[0][n].double() - gpm[1][n].double())).sum() for n in ns) / (2 * eps)
+            up = sum((u[n].double() * (gpm[0][n].double() - g0[n].double())).sum() for n in ns) / eps
+            down = sum((u[n].double() * (g0[n].double() - gpm[1][n].double())).sum() for n in ns) / eps
+            return (up + down) / 2, down, up
 
         for j, (d, gname, ns) in enumerate(jobs):
             u = dirs[d]
@@ -655,9 +661,10 @@ class ProbeQuadratic:
             th_norm = self._dot(theta0, theta0, ns).sqrt()
             eps = (self.eps_rel * th_norm / u_norm).item()
             vals[j, 0] = self._dot(g0, u, ns)
-            vals[j, 1] = curvature(ns, u, eps)
+            vals[j, 1], vals[j, 6], vals[j, 7] = curvature(ns, u, eps)
+            vals[j, 8] = eps
             if d == "step" and gname == "global":
-                vals[j, 4] = curvature(ns, u, eps / 2)
+                vals[j, 4] = curvature(ns, u, eps / 2)[0]
             v = dirs["step"]
             vals[j, 2] = self._dot(u, v, ns)
             vals[j, 3] = u_norm * self._dot(v, v, ns).sqrt()
@@ -666,10 +673,11 @@ class ProbeQuadratic:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             ws = torch.distributed.get_world_size()
             # a, c, c_half: average of per-rank probe shards; <u,v> and norms are identical on all ranks
-            ac = vals[:, [0, 1, 4]].contiguous()
+            red = [0, 1, 4, 6, 7]
+            ac = vals[:, red].contiguous()
             torch.distributed.all_reduce(ac, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.SUM)
-            vals[:, [0, 1, 4]] = ac / ws
+            vals[:, red] = ac / ws
             losses /= ws
         with torch.no_grad():
             for n in names_all:
@@ -678,9 +686,10 @@ class ProbeQuadratic:
         V = vals.cpu().tolist()
         loss0, loss1 = losses.tolist()
         rec: dict = {"global/probe_loss": _safe(loss0), "global/probe_step_dL": _safe(loss1 - loss0)}
-        for (d, gname, _), (a, c, uv, nn, c_half, u_rel) in zip(jobs, V):
+        for (d, gname, _), (a, c, uv, nn, c_half, u_rel, c_desc, c_asc, eps) in zip(jobs, V):
             k = f"{gname}/probe_{d}"
             rec[f"{k}_a"], rec[f"{k}_c"] = _safe(a), _safe(c)
+            rec[f"{k}_c_desc"], rec[f"{k}_c_asc"] = _safe(c_desc), _safe(c_asc)
             rec[f"{k}_D"] = _safe(a * a / (2 * c)) if c > 0 else None
             rec[f"{k}_opt_rel"] = _safe(abs(a) / c * u_rel) if c > 0 else None
             if math.isfinite(c_half):
@@ -688,6 +697,7 @@ class ProbeQuadratic:
             if d == "step":
                 rec[f"{k}_ratio"] = _safe(a / c) if c > 0 else None
                 rec[f"{k}_dL_pred"] = _safe(-a + c / 2)
+                rec[f"{k}_dL_pred3"] = _safe(-a + c / 2 - (c_asc - c_desc) / eps / 6) if eps > 0 else None
             else:
                 rec[f"{k}_cos"] = _safe(_div(uv, nn))
         return rec
