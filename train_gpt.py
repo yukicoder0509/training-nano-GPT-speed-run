@@ -120,12 +120,19 @@ TAILEMA_LAMBDA = 0.6
 #     blocks. NEWTON_MODE="soap": U <- SOAP(U) K, before the attn.proj trust gate and Newton-Schulz.
 #     NEWTON_MODE="grad": g <- g K before momentum (as in #15), so momentum, SOAP's statistics and the
 #     trust gate all see the preconditioned gradient.
+#     NEWTON_MODE="right": one-sided SOAP (output/row side only) then U <- SOAP_L(U) K, i.e. K replaces
+#     SOAP's input-side (column) whitening instead of stacking on it.
 NEWTON_MUON = os.environ.get("NEWTON_MUON", "1") == "1"
 NEWTON_MODE = os.environ.get("NEWTON_MODE", "soap")
-assert NEWTON_MODE in ("soap", "grad")
+assert NEWTON_MODE in ("soap", "grad", "right")
+SOAP_ONE_SIDED = NEWTON_MUON and NEWTON_MODE == "right"
 NEWTON_REFRESH = 64
 NEWTON_COV_EMA = 0.05
-NEWTON_DAMPING = 0.2
+NEWTON_DAMPING = float(os.environ.get("NEWTON_DAMPING", 0.2))   # larger -> K closer to a scaled identity
+# Per-type Muon lr multipliers (q/k/v, attn.proj, mlp.fc+mlp.proj); #15 used 0.8 : 1 : 1.2. The PowerCool
+# constant is scaled by the same factor so every type starts decaying at the same step.
+MUON_LR_MULT = dict(zip(("qkv", "attn_proj", "mlp"),
+                        (float(x) for x in os.environ.get("MUON_LR_MULT", "1,1,1").split(","))))
 NEWTON_BLOCK = 768
 
 
@@ -414,11 +421,14 @@ def soap_eigenbasis(mat: Tensor) -> Tensor:
     return torch.flip(q, [1])
 
 def soap_basis_qr(row_gg, col_gg, q_row, q_col, exp_avg_sq):
+    # col_gg is None for one-sided (row-only) SOAP
     row_eig = torch.diag(q_row.T @ row_gg @ q_row)
     row_sort = torch.argsort(row_eig, descending=True)
     q_row = q_row[:, row_sort]
     exp_avg_sq = exp_avg_sq.index_select(0, row_sort)
     q_row, _ = torch.linalg.qr(row_gg @ q_row)
+    if col_gg is None:
+        return q_row, q_col, exp_avg_sq
 
     col_eig = torch.diag(q_col.T @ col_gg @ q_col)
     col_sort = torch.argsort(col_eig, descending=True)
@@ -432,20 +442,21 @@ def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8):
     if state["q_row"] is None:
         return update
     q_row, q_col = state["q_row"], state["q_col"]
-    projected = q_row.T @ update_f @ q_col
+    projected = q_row.T @ update_f if q_col is None else q_row.T @ update_f @ q_col
     state["exp_avg_sq"].mul_(beta2).add_(projected.square(), alpha=1 - beta2)
     denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(SOAP_DENOM_POWER)
-    precond = q_row @ (projected / denom) @ q_col.T
+    precond = q_row @ (projected / denom) if q_col is None else q_row @ (projected / denom) @ q_col.T
     precond.mul_(gram_frobenius_norm_estimate(update_f, eps=eps) / gram_frobenius_norm_estimate(precond, eps=eps))
     return precond.to(update.dtype)
 
 def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, precondition_frequency=SOAP_PRECONDITION_FREQUENCY):
     grad_f = grad.float()
     state["row_gg"].lerp_(grad_f @ grad_f.T, 1 - shampoo_beta)
-    state["col_gg"].lerp_(grad_f.T @ grad_f, 1 - shampoo_beta)
+    if state["col_gg"] is not None:
+        state["col_gg"].lerp_(grad_f.T @ grad_f, 1 - shampoo_beta)
     if state["q_row"] is None:
         state["q_row"] = soap_eigenbasis(state["row_gg"])
-        state["q_col"] = soap_eigenbasis(state["col_gg"])
+        state["q_col"] = None if state["col_gg"] is None else soap_eigenbasis(state["col_gg"])
     elif state["soap_step"] > 0 and state["soap_step"] % precondition_frequency == 0:
         state["q_row"], state["q_col"], state["exp_avg_sq"] = soap_basis_qr(
             state["row_gg"], state["col_gg"], state["q_row"], state["q_col"], state["exp_avg_sq"]
@@ -544,8 +555,17 @@ class Muon(torch.optim.Optimizer):
         self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_param(n)}
         self.attn_proj_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
         self.step_count = 0
-        params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        if all(m == 1.0 for m in MUON_LR_MULT.values()):
+            params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
+        else:
+            by_type = {}
+            for n, p in named_params:
+                kind = "attn_proj" if is_attn_proj_param(n) else "qkv" if is_attn_param(n) else "mlp"
+                by_type.setdefault(kind, []).append(p)
+            params = [dict(params=sorted(ps, key=lambda x: x.size(), reverse=True),
+                           lr=lr * MUON_LR_MULT[kind], lr_mult=MUON_LR_MULT[kind])
+                      for kind, ps in by_type.items()]
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -567,7 +587,8 @@ class Muon(torch.optim.Optimizer):
                         if p in self.soap_params:
                             state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
                             state["row_gg"] = torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device)
-                            state["col_gg"] = torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device)
+                            state["col_gg"] = (None if SOAP_ONE_SIDED else
+                                               torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device))
                             state["q_row"] = None
                             state["q_col"] = None
                             state["soap_step"] = 0
@@ -581,7 +602,7 @@ class Muon(torch.optim.Optimizer):
                     if use_soap:
                         if is_attn_soap:
                             soap_update = soap_precondition_momentum(momentum_update, state)
-                            if self.newton is not None and NEWTON_MODE == "soap":
+                            if self.newton is not None and NEWTON_MODE in ("soap", "right"):
                                 soap_update = self.newton.apply(soap_update, p)
                             if p in self.attn_proj_soap_params:
                                 gate = bounded_trust_gate(
@@ -593,7 +614,7 @@ class Muon(torch.optim.Optimizer):
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
                             momentum_update = soap_precondition_momentum(momentum_update, state)
-                            if self.newton is not None and NEWTON_MODE == "soap":
+                            if self.newton is not None and NEWTON_MODE in ("soap", "right"):
                                 momentum_update = self.newton.apply(momentum_update, p)
                     update = muon_update(momentum_update)
                     update = scale_radial_update(update, p)
@@ -805,7 +826,7 @@ print0(f"Experiment={EXPERIMENT_NAME}")
 print0(f"Intuition={EXPERIMENT_INTUITION}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
-print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK}")
+print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK} muon_lr_mult={MUON_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
 print0(f"Using target_uw={TARGET_UW}")
@@ -959,7 +980,8 @@ optimizer1.param_groups[1]["power_c"] = ADAM_PROJ_POWER_C
 optimizer3.param_groups[0]["power_c"] = ADAM_OTHER_POWER_C
 optimizer3.param_groups[1]["power_c"] = ADAM_OTHER_POWER_C
 optimizer3.param_groups[2]["power_c"] = ADAM_OTHER_POWER_C
-optimizer2.param_groups[0]["power_c"] = MUON_POWER_C
+for group in optimizer2.param_groups:
+    group["power_c"] = MUON_POWER_C * group.get("lr_mult", 1.0)
 
 # learning rate schedule: stable then decay
 def _lr(step, initial_lr, power_c, power=1.0):
@@ -1013,7 +1035,8 @@ _tailema = None   # (A) Tail-EMA buffer: one fp32 tensor per non-embed param; la
 dist.barrier()
 t0 = time.perf_counter()
 H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None, config=dict(train_steps=train_steps, newton_muon=NEWTON_MUON, newton_mode=NEWTON_MODE,
-                                   newton_refresh=NEWTON_REFRESH, newton_damping=NEWTON_DAMPING))
+                                   newton_refresh=NEWTON_REFRESH, newton_damping=NEWTON_DAMPING,
+                                   muon_lr_mult=MUON_LR_MULT))
 for step in range(train_steps + 1):
     H.start_step()
 

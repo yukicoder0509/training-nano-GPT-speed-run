@@ -42,7 +42,8 @@ Each parameter is updated on one rank and then all-gathered.
    - Second moment: V ← 0.9·V + 0.1·P²
    - Precondition and rotate back: S = Q_L·(P / √V)·Q_Rᵀ, then rescale so ‖S‖_S4 = ‖U‖_S4.
    - On step 0 there is no eigenbasis yet, so S = U.
-3. **Newton-Muon right preconditioning, only when `NEWTON_MODE=soap` (the default)** (`NEWTON_MUON`, record #15 / PR #281):
+   - **One-sided when `NEWTON_MODE=right`:** R and Q_R are not kept, and Q_R = I. So P = Q_Lᵀ·U and S = Q_L·(P / √V), and K_ℓ takes over the input (column) side.
+3. **Newton-Muon right preconditioning, only when `NEWTON_MODE` is `soap` (the default) or `right`** (`NEWTON_MUON`, record #15 / PR #281):
    - Ŝ = S·K_ℓ, rescaled so ‖Ŝ‖_S4 = ‖S‖_S4.
    - K_ℓ is the preconditioner for this layer's input space (§2a).
    - For mlp.proj (input width 3072), K_ℓ is block-diagonal with 4 blocks of 768×768.
@@ -67,10 +68,14 @@ Each parameter is updated on one rank and then all-gathered.
    - Decay: W ← W ⊙ (1 − 0.025·η·1[O ⊙ W_old > 0]). The mask is taken from the weights before the step.
 9. **Update the SOAP statistics with the raw gradient** (used from the next step on):
    - L ← 0.9·L + 0.1·g·gᵀ
-   - R ← 0.9·R + 0.1·gᵀ·g
+   - R ← 0.9·R + 0.1·gᵀ·g (skipped in `right` mode)
    - Q_L ← qr(L·Q_L) and Q_R ← qr(R·Q_R): one power-iteration step every step, after sorting by eigenvalue.
 
-There is no gradient clipping and no other weight decay. Muon's η₀ = 0.0375.
+There is no gradient clipping and no other weight decay.
+
+**Muon learning rate:** η₀ = 0.0375 · m_type.
+- The multipliers m_type are set by `MUON_LR_MULT` = "m_qkv, m_attn.proj, m_mlp", default "1,1,1". #15's ratios are 0.8, 1, 1.2.
+- Each type's PowerCool constant is c·m_type, so η_t = m_type·η_t^(base) and every type starts decaying at the same step.
 
 ### 2a. Newton-Muon preconditioner K_ℓ
 
@@ -83,7 +88,8 @@ There is no gradient clipping and no other weight decay. Muon's η₀ = 0.0375.
 - **Collect statistics, only on refresh steps** (t + 1 ≡ 0 mod 64). Each layer's `Linear.forward` accumulates C_ℓ = mean over tokens of x·xᵀ for that step's batch. C_ℓ is averaged over ranks and microbatches.
 - **Refresh, at the start of that same step's Muon update:**
   - Σ_ℓ ← 0.95·Σ_ℓ + 0.05·C_ℓ
-  - K_ℓ = (Σ_ℓ + (0.2·tr(Σ_ℓ)/d + 10⁻⁸)·I)⁻¹, computed by Cholesky.
+  - K_ℓ = (Σ_ℓ + (δ·tr(Σ_ℓ)/d + 10⁻⁸)·I)⁻¹, computed by Cholesky.
+  - The damping is δ = `NEWTON_DAMPING`, default 0.2 (#15's value). A larger δ makes K_ℓ closer to a scaled identity, i.e. weaker preconditioning.
   - If the Cholesky fails, K_ℓ = I.
 - **Initial values:** Σ_ℓ = 0.001·I. K_ℓ = I until the first refresh at t = 63, so Newton-Muon has no effect on steps 0–62.
 
