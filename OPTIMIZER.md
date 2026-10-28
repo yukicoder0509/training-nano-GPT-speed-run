@@ -31,6 +31,9 @@ The wrapper keeps a buffer b and the previous weights W_prev for every parameter
 
 Each parameter is updated on one rank and then all-gathered.
 
+0. **Newton-Muon on the gradient, only when `NEWTON_MODE=grad`** (as in record #15):
+   - g ← g·K_ℓ, with no rescale (§2a).
+   - Every later use of g in this section (momentum, the trust gate's cos(·,g), and the L/R statistics) then sees g·K_ℓ.
 1. **Momentum (Nesterov form):**
    - m ← μ·m + (1−μ)·g
    - U = (1−μ)·g + μ·m
@@ -39,10 +42,11 @@ Each parameter is updated on one rank and then all-gathered.
    - Second moment: V ← 0.9·V + 0.1·P²
    - Precondition and rotate back: S = Q_L·(P / √V)·Q_Rᵀ, then rescale so ‖S‖_S4 = ‖U‖_S4.
    - On step 0 there is no eigenbasis yet, so S = U.
-3. **Newton-Muon right preconditioning** (`NEWTON_MUON`, record #15 / PR #281):
+3. **Newton-Muon right preconditioning, only when `NEWTON_MODE=soap` (the default)** (`NEWTON_MUON`, record #15 / PR #281):
    - Ŝ = S·K_ℓ, rescaled so ‖Ŝ‖_S4 = ‖S‖_S4.
    - K_ℓ is the preconditioner for this layer's input space (§2a).
    - For mlp.proj (input width 3072), K_ℓ is block-diagonal with 4 blocks of 768×768.
+   - With `NEWTON_MODE=grad`, this step is skipped and Ŝ = S.
 4. **Trust gate (attn.proj only).** For q, k, v and the MLP matrices, U ← Ŝ directly.
    - a = clip((cos(Ŝ,U) − 0.2)/0.8, 0, 1)
    - b = clip(cos(Ŝ,g) / cos(U,g), 0, 1)

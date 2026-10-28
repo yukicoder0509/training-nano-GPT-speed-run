@@ -117,8 +117,12 @@ TAILEMA_LAMBDA = 0.6
 #     SOAP-whitened update by K = (Sigma + DAMPING*tr(Sigma)/d*I)^-1, Sigma = EMA of the layer-input
 #     covariance x x^T (collected by forward hooks on refresh steps only). K is refreshed every REFRESH
 #     steps (K = I before the first refresh). mlp.proj (in=3072) uses a 4-block-diagonal K of 768^2
-#     blocks. Applied as U <- SOAP(U) K, before the attn.proj trust gate and Newton-Schulz.
+#     blocks. NEWTON_MODE="soap": U <- SOAP(U) K, before the attn.proj trust gate and Newton-Schulz.
+#     NEWTON_MODE="grad": g <- g K before momentum (as in #15), so momentum, SOAP's statistics and the
+#     trust gate all see the preconditioned gradient.
 NEWTON_MUON = os.environ.get("NEWTON_MUON", "1") == "1"
+NEWTON_MODE = os.environ.get("NEWTON_MODE", "soap")
+assert NEWTON_MODE in ("soap", "grad")
 NEWTON_REFRESH = 64
 NEWTON_COV_EMA = 0.05
 NEWTON_DAMPING = 0.2
@@ -511,15 +515,16 @@ class NewtonPreconditioner:
             st["count"].zero_()
         self.has_inv = True
 
-    def apply(self, update, p, eps=1e-8):
-        # U K (block-diagonal K for wide inputs), rescaled to keep U's Schatten-4 norm
+    def apply(self, update, p, rescale=True, eps=1e-8):
+        # U K (block-diagonal K for wide inputs), optionally rescaled to keep U's Schatten-4 norm
         if not self.has_inv:
             return update
         inv = self.of_param[p]["inv"]
         u = update.float()
         nb, d = inv.size(0), inv.size(-1)
         out = torch.bmm(u.view(u.size(0), nb, d).permute(1, 0, 2), inv).permute(1, 0, 2).reshape_as(u)
-        out.mul_(gram_frobenius_norm_estimate(u, eps=eps) / gram_frobenius_norm_estimate(out, eps=eps))
+        if rescale:
+            out.mul_(gram_frobenius_norm_estimate(u, eps=eps) / gram_frobenius_norm_estimate(out, eps=eps))
         return out.to(update.dtype)
 
 def muon_update(update):
@@ -564,6 +569,8 @@ class Muon(torch.optim.Optimizer):
                             state["q_col"] = None
                             state["soap_step"] = 0
                     grad = p.grad
+                    if self.newton is not None and NEWTON_MODE == "grad":
+                        grad = self.newton.apply(grad, p, rescale=False)
                     state["momentum"].lerp_(grad, 1 - group["mu"])
                     momentum_update = grad.lerp(state["momentum"], group["mu"])
                     is_attn_soap = p in self.attn_soap_params
@@ -571,7 +578,7 @@ class Muon(torch.optim.Optimizer):
                     if use_soap:
                         if is_attn_soap:
                             soap_update = soap_precondition_momentum(momentum_update, state)
-                            if self.newton is not None:
+                            if self.newton is not None and NEWTON_MODE == "soap":
                                 soap_update = self.newton.apply(soap_update, p)
                             if p in self.attn_proj_soap_params:
                                 gate = bounded_trust_gate(
@@ -583,7 +590,7 @@ class Muon(torch.optim.Optimizer):
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
                             momentum_update = soap_precondition_momentum(momentum_update, state)
-                            if self.newton is not None:
+                            if self.newton is not None and NEWTON_MODE == "soap":
                                 momentum_update = self.newton.apply(momentum_update, p)
                     update = muon_update(momentum_update)
                     update = scale_radial_update(update, p)
@@ -795,7 +802,7 @@ print0(f"Experiment={EXPERIMENT_NAME}")
 print0(f"Intuition={EXPERIMENT_INTUITION}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
-print0(f"Using newton_muon={NEWTON_MUON} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK}")
+print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
 print0(f"Using target_uw={TARGET_UW}")
@@ -1002,7 +1009,7 @@ training_time = 0
 _tailema = None   # (A) Tail-EMA buffer: one fp32 tensor per non-embed param; lazy-init at TAILEMA_START
 dist.barrier()
 t0 = time.perf_counter()
-H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None, config=dict(train_steps=train_steps, newton_muon=NEWTON_MUON,
+H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None, config=dict(train_steps=train_steps, newton_muon=NEWTON_MUON, newton_mode=NEWTON_MODE,
                                    newton_refresh=NEWTON_REFRESH, newton_damping=NEWTON_DAMPING))
 for step in range(train_steps + 1):
     H.start_step()
