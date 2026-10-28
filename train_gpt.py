@@ -1484,6 +1484,35 @@ def run_readout_lab(step):
             json.dump(dict(step=step, results=results, heldout=heldout), f)
     model.train()
 
+_rowstat_prev = {}
+
+@torch.no_grad()
+def log_rowstats(step):
+    """Row-norm statistics of the hidden matrices per type (rank 0, at validation steps) -> <log>.rowstat.jsonl:
+    mean and CV (std/mean) of the output-row norms, and the mean |d log row norm| per step since the last log."""
+    if dist.get_rank() != 0:
+        return
+    rec = {"step": step}
+    by_type = {}
+    for n, p in model.blocks.named_parameters():
+        if p.ndim != 2:
+            continue
+        typ = n.split(".", 1)[1].rsplit(".", 1)[0].replace(".", "_")   # attn_q, attn_proj, mlp_fc, ...
+        r = p.float().norm(dim=1)
+        by_type.setdefault(typ, []).append(r)
+        prev = _rowstat_prev.get(n)
+        if prev is not None:
+            rec.setdefault(f"{typ}/dlog_per_step", []).append(
+                ((r.log() - prev[1].log()).abs().mean() / max(step - prev[0], 1)).item())
+        _rowstat_prev[n] = (step, r)
+    for typ, rs in by_type.items():
+        r = torch.cat(rs)
+        rec[f"{typ}/mean"], rec[f"{typ}/cv"] = r.mean().item(), (r.std() / r.mean()).item()
+        if f"{typ}/dlog_per_step" in rec:
+            rec[f"{typ}/dlog_per_step"] = sum(rec[f"{typ}/dlog_per_step"]) / len(rec[f"{typ}/dlog_per_step"])
+    with open(logfile.replace(".txt", ".rowstat.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
 if RESUME_FROM:
     load_checkpoint(RESUME_FROM)
 if READOUT_LAB:
@@ -1529,6 +1558,7 @@ for step in range(RESUME_STEP, train_steps + 1):
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} val_ema_loss:{val_ema_loss:.5f} train_time:{training_time:.3f}s"
                + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
         H.log_val(step, val_ema_loss, val_raw_loss=val_loss)
+        log_rowstats(step)
         model.train()
         # start the clock again
         dist.barrier()
