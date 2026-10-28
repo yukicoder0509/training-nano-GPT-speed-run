@@ -115,7 +115,7 @@ TAILEMA_END = 2900
 TAILEMA_LAMBDA = 0.6
 # (D) Newton-Muon (record #15, PR #281, arXiv:2604.01472): right-precondition every hidden matrix's
 #     SOAP-whitened update by K = (Sigma + DAMPING*tr(Sigma)/d*I)^-1, Sigma = EMA of the layer-input
-#     covariance x x^T (collected by forward hooks on refresh steps only). K is refreshed every REFRESH
+#     covariance x x^T (collected in Linear.forward on refresh steps only). K is refreshed every REFRESH
 #     steps (K = I before the first refresh). mlp.proj (in=3072) uses a 4-block-diagonal K of 768^2
 #     blocks. NEWTON_MODE="soap": U <- SOAP(U) K, before the attn.proj trust gate and Newton-Schulz.
 #     NEWTON_MODE="grad": g <- g K before momentum (as in #15), so momentum, SOAP's statistics and the
@@ -181,8 +181,18 @@ class RMSNorm(nn.Module):
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=True)
+        # Newton-Muon input statistics, set only on refresh steps: (nb, d, d) accumulator + count.
+        # Collected in forward (not a hook) because forward hooks added after model.compile never fire.
+        self.newton_accum = None
+        self.newton_count = None
 
     def forward(self, x):
+        if self.newton_accum is not None:
+            xf = x.detach().flatten(0, -2).float()
+            n, nb, d = xf.size(0), self.newton_accum.size(0), self.newton_accum.size(-1)
+            xf = xf.reshape(n, nb, d).permute(1, 2, 0)
+            self.newton_accum.add_(torch.bmm(xf, xf.mT), alpha=1 / n)
+            self.newton_count.add_(1)
         return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
 
 class Rotary(nn.Module):
@@ -442,17 +452,6 @@ def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, preconditio
         )
     state["soap_step"] += 1
 
-@torch.compiler.disable
-@torch.no_grad()
-def newton_stat_hook(module, inputs, output):
-    # per-token mean of x x^T for this microbatch (split into BLOCK-wide feature blocks)
-    st = module._newton_stat
-    x = inputs[0].detach().flatten(0, -2).float()
-    n, nb = x.size(0), st["accum"].size(0)
-    x = x.reshape(n, nb, NEWTON_BLOCK).permute(1, 2, 0)
-    st["accum"].add_(torch.bmm(x, x.mT), alpha=1 / n)
-    st["count"].add_(1)
-
 class NewtonPreconditioner:
     """Newton-Muon right preconditioner, one K per layer-input space (q/k/v share theirs)."""
     def __init__(self, model):
@@ -464,7 +463,6 @@ class NewtonPreconditioner:
                 nb = src.weight.size(1) // d
                 st = dict(module=src, n=nb,
                           accum=torch.zeros(nb, d, d, device=dev), count=torch.zeros((), device=dev))
-                src._newton_stat = st
                 self.stats.append(st)
                 for u in users:
                     self.of_param[u.weight] = st
@@ -479,18 +477,17 @@ class NewtonPreconditioner:
             st["slice"] = slice(i, i + st["n"])
             i += st["n"]
         self.has_inv = False
-        self.hooks = []
 
     def is_refresh_step(self, step):
         return (step + 1) % NEWTON_REFRESH == 0
 
-    def enable_hooks(self):
-        self.hooks = [st["module"].register_forward_hook(newton_stat_hook) for st in self.stats]
+    def enable_capture(self):
+        for st in self.stats:
+            st["module"].newton_accum, st["module"].newton_count = st["accum"], st["count"]
 
-    def disable_hooks(self):
-        for h in self.hooks:
-            h.remove()
-        self.hooks = []
+    def disable_capture(self):
+        for st in self.stats:
+            st["module"].newton_accum = st["module"].newton_count = None
 
     @torch.no_grad()
     def refresh(self):
@@ -510,7 +507,7 @@ class NewtonPreconditioner:
         torch.cholesky_inverse(L, upper=False, out=self.K)
         if info.any():
             self.K[info != 0] = torch.eye(d, device=self.K.device)
-        # diagnostics: hook counts and how far K is from a scaled identity
+        # diagnostics: capture counts and how far K is from a scaled identity
         Kn = self.K / self.K.diagonal(dim1=-2, dim2=-1).mean(-1).view(-1, 1, 1)
         off = (Kn - torch.eye(d, device=Kn.device)).norm(dim=(-2, -1)) / d**0.5
         self.last_diag = dict(count_min=self.counts.min().item(), count_max=self.counts.max().item(),
@@ -1071,9 +1068,9 @@ for step in range(train_steps + 1):
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
     optimizers[0].nesterov_step()
-    newton_hooks = newton is not None and newton.is_refresh_step(step)
-    if newton_hooks:
-        newton.enable_hooks()
+    newton_capture = newton is not None and newton.is_refresh_step(step)
+    if newton_capture:
+        newton.enable_capture()
     train_loss = 0
     for i in range(len(inputs) // mbs):
         loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
@@ -1082,8 +1079,8 @@ for step in range(train_steps + 1):
             raise RuntimeError(f"non-finite train loss at step {step} mb {i}: {loss.item()}")
         loss.backward()
         train_loss = train_loss + loss.detach()
-    if newton_hooks:
-        newton.disable_hooks()
+    if newton_capture:
+        newton.disable_capture()
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)

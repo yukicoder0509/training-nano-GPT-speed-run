@@ -80,7 +80,7 @@ There is no gradient clipping and no other weight decay. Muon's η₀ = 0.0375.
 - the input of mlp.fc (output of norm2);
 - the input of mlp.proj (relu² activations), split into 4 blocks of 768.
 
-- **Collect statistics, only on refresh steps** (t + 1 ≡ 0 mod 64). A forward hook on each layer accumulates C_ℓ = mean over tokens of x·xᵀ for that step's batch. C_ℓ is averaged over ranks and microbatches.
+- **Collect statistics, only on refresh steps** (t + 1 ≡ 0 mod 64). Each layer's `Linear.forward` accumulates C_ℓ = mean over tokens of x·xᵀ for that step's batch. C_ℓ is averaged over ranks and microbatches.
 - **Refresh, at the start of that same step's Muon update:**
   - Σ_ℓ ← 0.95·Σ_ℓ + 0.05·C_ℓ
   - K_ℓ = (Σ_ℓ + (0.2·tr(Σ_ℓ)/d + 10⁻⁸)·I)⁻¹, computed by Cholesky.
