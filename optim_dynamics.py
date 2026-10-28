@@ -565,6 +565,11 @@ class ProbeQuadratic:
         probe_<dir>_D      = a^2 / (2c): the largest one-step probe-loss drop along u at the best scale; scale-free,
                              so it compares DIRECTIONS (None when c <= 0)
         probe_<dir>_cos    = cos(u, realized step) over G
+        probe_<dir>_opt_rel = (a/c) ||u_G|| / ||theta0_G||, the size of the greedy-optimal step relative to the weights.
+                             The quadratic model is only probed at +-eps_rel; when opt_rel >> eps_rel, D and a/c are
+                             extrapolations (trust their ranking, not their values)
+        probe_<dir>_c_half = c re-measured with eps/2 (global group only): |c_half/c - 1| >> 0 means the finite
+                             difference is not in its quadratic regime (or is dominated by bf16 rounding)
     For the realized step v = theta0 - theta1 (dir "step"; includes every floor/pin/decay/lookahead the optimizer
     applied), the step taken is s = 1, so
         probe_step_ratio   = a / c = eta* / eta, the greedy optimal step scale relative to the one taken
@@ -572,7 +577,8 @@ class ProbeQuadratic:
                              compare across groups and over time, not in absolute terms)
         probe_step_dL_pred = -a + c/2 (quadratic model of the realized step), and on "global" only
         probe_step_dL      = L(theta1) - L(theta0), the measured probe-loss change, as a check of the model.
-    Groups: "global" and "type/<block type>". Collective under torch.distributed: every rank calls measure() at the
+    Groups: "global", "type/<block type>", and "type/hidden" = the params that have candidate directions (e.g. the
+    Muon matrices), so the realized step's D there is directly comparable with the candidates' "global" D. Collective under torch.distributed: every rank calls measure() at the
     same step with the same direction/parameter keys (directions must be identical on all ranks); per-rank probe
     shards are averaged. The model's weights are restored bit-exactly afterwards and p.grad is untouched.
 
@@ -612,6 +618,7 @@ class ProbeQuadratic:
         dirs = {"step": {n: theta0[n].to(hi[n]) - theta1[n].to(hi[n]) for n in names_all}, **(directions or {})}
         loss0, g0 = self._grads(names_all)
 
+        cand = {n for d, u in dirs.items() if d != "step" for n in u}
         jobs = []  # (dir, group name, names)
         for d, u in dirs.items():
             groups: dict[str, list[str]] = defaultdict(list)
@@ -619,18 +626,15 @@ class ProbeQuadratic:
                 groups["global"].append(n)
                 if self.per_type:
                     groups[f"type/{self.typ_of[n]}"].append(n)
+                if cand and n in cand:
+                    groups["type/hidden"].append(n)
             jobs += [(d, g, ns) for g, ns in groups.items()]
         dev = g0[names_all[0]].device
-        vals = torch.zeros(len(jobs), 4, dtype=torch.float64, device=dev)  # a, c, <u,v>, |u||v|
-        for j, (d, gname, ns) in enumerate(jobs):
-            u = dirs[d]
-            u_norm = self._dot(u, u, ns).sqrt()
-            if u_norm <= 0:
-                vals[j, 1] = float("nan")
-                continue
-            th_norm = self._dot(theta0, theta0, ns).sqrt()
-            eps = (self.eps_rel * th_norm / u_norm).item()
-            vals[j, 0] = self._dot(g0, u, ns)
+        # a, c, <u,v>, |u||v|, c at eps/2 (step/global only), opt_rel numerator (|u| / |theta|)
+        vals = torch.zeros(len(jobs), 6, dtype=torch.float64, device=dev)
+        vals[:, 4] = float("nan")
+
+        def curvature(ns, u, eps):
             gpm = []
             for sign in (1.0, -1.0):
                 with torch.no_grad():
@@ -640,18 +644,32 @@ class ProbeQuadratic:
             with torch.no_grad():
                 for n in ns:
                     self.p_of[n].copy_(theta0[n])
-            vals[j, 1] = sum((u[n].double() * (gpm[0][n].double() - gpm[1][n].double())).sum() for n in ns) / (2 * eps)
+            return sum((u[n].double() * (gpm[0][n].double() - gpm[1][n].double())).sum() for n in ns) / (2 * eps)
+
+        for j, (d, gname, ns) in enumerate(jobs):
+            u = dirs[d]
+            u_norm = self._dot(u, u, ns).sqrt()
+            if u_norm <= 0:
+                vals[j, 1] = float("nan")
+                continue
+            th_norm = self._dot(theta0, theta0, ns).sqrt()
+            eps = (self.eps_rel * th_norm / u_norm).item()
+            vals[j, 0] = self._dot(g0, u, ns)
+            vals[j, 1] = curvature(ns, u, eps)
+            if d == "step" and gname == "global":
+                vals[j, 4] = curvature(ns, u, eps / 2)
             v = dirs["step"]
             vals[j, 2] = self._dot(u, v, ns)
             vals[j, 3] = u_norm * self._dot(v, v, ns).sqrt()
-            del gpm
+            vals[j, 5] = u_norm / th_norm
         losses = torch.stack([loss0, loss1])
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             ws = torch.distributed.get_world_size()
-            ac = vals[:, :2].contiguous()
+            # a, c, c_half: average of per-rank probe shards; <u,v> and norms are identical on all ranks
+            ac = vals[:, [0, 1, 4]].contiguous()
             torch.distributed.all_reduce(ac, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.SUM)
-            vals[:, :2] = ac / ws  # a, c: average of per-rank probe shards; <u,v> and norms are identical on all ranks
+            vals[:, [0, 1, 4]] = ac / ws
             losses /= ws
         with torch.no_grad():
             for n in names_all:
@@ -660,10 +678,13 @@ class ProbeQuadratic:
         V = vals.cpu().tolist()
         loss0, loss1 = losses.tolist()
         rec: dict = {"global/probe_loss": _safe(loss0), "global/probe_step_dL": _safe(loss1 - loss0)}
-        for (d, gname, _), (a, c, uv, nn) in zip(jobs, V):
+        for (d, gname, _), (a, c, uv, nn, c_half, u_rel) in zip(jobs, V):
             k = f"{gname}/probe_{d}"
             rec[f"{k}_a"], rec[f"{k}_c"] = _safe(a), _safe(c)
             rec[f"{k}_D"] = _safe(a * a / (2 * c)) if c > 0 else None
+            rec[f"{k}_opt_rel"] = _safe(abs(a) / c * u_rel) if c > 0 else None
+            if math.isfinite(c_half):
+                rec[f"{k}_c_half"] = _safe(c_half)
             if d == "step":
                 rec[f"{k}_ratio"] = _safe(a / c) if c > 0 else None
                 rec[f"{k}_dL_pred"] = _safe(-a + c / 2)
