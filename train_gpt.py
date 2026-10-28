@@ -131,10 +131,10 @@ ROWFLOOR_RHO = 1.0
 CWD = 0.025
 # (A) Tail-EMA eval readout: slow weight EMA over [START,END] (token embed excluded), eval the
 #     partial blend (1-LAMBDA)*w + LAMBDA*ema. TAILEMA_TAU=0 -> off (eval raw weights only).
-TAILEMA_TAU = 150.0
-TAILEMA_START = 2400
+TAILEMA_TAU = float(os.environ.get("TAILEMA_TAU", 150.0))
+TAILEMA_START = int(os.environ.get("TAILEMA_START", 2400))
 TAILEMA_END = 2900
-TAILEMA_LAMBDA = 0.6
+TAILEMA_LAMBDA = float(os.environ.get("TAILEMA_LAMBDA", 0.6))
 # (D) Newton-Muon (record #15, PR #281, arXiv:2604.01472): right-precondition every hidden matrix's
 #     SOAP-whitened update by K = (Sigma + DAMPING*tr(Sigma)/d*I)^-1, Sigma = EMA of the layer-input
 #     covariance x x^T (collected in Linear.forward on refresh steps only). K is refreshed every REFRESH
@@ -1350,7 +1350,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):

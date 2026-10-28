@@ -120,7 +120,7 @@ There is no gradient clipping and no other weight decay.
 
 ## 4. Evaluation only: Tail-EMA (training is unaffected)
 
-- For 2400 ≤ t < 2900, every parameter except the token embedding keeps an average: ē ← ē + (W − ē)/150.
+- For 2400 ≤ t < 2900, every parameter except the token embedding keeps an average: ē ← ē + (W − ē)/150. (env `TAILEMA_START`, `TAILEMA_TAU`, `TAILEMA_LAMBDA`; defaults 2400 / 150 / 0.6.)
 - Validation is scored on the blend (1 − 0.6)·W + 0.6·ē. This is the reported `val_ema_loss`.
 - Validation runs every 125 steps, at the stop step, and densely every 5 steps over 2650–2690 (`DENSE_VAL`, "lo:hi:stride"), so a run can be scored at the earliest step that passes.
 - Readout lab (`READOUT_LAB=1`, eval only): keeps weight snapshots after `LAB_REF_STEPS` and update-EMAs m_β (β = 0.9, 0.97) of Δθ from `LAB_VEL_START`; at the stop step scores θ_eval = base + γ·(base − θ_ref) and base + γ·m_β, for base = raw W or the Tail-EMA blend, plus a λ grid of the Tail-EMA blend. Results go to `<log>.readout.json`.
