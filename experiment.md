@@ -468,3 +468,24 @@ All nine full runs are below the mean of rec-46 on the same seeds; with the seed
    - Per-step SNR (EMA ≈ 50 steps) is 0.02–0.09 everywhere, so the equilibrium is only visible over hundreds of steps; this rules out "a strong persistent pull held back by the pin".
 
 **Candidate for full-run validation** (commit `b7ae8c3`): `ROW_GAIN_LR=0.02 ROW_GAIN_SCOPE=q,k,v,o,fc ROW_GAIN_START=1000 TAILEMA_START=2100 TAILEMA_TAU=200` (λ 0.6), seeds 0–7 (`cand-rg20`), plus rec-46 controls for seeds 5–7 (`ctrl-rec46`). Scored by `fork_compare.py --full`: Track 3 rule at each dense step, earliest passing step, and seed-paired difference from the rec-46 controls.
+
+### Full-run validation of the candidate (8 seeds)
+
+Commit `b7ae8c3`. Reproduce one seed:
+
+```
+NEWTON_MUON=0 ROW_GAIN_LR=0.02 ROW_GAIN_SCOPE=q,k,v,o,fc ROW_GAIN_START=1000 TAILEMA_START=2100 TAILEMA_TAU=200 \
+WANDB_RUN_NAME=cand-rg20 sbatch --job-name=cand-rg20-s<seed> run_record.sbatch b7ae8c3 --seed <seed>
+```
+
+Track 3 rule (3.28 − mean)·√n ≥ 0.004, n = 8 (`fork_compare.py --full cand-rg20`):
+
+| step | 2650 | 2655 | 2660 | **2665** | 2670 | 2680 | 2690 |
+|---|---|---|---|---|---|---|---|
+| mean val_ema | 3.27953 | 3.27919 | 3.27888 | **3.27858** | 3.27829 | 3.27771 | 3.27717 |
+| (3.28 − mean)·√8 | 0.00132 | 0.00231 | 0.00315 | **0.00403** | 0.00484 | 0.00647 | 0.00802 |
+
+- **Earliest passing step: 2665** (rec-46: 2690). Borderline (0.00403 vs 0.004); seeds 8–15 queued.
+- Seed-paired vs rec-46 controls at 2690 (controls: `ckpt-rec46`, `aux-control`, `ctrl-rec46`; mean where a seed has two): −0.00103, −0.00197, −0.00029, −0.00024, −0.00114, −0.00195, −0.00240, −0.00333; **mean −0.00154 ± 0.00038 (SE)**, all 8 negative, ≈ 23 steps at the end-of-run slope.
+- rec-46 controls at this commit, seeds 5–7, alone: mean 3.27898 (does not pass by 2690 with n = 3; for reference only).
+- W&B: [s0](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/vd8eol60) [s1](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/xgq882m1) [s2](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/wm78t2y9) [s3](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/uw2c8g4r) [s4](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/vw9eh8gb) [s5](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/dstii5eg) [s6](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/aysiph0t) [s7](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/1epj5o1f) 
