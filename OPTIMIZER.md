@@ -1,0 +1,100 @@
+# Optimizer step (math)
+
+This is the update that `train_gpt.py` at this commit performs on each training step. Keep this file in sync with the code: any commit that changes the optimizer updates this file in the same commit.
+
+Notation: t is the loop step; g = ∇L, the gradient summed over ranks. W is a parameter and η_t its learning rate. ‖X‖_S4 = ‖XᵀX‖_F^½ is the Schatten-4 norm, which is what `gram_frobenius_norm_estimate` computes. ⊙ is elementwise multiplication.
+
+## 0. Schedules (`set_hparams`)
+
+- **Learning rate (PowerCool), per parameter group:** η_t = min(η₀, c·(T_end − t)^1.2), with T_end = 2900 (`FINAL_SCHEDULE_STEPS`).
+  - Each group has its own constant c (`*_POWER_C`). Muon starts decaying at about step 511.
+- **Muon momentum μ_t:**
+  - rises linearly 0.85 → 0.95 over steps 0–300;
+  - holds at 0.95;
+  - falls linearly 0.95 → 0.85 over steps 2700–2900.
+- Training stops at `STOP_STEP` = 2690, so at the last step η is still 5.4 % of η₀ for Muon, and the μ cooldown never starts.
+
+## 1. Outer wrapper: EMA-Nesterov (all parameters)
+
+The wrapper keeps a buffer b and the previous weights W_prev for every parameter.
+
+- **Before the forward pass, only when 300 ≤ t < 1950:**
+  W ← W + β_t·b, with β_t = 0.3·η_{t−1}/η₀.
+  - The LR ratio is taken from the embedding Adam group, using the previous step's LR.
+  - The shift is not undone afterwards.
+- The forward and backward passes then run at the shifted point, and the inner optimizers step W → W′.
+- **After the inner step:**
+  - b ← 0.99·b + 0.01·(W′ − W_prev)
+  - W_prev ← W′
+
+## 2. Muon: hidden 2-D matrices (q, k, v, attn.proj, mlp.fc, mlp.proj)
+
+Each parameter is updated on one rank and then all-gathered.
+
+1. **Momentum (Nesterov form):**
+   - m ← μ·m + (1−μ)·g
+   - U = (1−μ)·g + μ·m
+2. **SOAP whitening in an eigenbasis.** L, R, Q_L, Q_R and V are SOAP's per-parameter state.
+   - Rotate: P = Q_Lᵀ·U·Q_R
+   - Second moment: V ← 0.9·V + 0.1·P²
+   - Precondition and rotate back: S = Q_L·(P / √V)·Q_Rᵀ, then rescale so ‖S‖_S4 = ‖U‖_S4.
+   - On step 0 there is no eigenbasis yet, so S = U.
+3. **Newton-Muon right preconditioning** (`NEWTON_MUON`, record #15 / PR #281):
+   - Ŝ = S·K_ℓ, rescaled so ‖Ŝ‖_S4 = ‖S‖_S4.
+   - K_ℓ is the preconditioner for this layer's input space (§2a).
+   - For mlp.proj (input width 3072), K_ℓ is block-diagonal with 4 blocks of 768×768.
+4. **Trust gate (attn.proj only).** For q, k, v and the MLP matrices, U ← Ŝ directly.
+   - a = clip((cos(Ŝ,U) − 0.2)/0.8, 0, 1)
+   - b = clip(cos(Ŝ,g) / cos(U,g), 0, 1)
+   - γ = clip(a·b, floor_t, cap_t)
+     - floor_t is 0.45 for t < 1375, then falls linearly to 0 at t = 1625.
+     - cap_t is 0.85 for t < 1625, then 1.
+   - Blend: U ← (U + γ·(Ŝ − U)), rescaled to ‖U‖_S4.
+5. **Orthogonalize:** O = NS₁₂(U / ‖U‖_S4) · √max(1, rows/cols).
+   - NS₁₂ is 12 Newton–Schulz iterations in bf16: X ← 2X − 1.5(XXᵀ)X + 0.5(XXᵀ)²X.
+6. **Damp the radial part:**
+   - c = ⟨O,W⟩ / ‖W‖²
+   - O ← (O − c·W) + s·c·W
+   - s = 0.5 when the step would grow ‖W‖ (c < 0), and 1 otherwise.
+7. **RowFloor:** for each output row i, O_i ← max(1, 0.3825·‖W_i‖ / ‖O_i‖)·O_i.
+8. **Radius pin, then cautious weight decay:**
+   - Target norm: r* = ‖W‖ − η·⟨O,W⟩ / ‖W‖
+   - Step: W ← W − η·O, then W ← W · r* / ‖W‖
+   - Decay: W ← W ⊙ (1 − 0.025·η·1[O ⊙ W_old > 0]). The mask is taken from the weights before the step.
+9. **Update the SOAP statistics with the raw gradient** (used from the next step on):
+   - L ← 0.9·L + 0.1·g·gᵀ
+   - R ← 0.9·R + 0.1·gᵀ·g
+   - Q_L ← qr(L·Q_L) and Q_R ← qr(R·Q_R): one power-iteration step every step, after sorting by eigenvalue.
+
+There is no gradient clipping and no other weight decay. Muon's η₀ = 0.0375.
+
+### 2a. Newton-Muon preconditioner K_ℓ
+
+ℓ indexes the input spaces, 4 per block:
+- the shared input of q/k/v (output of norm1);
+- the input of attn.proj (attention output);
+- the input of mlp.fc (output of norm2);
+- the input of mlp.proj (relu² activations), split into 4 blocks of 768.
+
+- **Collect statistics, only on refresh steps** (t + 1 ≡ 0 mod 64). A forward hook on each layer accumulates C_ℓ = mean over tokens of x·xᵀ for that step's batch. C_ℓ is averaged over ranks and microbatches.
+- **Refresh, at the start of that same step's Muon update:**
+  - Σ_ℓ ← 0.95·Σ_ℓ + 0.05·C_ℓ
+  - K_ℓ = (Σ_ℓ + (0.2·tr(Σ_ℓ)/d + 10⁻⁸)·I)⁻¹, computed by Cholesky.
+  - If the Cholesky fails, K_ℓ = I.
+- **Initial values:** Σ_ℓ = 0.001·I. K_ℓ = I until the first refresh at t = 63, so Newton-Muon has no effect on steps 0–62.
+
+## 3. Adam groups
+
+- **Embedding and lm_head:** `torch.optim.AdamW`.
+  - β = (0.8, 0.99), ε = 1e-10, no weight decay, standard bias correction.
+  - η₀ is 0.3 for the embedding and 1/320 for lm_head.
+- **1-D parameters (norm gains and biases):** Adam without bias correction, η₀ = 0.01.
+  - m ← 0.8·m + 0.2·g
+  - v ← β₂·v + (1−β₂)·g²
+  - W ← W − η·m / (√v + 1e-10)
+  - β₂ is 0.99 for gains, 0.9965 for the attn.proj bias, and 0.997 for everything else.
+
+## 4. Evaluation only: Tail-EMA (training is unaffected)
+
+- For 2400 ≤ t < 2900, every parameter except the token embedding keeps an average: ē ← ē + (W − ē)/150.
+- Validation is scored on the blend (1 − 0.6)·W + 0.6·ē. This is the reported `val_ema_loss`.

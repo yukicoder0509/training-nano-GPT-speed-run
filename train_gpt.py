@@ -113,6 +113,16 @@ TAILEMA_TAU = 150.0
 TAILEMA_START = 2400
 TAILEMA_END = 2900
 TAILEMA_LAMBDA = 0.6
+# (D) Newton-Muon (record #15, PR #281, arXiv:2604.01472): right-precondition every hidden matrix's
+#     SOAP-whitened update by K = (Sigma + DAMPING*tr(Sigma)/d*I)^-1, Sigma = EMA of the layer-input
+#     covariance x x^T (collected by forward hooks on refresh steps only). K is refreshed every REFRESH
+#     steps (K = I before the first refresh). mlp.proj (in=3072) uses a 4-block-diagonal K of 768^2
+#     blocks. Applied as U <- SOAP(U) K, before the attn.proj trust gate and Newton-Schulz.
+NEWTON_MUON = os.environ.get("NEWTON_MUON", "1") == "1"
+NEWTON_REFRESH = 64
+NEWTON_COV_EMA = 0.05
+NEWTON_DAMPING = 0.2
+NEWTON_BLOCK = 768
 
 
 ########################################
@@ -428,6 +438,90 @@ def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, preconditio
         )
     state["soap_step"] += 1
 
+@torch.compiler.disable
+@torch.no_grad()
+def newton_stat_hook(module, inputs, output):
+    # per-token mean of x x^T for this microbatch (split into BLOCK-wide feature blocks)
+    st = module._newton_stat
+    x = inputs[0].detach().flatten(0, -2).float()
+    n, nb = x.size(0), st["accum"].size(0)
+    x = x.reshape(n, nb, NEWTON_BLOCK).permute(1, 2, 0)
+    st["accum"].add_(torch.bmm(x, x.mT), alpha=1 / n)
+    st["count"].add_(1)
+
+class NewtonPreconditioner:
+    """Newton-Muon right preconditioner, one K per layer-input space (q/k/v share theirs)."""
+    def __init__(self, model):
+        dev, d = next(model.parameters()).device, NEWTON_BLOCK
+        self.stats, self.of_param = [], {}
+        for block in model.blocks:
+            a, m = block.attn, block.mlp
+            for src, users in ((a.q, (a.q, a.k, a.v)), (a.proj, (a.proj,)), (m.fc, (m.fc,)), (m.proj, (m.proj,))):
+                nb = src.weight.size(1) // d
+                st = dict(module=src, n=nb,
+                          accum=torch.zeros(nb, d, d, device=dev), count=torch.zeros((), device=dev))
+                src._newton_stat = st
+                self.stats.append(st)
+                for u in users:
+                    self.of_param[u.weight] = st
+        n = sum(st["n"] for st in self.stats)
+        eye = torch.eye(d, device=dev).repeat(n, 1, 1)
+        self.cov = 0.001 * eye
+        self.K = eye.clone()
+        self.counts = torch.zeros(n, device=dev)
+        i = 0
+        for st in self.stats:
+            st["inv"] = self.K[i:i + st["n"]]
+            st["slice"] = slice(i, i + st["n"])
+            i += st["n"]
+        self.has_inv = False
+        self.hooks = []
+
+    def is_refresh_step(self, step):
+        return (step + 1) % NEWTON_REFRESH == 0
+
+    def enable_hooks(self):
+        self.hooks = [st["module"].register_forward_hook(newton_stat_hook) for st in self.stats]
+
+    def disable_hooks(self):
+        for h in self.hooks:
+            h.remove()
+        self.hooks = []
+
+    @torch.no_grad()
+    def refresh(self):
+        # all ranks: Sigma <- lerp(Sigma, mean_batch x x^T, COV_EMA); K = (Sigma + damping)^-1
+        batch = torch.cat([st["accum"] for st in self.stats])
+        for st in self.stats:
+            self.counts[st["slice"]] = st["count"]
+        dist.all_reduce(batch, op=dist.ReduceOp.SUM)
+        dist.all_reduce(self.counts, op=dist.ReduceOp.SUM)
+        batch.div_(self.counts.clamp_min(1).view(-1, 1, 1))
+        self.cov.lerp_(batch, (self.counts > 0).float().mul(NEWTON_COV_EMA).view(-1, 1, 1))
+        d = self.cov.size(-1)
+        damped = self.cov.clone()
+        diag = damped.diagonal(dim1=-2, dim2=-1)
+        diag.add_((diag.sum(-1) / d * NEWTON_DAMPING + 1e-8).unsqueeze(-1))
+        L, info = torch.linalg.cholesky_ex(damped, upper=False, check_errors=False)
+        torch.cholesky_inverse(L, upper=False, out=self.K)
+        if info.any():
+            self.K[info != 0] = torch.eye(d, device=self.K.device)
+        for st in self.stats:
+            st["accum"].zero_()
+            st["count"].zero_()
+        self.has_inv = True
+
+    def apply(self, update, p, eps=1e-8):
+        # U K (block-diagonal K for wide inputs), rescaled to keep U's Schatten-4 norm
+        if not self.has_inv:
+            return update
+        inv = self.of_param[p]["inv"]
+        u = update.float()
+        nb, d = inv.size(0), inv.size(-1)
+        out = torch.bmm(u.view(u.size(0), nb, d).permute(1, 0, 2), inv).permute(1, 0, 2).reshape_as(u)
+        out.mul_(gram_frobenius_norm_estimate(u, eps=eps) / gram_frobenius_norm_estimate(out, eps=eps))
+        return out.to(update.dtype)
+
 def muon_update(update):
     # Newton-Schulz orthogonalization + aspect-ratio scale.
     update = zeropower_via_newtonschulz5(update)
@@ -436,8 +530,9 @@ def muon_update(update):
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, named_params, lr=0.02, weight_decay=0, mu=0.95):
+    def __init__(self, named_params, lr=0.02, weight_decay=0, mu=0.95, newton=None):
         assert isinstance(named_params, list) and len(named_params) >= 1
+        self.newton = newton
         self.soap_params = {p for n, p in named_params if should_soap_param(n)}
         self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_param(n)}
         self.attn_proj_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
@@ -450,6 +545,8 @@ class Muon(torch.optim.Optimizer):
     def step(self):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
+        if self.newton is not None and self.newton.is_refresh_step(self.step_count):
+            self.newton.refresh()
         for group in self.param_groups:
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
@@ -474,6 +571,8 @@ class Muon(torch.optim.Optimizer):
                     if use_soap:
                         if is_attn_soap:
                             soap_update = soap_precondition_momentum(momentum_update, state)
+                            if self.newton is not None:
+                                soap_update = self.newton.apply(soap_update, p)
                             if p in self.attn_proj_soap_params:
                                 gate = bounded_trust_gate(
                                     trust_gate(momentum_update, soap_update, grad),
@@ -484,6 +583,8 @@ class Muon(torch.optim.Optimizer):
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
                             momentum_update = soap_precondition_momentum(momentum_update, state)
+                            if self.newton is not None:
+                                momentum_update = self.newton.apply(momentum_update, p)
                     update = muon_update(momentum_update)
                     update = scale_radial_update(update, p)
                     # u/w-floor. SOAP and non-SOAP params can use different floors.
@@ -694,6 +795,7 @@ print0(f"Experiment={EXPERIMENT_NAME}")
 print0(f"Intuition={EXPERIMENT_INTUITION}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
+print0(f"Using newton_muon={NEWTON_MUON} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
 print0(f"Using target_uw={TARGET_UW}")
@@ -824,8 +926,9 @@ optimizer3 = Adam([
     ],
     lr=0.01, betas=(0.8, 0.99), eps=1e-10)
 # Skylight-001: NorMuon-lite (per-row variance) + u/w-floor + lr=0.0375.
+newton = NewtonPreconditioner(model) if NEWTON_MUON else None
 optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
-                  lr=MUON_LR, mu=MU)
+                  lr=MUON_LR, mu=MU, newton=newton)
 optimizers = [optimizer1, optimizer2, optimizer3]
 optimizers = [EMA_Nesterov(
         [p for p in model.parameters()],
@@ -899,7 +1002,8 @@ training_time = 0
 _tailema = None   # (A) Tail-EMA buffer: one fp32 tensor per non-embed param; lazy-init at TAILEMA_START
 dist.barrier()
 t0 = time.perf_counter()
-H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None, config=dict(train_steps=train_steps))
+H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None, config=dict(train_steps=train_steps, newton_muon=NEWTON_MUON,
+                                   newton_refresh=NEWTON_REFRESH, newton_damping=NEWTON_DAMPING))
 for step in range(train_steps + 1):
     H.start_step()
 
@@ -954,6 +1058,9 @@ for step in range(train_steps + 1):
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
     optimizers[0].nesterov_step()
+    newton_hooks = newton is not None and newton.is_refresh_step(step)
+    if newton_hooks:
+        newton.enable_hooks()
     train_loss = 0
     for i in range(len(inputs) // mbs):
         loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
@@ -962,6 +1069,8 @@ for step in range(train_steps + 1):
             raise RuntimeError(f"non-finite train loss at step {step} mb {i}: {loss.item()}")
         loss.backward()
         train_loss = train_loss + loss.detach()
+    if newton_hooks:
+        newton.disable_hooks()
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
