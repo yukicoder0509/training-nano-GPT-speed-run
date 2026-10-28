@@ -134,6 +134,11 @@ NEWTON_DAMPING = float(os.environ.get("NEWTON_DAMPING", 0.2))   # larger -> K cl
 MUON_LR_MULT = dict(zip(("qkv", "attn_proj", "mlp"),
                         (float(x) for x in os.environ.get("MUON_LR_MULT", "1,1,1").split(","))))
 NEWTON_BLOCK = 768
+# 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
+# the PowerCool constant, i.e. the whole LR curve.
+GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
+AUX_BETA1 = float(os.environ.get("AUX_BETA1", 0.8))
+AUX_LR_MULT = float(os.environ.get("AUX_LR_MULT", 1.0))
 
 
 ########################################
@@ -842,6 +847,7 @@ print0(f"Intuition={EXPERIMENT_INTUITION}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
 print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK} muon_lr_mult={MUON_LR_MULT}")
+print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
 print0(f"Using target_uw={TARGET_UW}")
@@ -979,9 +985,9 @@ other_aux_params = [p for n, p in model.named_parameters()
 # NOTE: we do NOT use torch.optim.AdamW here because AdamW applies (1-beta^t) bias
 # correction, which CenterShrinkAdam does not -- they are not equivalent.
 optimizer3 = Adam([
-        dict(params=gain_aux_params, lr=0.01, betas=(0.8, 0.99)),
-        dict(params=other_aux_params, lr=0.01, betas=(0.8, 0.997)),
-        dict(params=attn_proj_bias_params, lr=0.01, betas=(0.8, 0.9965)),
+        dict(params=gain_aux_params, lr=0.01 * AUX_LR_MULT, betas=(AUX_BETA1, GAIN_BETA2)),
+        dict(params=other_aux_params, lr=0.01 * AUX_LR_MULT, betas=(AUX_BETA1, 0.997)),
+        dict(params=attn_proj_bias_params, lr=0.01 * AUX_LR_MULT, betas=(AUX_BETA1, 0.9965)),
     ],
     lr=0.01, betas=(0.8, 0.99), eps=1e-10)
 # Skylight-001: NorMuon-lite (per-row variance) + u/w-floor + lr=0.0375.
@@ -1005,9 +1011,8 @@ for opt in optimizers[0].inner_optimizer:
         group["initial_lr"] = group["lr"]
 optimizer1.param_groups[0]["power_c"] = ADAM_EMBED_POWER_C
 optimizer1.param_groups[1]["power_c"] = ADAM_PROJ_POWER_C
-optimizer3.param_groups[0]["power_c"] = ADAM_OTHER_POWER_C
-optimizer3.param_groups[1]["power_c"] = ADAM_OTHER_POWER_C
-optimizer3.param_groups[2]["power_c"] = ADAM_OTHER_POWER_C
+for group in optimizer3.param_groups:
+    group["power_c"] = ADAM_OTHER_POWER_C * AUX_LR_MULT
 for group in optimizer2.param_groups:
     group["power_c"] = MUON_POWER_C * group.get("lr_mult", 1.0)
 
@@ -1065,7 +1070,8 @@ t0 = time.perf_counter()
 H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None,
                     probe_loss_fn=probe_loss_fn, gns_loss_fn=gns_loss_fn, config=dict(train_steps=train_steps, newton_muon=NEWTON_MUON, newton_mode=NEWTON_MODE,
                                    newton_refresh=NEWTON_REFRESH, newton_damping=NEWTON_DAMPING,
-                                   muon_lr_mult=MUON_LR_MULT))
+                                   muon_lr_mult=MUON_LR_MULT, gain_beta2=GAIN_BETA2,
+                                   aux_beta1=AUX_BETA1, aux_lr_mult=AUX_LR_MULT))
 for step in range(train_steps + 1):
     H.start_step()
 

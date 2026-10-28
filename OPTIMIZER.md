@@ -98,11 +98,12 @@ There is no gradient clipping and no other weight decay.
 - **Embedding and lm_head:** `torch.optim.AdamW`.
   - β = (0.8, 0.99), ε = 1e-10, no weight decay, standard bias correction.
   - η₀ is 0.3 for the embedding and 1/320 for lm_head.
-- **1-D parameters (norm gains and biases):** Adam without bias correction, η₀ = 0.01.
-  - m ← 0.8·m + 0.2·g
+- **1-D parameters (norm gains and biases):** Adam without bias correction, η₀ = 0.01·a.
+  - m ← β₁·m + (1−β₁)·g, with β₁ = 0.8
   - v ← β₂·v + (1−β₂)·g²
   - W ← W − η·m / (√v + 1e-10)
   - β₂ is 0.99 for gains, 0.9965 for the attn.proj bias, and 0.997 for everything else.
+  - Ablation knobs (env), defaults = rec-46: `GAIN_BETA2` (gains' β₂, 0.99), `AUX_BETA1` (β₁ for all 1-D params, 0.8), `AUX_LR_MULT` = a (1.0). a scales the PowerCool constant too, so η_t = a·η_t^(base).
 
 ## 4. Evaluation only: Tail-EMA (training is unaffected)
 
