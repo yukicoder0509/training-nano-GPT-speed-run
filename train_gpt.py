@@ -755,12 +755,6 @@ class Muon(torch.optim.Optimizer):
         self.gated_params = self.attn_proj_soap_params | (self.v_params if V_GATE else set())
         self.vo_params = self.v_params | {p for n, p in named_params if is_attn_proj_param(n)}
         self.head_mask = None
-
-    def in_scope(self, p, scope):
-        return scope == "all" or (scope == "vo" and p in self.vo_params)
-
-    def sink_of(self, p):
-        return SOAP_SINK if SOAP_SINK and self.in_scope(p, SOAP_SINK_SCOPE) else ""
         self.step_count = 0
         # Probe diagnostics (harness.ProbeQuadratic): on probe steps the harness sets probe_capture and this optimizer
         # records, per param it owns, the candidate update directions below (descent convention, W -= lr*u).
@@ -784,6 +778,12 @@ class Muon(torch.optim.Optimizer):
                            lr=lr * lr_mult, lr_mult=lr_mult, floor_mult=floor_mult)
                       for (lr_mult, floor_mult), ps in by_type.items()]
         super().__init__(params, defaults)
+
+    def in_scope(self, p, scope):
+        return scope == "all" or (scope == "vo" and p in self.vo_params)
+
+    def sink_of(self, p):
+        return SOAP_SINK if SOAP_SINK and self.in_scope(p, SOAP_SINK_SCOPE) else ""
 
     def _capture(self, p, name, u):
         if self.probe_capture:
