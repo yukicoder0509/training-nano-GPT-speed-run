@@ -260,3 +260,21 @@ Commit `257e962`, `NEWTON_MUON=0`, stop 2690, paired with the same-seed controls
 - `V_GATE`: mean −0.0021 ± 0.0012 (SE from the paired SD 0.0017), about 1.8σ. Both runs are below 4 of the 5 controls. Promising; needs seeds 2–4.
 - `VO_HEAD`: mean −0.0011; `VO_DENOM_POWER=0.25`: mean −0.0007. Both inside the noise with 2 seeds.
 - ρ for attn_v got *more* negative with the gate and with V^¼ (−0.30 → −0.38) while the loss improved, and gate/V^¼ are behind at step 1000 and ahead by 2690. More bounce, better result: further evidence that ρ is not a target to minimize. The probe D picked the right ordering; ρ would have picked the wrong one.
+
+### V_GATE on seeds 2–4, and V_GATE + VO_HEAD (5 runs)
+
+Commit `257e962`, paired with the same-seed controls.
+
+| Seed | control | `V_GATE=1` | Δ | `V_GATE=1 VO_HEAD=1` | Δ |
+|---|---|---|---|---|---|
+| 0 | 3.27980 | 3.27783 | −0.00197 | 3.27976 ([cfti692z](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/cfti692z)) | −0.00004 |
+| 1 | 3.27942 | 3.27717 | −0.00225 | 3.27844 ([2uy7yhs1](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/2uy7yhs1)) | −0.00098 |
+| 2 | 3.27863 | 3.27794 ([4fhoxffa](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/4fhoxffa)) | −0.00069 | | |
+| 3 | 3.27698 | 3.27744 ([oyranqda](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/oyranqda)) | +0.00046 | | |
+| 4 | 3.27937 | 3.27951 ([mm322vc9](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/mm322vc9)) | +0.00014 | | |
+| mean | 3.27884 | 3.27798 | **−0.00086 ± 0.00054 (SE)** | | −0.00051 (2 seeds) |
+
+**Conclusion.**
+- `V_GATE`: the 2-seed −0.0021 shrank to −0.0009 at 5 seeds (paired t ≈ 1.6, p ≈ 0.19). Possibly a small real gain, not established. Same pattern as gain β₂: the first seeds overstated it.
+- `V_GATE + VO_HEAD` is worse than `V_GATE` alone on the same seeds (−0.0005 vs −0.0021): the two do not add.
+- Defaults stay at rec-46.
