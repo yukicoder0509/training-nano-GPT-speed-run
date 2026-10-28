@@ -244,3 +244,19 @@ Commit `3a47570`, same setup. Seeds 3/4 control: [3gpqdh4y](https://forge.corewe
 - The greedy-optimal step sizes (opt_rel 0.003–0.03) are at or below the probed ±0.02, so these D values are interpolated, not extrapolated.
 - Taken alone, V gains 2–5×; with the V–O cross curvature counted, the gains shrink to 5–12%.
 - vo_shared is dropped (≤ 1). vo_gate, vo_p25 and vo_head go to full runs (`V_GATE`, `VO_DENOM_POWER=0.25`, `VO_HEAD`, commit `257e962`), seeds 0 and 1, paired with the existing same-seed controls.
+
+### V/O variants: full runs (6 runs)
+
+Commit `257e962`, `NEWTON_MUON=0`, stop 2690, paired with the same-seed controls (s0 3.27980, s1 3.27942).
+
+| Variant (env) | Seed | val @1000 | val @2000 | **val_ema @2690** | Δ vs control | ρ attn_v | ρ attn_o | W&B |
+|---|---|---|---|---|---|---|---|---|
+| control | 0 / 1 | 3.62924 / 3.62781 | 3.39517 / 3.39488 | 3.27980 / 3.27942 | – | −0.302 / −0.290 | −0.247 / −0.236 | [stsjiyx6](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/stsjiyx6) / [98ygxss6](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/98ygxss6) |
+| `V_GATE=1` | 0 / 1 | 3.63120 / 3.62909 | 3.39474 / 3.39357 | 3.27783 / 3.27717 | −0.00197 / −0.00225 | −0.396 / −0.363 | −0.277 / −0.267 | [p0zgwh4z](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/p0zgwh4z) / [8c0b2qih](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/8c0b2qih) |
+| `VO_HEAD=1` | 0 / 1 | 3.62838 / 3.62694 | 3.39390 / 3.39378 | 3.27849 / 3.27846 | −0.00131 / −0.00096 | −0.303 / −0.315 | −0.266 / −0.268 | [ebxv80f6](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/ebxv80f6) / [0d74vmza](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/0d74vmza) |
+| `VO_DENOM_POWER=0.25` | 0 / 1 | 3.63161 / 3.63291 | 3.39547 / 3.39580 | 3.27887 / 3.27894 | −0.00093 / −0.00048 | −0.388 / −0.396 | −0.269 / −0.280 | [h3la4wa7](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/h3la4wa7) / [0ood5853](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/0ood5853) |
+
+- All six runs are below their controls. The ranking matches the probe screen's V∪O ranking (gate > head ≈ p25).
+- `V_GATE`: mean −0.0021 ± 0.0012 (SE from the paired SD 0.0017), about 1.8σ. Both runs are below 4 of the 5 controls. Promising; needs seeds 2–4.
+- `VO_HEAD`: mean −0.0011; `VO_DENOM_POWER=0.25`: mean −0.0007. Both inside the noise with 2 seeds.
+- ρ for attn_v got *more* negative with the gate and with V^¼ (−0.30 → −0.38) while the loss improved, and gate/V^¼ are behind at step 1000 and ahead by 2690. More bounce, better result: further evidence that ρ is not a target to minimize. The probe D picked the right ordering; ρ would have picked the wrong one.
