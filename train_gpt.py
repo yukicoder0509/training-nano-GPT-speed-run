@@ -510,6 +510,11 @@ class NewtonPreconditioner:
         torch.cholesky_inverse(L, upper=False, out=self.K)
         if info.any():
             self.K[info != 0] = torch.eye(d, device=self.K.device)
+        # diagnostics: hook counts and how far K is from a scaled identity
+        Kn = self.K / self.K.diagonal(dim1=-2, dim2=-1).mean(-1).view(-1, 1, 1)
+        off = (Kn - torch.eye(d, device=Kn.device)).norm(dim=(-2, -1)) / d**0.5
+        self.last_diag = dict(count_min=self.counts.min().item(), count_max=self.counts.max().item(),
+                              K_offident=off.mean().item(), cholesky_fail=int((info != 0).sum().item()))
         for st in self.stats:
             st["accum"].zero_()
             st["count"].zero_()
@@ -552,6 +557,7 @@ class Muon(torch.optim.Optimizer):
         rank = dist.get_rank()
         if self.newton is not None and self.newton.is_refresh_step(self.step_count):
             self.newton.refresh()
+            print0(f"newton refresh step:{self.step_count} " + " ".join(f"{k}:{v:.4g}" for k, v in self.newton.last_diag.items()), console=True)
         for group in self.param_groups:
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
