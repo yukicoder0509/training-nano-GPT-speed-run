@@ -138,6 +138,9 @@ NEWTON_BLOCK = 768
 # Muon lr (and PowerCool constant); VO_FLOOR_MULT scales their RowFloor target u/w.
 VO_LR_MULT = float(os.environ.get("VO_LR_MULT", 1.0))
 VO_FLOOR_MULT = float(os.environ.get("VO_FLOOR_MULT", 1.0))
+# Screening only: compute V/O SOAP variant directions (class VOVariants) and record them on probe steps for
+# harness.ProbeQuadratic. They are never applied, so training is unchanged; costs extra compute every step.
+VO_VARIANTS = os.environ.get("VO_VARIANTS", "0") == "1"
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -472,6 +475,97 @@ def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, preconditio
         )
     state["soap_step"] += 1
 
+class VOVariants:
+    """V/O SOAP variant directions for screening (VO_VARIANTS=1); never applied to the weights.
+
+    Kept up to date every step for the attn.v / attn.proj params this rank owns; on probe steps Muon records each
+    variant, after the same attn.proj trust gate and Newton-Schulz as the real path, as a candidate direction:
+      vo_ns      the real direction, restricted to V/O (the baseline the others are compared with)
+      vo_head    per-head SOAP: V's output side and O's input side use block-diagonal (heads x HEAD_DIM) statistics
+      vo_shared  one basis for V's output side and O's input side (the same space), from the sum of the two
+                 trace-normalized statistics g_V g_V^T / |g_V|^2 + g_O^T g_O / |g_O|^2
+      vo_p25     the real SOAP state with denominator V^(1/4) instead of V^(1/2) (partial whitening)
+      vo_gate    the attn.proj trust gate also applied on attn.v (O = the real direction)
+    The shadow states (vo_head, vo_shared) run the same SOAP recurrences as the real one, from step 0.
+    """
+    names = ["vo_ns", "vo_head", "vo_shared", "vo_p25", "vo_gate"]
+
+    def __init__(self, named_params):
+        self.kind, self.partner, self.state = {}, {}, {}
+        pairs = {}
+        for n, p in named_params:
+            if n.endswith(".attn.v.weight") or n.endswith(".attn.proj.weight"):
+                k = "v" if n.endswith(".attn.v.weight") else "o"
+                self.kind[p] = k
+                pairs.setdefault(n.split(".attn.")[0], {})[k] = p
+        for pr in pairs.values():
+            self.partner[pr["v"]], self.partner[pr["o"]] = pr["o"], pr["v"]
+        self.mask = None
+
+    @staticmethod
+    def _new_state(p):
+        return dict(exp_avg_sq=torch.zeros_like(p, dtype=torch.float32),
+                    row_gg=torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device),
+                    col_gg=torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device),
+                    q_row=None, q_col=None, soap_step=0)
+
+    @staticmethod
+    def _update_stats(st, row_new, col_new):  # soap_update_preconditioner with given statistics
+        st["row_gg"].lerp_(row_new, 1 - SOAP_BETA2)
+        st["col_gg"].lerp_(col_new, 1 - SOAP_BETA2)
+        if st["q_row"] is None:
+            st["q_row"], st["q_col"] = soap_eigenbasis(st["row_gg"]), soap_eigenbasis(st["col_gg"])
+        elif st["soap_step"] > 0 and st["soap_step"] % SOAP_PRECONDITION_FREQUENCY == 0:
+            st["q_row"], st["q_col"], st["exp_avg_sq"] = soap_basis_qr(
+                st["row_gg"], st["col_gg"], st["q_row"], st["q_col"], st["exp_avg_sq"])
+        st["soap_step"] += 1
+
+    def step(self, p, grad, mom, soap_out, real_state, step_count, capture):
+        """Advance the shadow states; on capture steps return {name: pre-Newton-Schulz direction} (vo_ns excluded)."""
+        kind = self.kind[p]
+        if p not in self.state:
+            self.state[p] = dict(head=self._new_state(p), shared=self._new_state(p))
+        if self.mask is None:
+            h = p.size(0) // HEAD_DIM
+            self.mask = torch.block_diag(*[torch.ones(HEAD_DIM, HEAD_DIM, device=p.device)] * h)
+        sts = self.state[p]
+        dirs = {}
+        if capture:
+            dirs["vo_head"] = soap_precondition_momentum(mom, sts["head"])
+            dirs["vo_shared"] = soap_precondition_momentum(mom, sts["shared"])
+            if real_state["q_row"] is None:
+                dirs["vo_p25"] = mom
+            else:
+                q_row, q_col, m = real_state["q_row"], real_state["q_col"], mom.float()
+                proj = q_row.T @ m @ q_col
+                pre = q_row @ (proj / real_state["exp_avg_sq"].clamp_min(1e-16).pow(0.25)) @ q_col.T
+                pre.mul_(gram_frobenius_norm_estimate(m) / gram_frobenius_norm_estimate(pre))
+                dirs["vo_p25"] = pre.to(mom.dtype)
+            if kind == "o":  # O keeps the real trust gate, applied to each variant
+                for k, d in dirs.items():
+                    dirs[k] = norm_preserving_blend(mom, d, bounded_trust_gate(trust_gate(mom, d, grad), step_count))
+            else:
+                dirs["vo_gate"] = norm_preserving_blend(
+                    mom, soap_out, bounded_trust_gate(trust_gate(mom, soap_out, grad), step_count))
+        else:  # keep the shadow second moments advancing exactly as they would on capture steps
+            soap_precondition_momentum(mom, sts["head"])
+            soap_precondition_momentum(mom, sts["shared"])
+        g = grad.float()
+        gp = self.partner[p].grad.float()
+        gg_row, gg_col = g @ g.T, g.T @ g
+        if kind == "v":  # heads live on V's output side (rows)
+            self._update_stats(sts["head"], gg_row * self.mask, gg_col)
+            pg = gp.T @ gp  # O's input side = V's output space
+            self._update_stats(sts["shared"], gg_row / gg_row.trace().clamp_min(1e-30)
+                               + pg / pg.trace().clamp_min(1e-30), gg_col)
+        else:  # heads live on O's input side (columns)
+            self._update_stats(sts["head"], gg_row, gg_col * self.mask)
+            pg = gp @ gp.T  # V's output side
+            self._update_stats(sts["shared"], gg_row, gg_col / gg_col.trace().clamp_min(1e-30)
+                               + pg / pg.trace().clamp_min(1e-30))
+        return dirs
+
+
 class NewtonPreconditioner:
     """Newton-Muon right preconditioner, one K per layer-input space (q/k/v share theirs)."""
     def __init__(self, model):
@@ -549,6 +643,10 @@ class NewtonPreconditioner:
             out.mul_(gram_frobenius_norm_estimate(u, eps=eps) / gram_frobenius_norm_estimate(out, eps=eps))
         return out.to(update.dtype)
 
+def dirs_or_real(pre_ns, real, names):
+    """Variant directions after Newton-Schulz; a variant without its own direction here is the real one."""
+    return {k: (muon_update(pre_ns[k]) if k in pre_ns else real) for k in names}
+
 def muon_update(update):
     # Newton-Schulz orthogonalization + aspect-ratio scale.
     update = zeropower_via_newtonschulz5(update)
@@ -569,6 +667,9 @@ class Muon(torch.optim.Optimizer):
         # A new direction idea ("variant") is screened by adding its name here and a self._capture call.
         self.probe_capture, self.probe_dirs = False, {}
         self.probe_dir_names = ["momentum", "soap"] + (["newton"] if newton is not None and NEWTON_MODE != "grad" else []) + ["ns"]
+        self.vo = VOVariants(named_params) if VO_VARIANTS else None
+        if self.vo is not None:
+            self.probe_dir_names += VOVariants.names
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         if all(m == 1.0 for m in MUON_LR_MULT.values()) and VO_LR_MULT == 1.0 and VO_FLOOR_MULT == 1.0:
             params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
@@ -619,6 +720,7 @@ class Muon(torch.optim.Optimizer):
                     momentum_update = grad.lerp(state["momentum"], group["mu"])
                     self._capture(p, "momentum", momentum_update)
                     is_attn_soap = p in self.attn_soap_params
+                    vo_dirs = None
                     use_soap = p in self.soap_params
                     if use_soap:
                         if is_attn_soap:
@@ -634,6 +736,8 @@ class Muon(torch.optim.Optimizer):
                                 )
                             else:
                                 gate = torch.ones((), dtype=torch.float32, device=p.device)
+                            vo_dirs = (self.vo.step(p, grad, momentum_update, soap_update, state, self.step_count,
+                                                    self.probe_capture) if self.vo is not None and p in self.vo.kind else None)
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
                             momentum_update = soap_precondition_momentum(momentum_update, state)
@@ -643,6 +747,10 @@ class Muon(torch.optim.Optimizer):
                                 self._capture(p, "newton", momentum_update)
                     update = muon_update(momentum_update)
                     self._capture(p, "ns", update)
+                    if self.probe_capture and vo_dirs is not None:
+                        self._capture(p, "vo_ns", update)
+                        for k, d in dirs_or_real(vo_dirs, update, VOVariants.names[1:]).items():
+                            self._capture(p, k, d)
                     update = scale_radial_update(update, p)
                     # u/w-floor. SOAP and non-SOAP params can use different floors.
                     p_fro = p.float().norm().clamp_min(1e-8)
@@ -853,7 +961,7 @@ print0(f"Intuition={EXPERIMENT_INTUITION}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
 print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK} muon_lr_mult={MUON_LR_MULT}")
-print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT}")
+print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants={VO_VARIANTS}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
