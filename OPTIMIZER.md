@@ -115,3 +115,5 @@ There is no gradient clipping and no other weight decay.
 
 - For 2400 ≤ t < 2900, every parameter except the token embedding keeps an average: ē ← ē + (W − ē)/150.
 - Validation is scored on the blend (1 − 0.6)·W + 0.6·ē. This is the reported `val_ema_loss`.
+- Validation runs every 125 steps, at the stop step, and densely every 5 steps over 2650–2690 (`DENSE_VAL`, "lo:hi:stride"), so a run can be scored at the earliest step that passes.
+- Checkpoint/fork (`CKPT_STEPS`, `RESUME_FROM`) restores the exact training state above (weights, Muon/SOAP, Adam, EMA-Nesterov, Tail-EMA, data position); it does not change the update.

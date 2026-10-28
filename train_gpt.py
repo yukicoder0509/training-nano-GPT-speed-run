@@ -43,6 +43,7 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import argparse
+import json
 import uuid
 import time
 from pathlib import Path
@@ -94,6 +95,17 @@ ATTN_TRUST_MIN_GRAD_ALIGN = 0.00
 ATTN_TRUST_POWER = 1.00
 TRAIN_PROGRESS_INTERVAL = 0
 LOG_DIR = Path("logs")
+# Checkpoint / fork. CKPT_STEPS="1000,1500,2000" saves the full training state at the top of those steps (after their
+# validation) to CKPT_DIR/step<k>/: common.pt (replicated state, rank 0) + muon_rank<r>.pt (each rank's Muon shard).
+# RESUME_FROM=<CKPT_DIR>/step<k> starts the loop at step k from that state; env knobs set for the resumed run take
+# effect from step k on (a fork). Not covered: the Newton-Muon K/covariance and the VO_VARIANTS shadow states.
+CKPT_STEPS = {int(x) for x in os.environ.get("CKPT_STEPS", "").split(",") if x}
+CKPT_DIR = os.environ.get("CKPT_DIR", f"/work/{os.environ.get('USER', 'user')}/nanogpt-ckpt/"
+                                      f"{os.environ.get('WANDB_RUN_NAME', 'run')}-seed{args.seed}")
+RESUME_FROM = os.environ.get("RESUME_FROM", "")
+RESUME_STEP = json.load(open(f"{RESUME_FROM}/meta.json"))["step"] if RESUME_FROM else 0
+# Dense validation near the end, "lo:hi:stride" (inclusive), to score a run at the earliest step that passes.
+DENSE_VAL = os.environ.get("DENSE_VAL", "2650:2690:5")
 RADIAL_OUTWARD_SCALE = 0.5
 RADIAL_INWARD_SCALE = 1.0
 HEAD_DIM = 128
@@ -170,7 +182,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024, skip=0):
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     files = sorted(Path.cwd().glob(filename_pattern))
@@ -181,6 +193,9 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
     while True:
         if pos + batch_size + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
+        if skip > 0:  # resume: fast-forward past the batches already trained on
+            skip, pos = skip - 1, pos + batch_size
+            continue
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
@@ -1011,7 +1026,7 @@ print0("="*100)
 val_tokens = 20 * 524288
 batch_size = 8 * 64 * 1024
 mbs = 64
-train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size, skip=RESUME_STEP)
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 # Held-out training data for the diagnostics (harness: ProbeQuadratic, GradNoiseScale): the last train shard, which
 # training never reaches. Its first batch is the FIXED probe batch; later batches are fresh GNS batches.
@@ -1023,7 +1038,11 @@ probe_inputs, probe_targets = next(heldout_loader)
 def probe_loss_fn():
     return model(probe_inputs, probe_targets) / probe_targets.numel()
 
+_heldout_n = 0   # GNS batches drawn so far (restored on resume, so a fork sees the same batches)
+
 def gns_loss_fn(i):
+    global _heldout_n
+    _heldout_n += 1
     inputs, targets = next(heldout_loader)
     return model(inputs, targets) / targets.numel(), targets.numel()
 
@@ -1042,7 +1061,9 @@ train_steps = FINAL_TRAIN_STEPS
 # up to ~2800-2850, so STOP_STEP=2850 saves the unused 2850-2900 tail. Default = full run.
 STOP_STEP = int(os.environ.get("STOP_STEP", FINAL_TRAIN_STEPS))   # default: full schedule; set env to early-stop
 val_regular_interval = 125
-extra_val_steps = {2700, 2705, 2710, 2715, 2720, 2725, 2730, 2735, 2740, 2745, 2750, 2755, 2760, 2765, 2770, 2775, 2780, 2785, 2790, 2795, 2800, 2805, 2810, 2820, 2830, 2840, 2850, 2860, 2870, 2880, 2890, 2895, 2900, 2910, 2920, 2930, 2940, 2950, 2960, 2965, 2970, 2975, 2980, 2985, 2990, 2995, 2999, 3000, 3010, 3020}
+_dv = [int(x) for x in DENSE_VAL.split(":")] if DENSE_VAL else None
+extra_val_steps = set(range(_dv[0], _dv[1] + 1, _dv[2])) if _dv else set()
+extra_val_steps |= {2700, 2705, 2710, 2715, 2720, 2725, 2730, 2735, 2740, 2745, 2750, 2755, 2760, 2765, 2770, 2775, 2780, 2785, 2790, 2795, 2800, 2805, 2810, 2820, 2830, 2840, 2850, 2860, 2870, 2880, 2890, 2895, 2900, 2910, 2920, 2930, 2940, 2950, 2960, 2965, 2970, 2975, 2980, 2985, 2990, 2995, 2999, 3000, 3010, 3020}
 
 # initialize model parameters
 for name, p in model.named_parameters():
@@ -1214,7 +1235,72 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
                                    aux_beta1=AUX_BETA1, aux_lr_mult=AUX_LR_MULT,
                                    vo_lr_mult=VO_LR_MULT, vo_floor_mult=VO_FLOOR_MULT,
                                    v_gate=V_GATE, vo_denom_power=VO_DENOM_POWER, vo_head=VO_HEAD))
-for step in range(train_steps + 1):
+
+pname = {p: n for n, p in model.named_parameters()}
+p_of = {n: p for n, p in model.named_parameters()}
+_ckpt_env = ("NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+             "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
+
+def save_checkpoint(step):
+    assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
+    d = Path(CKPT_DIR) / f"step{step}"
+    d.mkdir(parents=True, exist_ok=True)
+    rank = dist.get_rank()
+    by_name = lambda opt: {pname[p]: st for p, st in opt.state.items()}
+    torch.save({"muon": by_name(optimizer2)}, d / f"muon_rank{rank}.pt.tmp")
+    os.replace(d / f"muon_rank{rank}.pt.tmp", d / f"muon_rank{rank}.pt")
+    if rank == 0:
+        ema = optimizers[0]
+        torch.save(dict(step=step, model=model.state_dict(), adamw=by_name(optimizer1), adam=by_name(optimizer3),
+                        ema_nesterov=dict(state=by_name(ema), it=ema.it), muon_step_count=optimizer2.step_count,
+                        tailema=_tailema, training_time=training_time, heldout_n=_heldout_n,
+                        rng=dict(cpu=torch.get_rng_state(), cuda=torch.cuda.get_rng_state())), d / "common.pt.tmp")
+        os.replace(d / "common.pt.tmp", d / "common.pt")
+        json.dump(dict(step=step, seed=SEED, world_size=dist.get_world_size(), commit=os.environ.get("RECORD_COMMIT"),
+                       run=os.environ.get("WANDB_RUN_NAME"), env={k: os.environ.get(k) for k in _ckpt_env}),
+                  open(d / "meta.json", "w"), indent=1)
+    dist.barrier()
+    print0(f"checkpoint step:{step} -> {d}", console=True)
+
+def load_checkpoint(path):
+    global _tailema, training_time, _heldout_n
+    assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
+    meta = json.load(open(f"{path}/meta.json"))
+    assert meta["world_size"] == dist.get_world_size()
+    ck = torch.load(f"{path}/common.pt", map_location=device, weights_only=False)
+    model.load_state_dict(ck["model"])
+    for opt, key in ((optimizer1, "adamw"), (optimizer3, "adam"), (optimizers[0], "ema_nesterov")):
+        states = ck[key]["state"] if key == "ema_nesterov" else ck[key]
+        assert set(states) == {pname[p] for g in opt.param_groups for p in g["params"]}, key
+        for n, st in states.items():
+            opt.state[p_of[n]] = st
+    optimizers[0].it = ck["ema_nesterov"]["it"]
+    optimizer2.step_count = ck["muon_step_count"]
+    # Muon states are sharded by rank; read every shard and keep the params this rank owns now (ownership can change
+    # when a knob regroups the params)
+    ws, rank = dist.get_world_size(), dist.get_rank()
+    owned = {p for g in optimizer2.param_groups for i, p in enumerate(g["params"]) if i % ws == rank}
+    n_loaded = 0
+    for r in range(meta["world_size"]):
+        for n, st in torch.load(f"{path}/muon_rank{r}.pt", map_location=device, weights_only=False)["muon"].items():
+            if p_of[n] in owned:
+                optimizer2.state[p_of[n]] = st
+                n_loaded += 1
+    assert n_loaded == len(owned), (n_loaded, len(owned))
+    _tailema, training_time = ck["tailema"], ck["training_time"]
+    for _ in range(ck["heldout_n"]):
+        next(heldout_loader)
+    _heldout_n = ck["heldout_n"]
+    torch.set_rng_state(ck["rng"]["cpu"].cpu())
+    torch.cuda.set_rng_state(ck["rng"]["cuda"].cpu())
+    H.t = meta["step"]
+    if H.dyn is not None:
+        H.dyn.t = meta["step"]
+    print0(f"resumed from {path} (step {meta['step']}, parent run {meta['run']}, parent env {meta['env']})", console=True)
+
+if RESUME_FROM:
+    load_checkpoint(RESUME_FROM)
+for step in range(RESUME_STEP, train_steps + 1):
     H.start_step()
 
     # --------------- VALIDATION SECTION -----------------
@@ -1260,6 +1346,8 @@ for step in range(train_steps + 1):
         dist.barrier()
         t0 = time.perf_counter()
 
+    if step in CKPT_STEPS and step != RESUME_STEP:
+        save_checkpoint(step)
     if step >= STOP_STEP:
         break
 
