@@ -211,3 +211,36 @@ All three seeds favour β₂ 0.997 (paired t ≈ 2.4, df 2, p ≈ 0.13). It is a
 - Instead the measured sharpness along the step rose to compensate: dir_sharpness·|v|² stays constant (attn_v 6.7k / 6.7k / 6.4k; attn_o 8.6k / 8.1k / 8.1k), so g_a·v, g_b·v and therefore ρ and align_b do not change.
 
 **Conclusion.** ρ and align_b are invariant to step size, for both the Adam groups (aux-lr-07) and the Muon V/O matrices. The local curvature along the update adapts to the step, consistent with self-stabilization / edge-of-stability behaviour. So ρ is not a step-size gauge and "step_ratio = 1/(1−ρ)" is not actionable. What did move ρ across records (#44: q/k −0.18 → −0.07) was a *direction* change (SOAP), so ρ is better read as a direction-quality signal.
+
+### Follow-up: gain β₂ 0.997 on seeds 3–4 (4 runs)
+
+Commit `3a47570`, same setup. Seeds 3/4 control: [3gpqdh4y](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/3gpqdh4y) / [1th1x875](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/1th1x875); β₂ 0.997: [wcmiyzvt](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/wcmiyzvt) / [ibp9obnx](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/ibp9obnx).
+
+| Seed | control | gain β₂ 0.997 | Δ |
+|---|---|---|---|
+| 0 | 3.27980 | 3.27847 | −0.00133 |
+| 1 | 3.27942 | 3.27924 | −0.00018 |
+| 2 | 3.27863 | 3.27720 | −0.00143 |
+| 3 | 3.27698 | 3.27964 | +0.00266 |
+| 4 | 3.27937 | 3.28027 | +0.00090 |
+| mean | 3.27884 | 3.27896 | **+0.00012 ± 0.00076 (SE)** |
+
+**Conclusion: no effect.** The 3-seed "probable gain" was noise. The controls alone span 3.27698–3.27980 (seed-to-seed SD ≈ 0.0011), larger than the ±0.0007 same-seed noise floor assumed so far; a paired single-seed difference has SD ≈ 0.0017, so effects below about 0.002 need 5+ seeds.
+
+## 2026-10-28 — V/O SOAP direction variants: probe screen
+
+**Setup.** Commit `fc7b5ad`, `VO_VARIANTS=1` (measured only, training unchanged), 1000 steps, probe every 100, run [v1ayjw5i](https://forge.coreweave.com/wandb/bendoris0509-national-yang-ming-chiao-tung-university/nano-gpt/runs/v1ayjw5i) (Slurm 632113). Each variant goes through the real attn.proj gate and Newton–Schulz; D = a²/2c on the fixed held-out probe batch. "V∪O" is the global group of the V/O-only directions, i.e. including the V–O cross curvature; it is the ranking that matters.
+
+**D relative to the real direction (vo_ns):**
+
+| Variant | V∪O, steps 100–400 | V∪O, steps 500–900 | attn_v alone, 500–900 | attn_o alone, 500–900 |
+|---|---|---|---|---|
+| vo_head (per-head statistics) | 1.00–1.02 | 1.05–1.07 | 1.8–2.8 | 1.01–1.02 |
+| vo_shared (one V–O basis) | 0.97–1.01 | 0.95–1.01 | 0.94–1.11 | 1.01–1.02 |
+| vo_p25 (V^¼ denominator) | 0.96–0.99 | 1.02–1.12 | 2.9–5.3 | 0.99–1.03 |
+| vo_gate (trust gate on V) | 1.05–1.12 | 1.01–1.22 | 2.9–5.2 | 1 (O unchanged) |
+
+- On attn_v the real SOAP direction is almost orthogonal to the probe gradient: its first-order gain a is about 10× smaller than with the gate or V^¼ (e.g. step 900: 0.044 vs 0.45 / 0.35), although those directions have cos 0.90–0.94 with it. Full whitening removes most of V's gradient-aligned component.
+- The greedy-optimal step sizes (opt_rel 0.003–0.03) are at or below the probed ±0.02, so these D values are interpolated, not extrapolated.
+- Taken alone, V gains 2–5×; with the V–O cross curvature counted, the gains shrink to 5–12%.
+- vo_shared is dropped (≤ 1). vo_gate, vo_p25 and vo_head go to full runs (`V_GATE`, `VO_DENOM_POWER=0.25`, `VO_HEAD`, commit `257e962`), seeds 0 and 1, paired with the existing same-seed controls.
