@@ -80,6 +80,9 @@ There is no gradient clipping and no other weight decay.
   - `V_GATE=1`: the trust gate of step 4 is also applied on attn.v (default: attn.proj only).
   - `VO_DENOM_POWER` = p: for attn.v and attn.proj, step 2 divides by V^p instead of V^½ (default 0.5).
   - `VO_HEAD=1`: step 9's new statistics are masked to the 6 head blocks (128×128) on V's output side (L) and O's input side (R), so those bases are block-diagonal per head.
+- Per-row norm control (Muown #23; env, defaults = rec-46):
+  - `ROW_PIN=1`: step 8's pin is per row: r*_i = ‖W_i‖ − η⟨O_i,W_i⟩/‖W_i‖ and each row is rescaled to r*_i.
+  - `ROW_GAIN_LR` = a > 0: step 8 is purely angular per row (r*_i = ‖W_i‖), then each row norm takes its own Adam step: g_i = ⟨∇W_i, W_i/‖W_i‖⟩ (raw gradient), Adam(β = 0.9, 0.95, bias-corrected), W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i). CWD still follows.
 - Screening only: `VO_VARIANTS=1` also computes V/O SOAP variant directions (per-head statistics, a shared V–O basis, V^¼ denominator, trust gate on V; class `VOVariants`) and records them on probe steps. They are never applied, so the update above is unchanged.
 - V/O ablation knobs (env, default 1 = rec-46): `VO_LR_MULT` multiplies m_type for attn.v and attn.proj (same PowerCool scaling), and `VO_FLOOR_MULT` multiplies their RowFloor target (0.3825 in step 7).
 
@@ -116,4 +119,5 @@ There is no gradient clipping and no other weight decay.
 - For 2400 ≤ t < 2900, every parameter except the token embedding keeps an average: ē ← ē + (W − ē)/150.
 - Validation is scored on the blend (1 − 0.6)·W + 0.6·ē. This is the reported `val_ema_loss`.
 - Validation runs every 125 steps, at the stop step, and densely every 5 steps over 2650–2690 (`DENSE_VAL`, "lo:hi:stride"), so a run can be scored at the earliest step that passes.
+- Readout lab (`READOUT_LAB=1`, eval only): keeps weight snapshots after `LAB_REF_STEPS` and update-EMAs m_β (β = 0.9, 0.97) of Δθ from `LAB_VEL_START`; at the stop step scores θ_eval = base + γ·(base − θ_ref) and base + γ·m_β, for base = raw W or the Tail-EMA blend, plus a λ grid of the Tail-EMA blend. Results go to `<log>.readout.json`.
 - Checkpoint/fork (`CKPT_STEPS`, `RESUME_FROM`) restores the exact training state above (weights, Muon/SOAP, Adam, EMA-Nesterov, Tail-EMA, data position); it does not change the update.

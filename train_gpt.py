@@ -104,6 +104,13 @@ CKPT_DIR = os.environ.get("CKPT_DIR", f"/work/{os.environ.get('USER', 'user')}/n
                                       f"{os.environ.get('WANDB_RUN_NAME', 'run')}-seed{args.seed}")
 RESUME_FROM = os.environ.get("RESUME_FROM", "")
 RESUME_STEP = json.load(open(f"{RESUME_FROM}/meta.json"))["step"] if RESUME_FROM else 0
+# Readout lab (eval only): READOUT_LAB=1 keeps weight snapshots after LAB_REF_STEPS and update-EMAs from LAB_VEL_START,
+# then at STOP_STEP scores a grid of late-trajectory readouts (Tail-EMA lambda, reference interpolation/extrapolation
+# as in #42, update-velocity readout as in #38, and their combination with Tail-EMA). Training is unchanged.
+READOUT_LAB = os.environ.get("READOUT_LAB", "0") == "1"
+LAB_REF_STEPS = [int(x) for x in os.environ.get("LAB_REF_STEPS", "2000,2200,2375,2500,2600").split(",") if x]
+LAB_VEL_START = int(os.environ.get("LAB_VEL_START", 2500))
+LAB_VEL_BETAS = (0.9, 0.97)
 # Dense validation near the end, "lo:hi:stride" (inclusive), to score a run at the earliest step that passes.
 DENSE_VAL = os.environ.get("DENSE_VAL", "2650:2690:5")
 RADIAL_OUTWARD_SCALE = 0.5
@@ -159,6 +166,12 @@ VO_VARIANTS = os.environ.get("VO_VARIANTS", "0") == "1"
 V_GATE = os.environ.get("V_GATE", "0") == "1"
 VO_DENOM_POWER = float(os.environ.get("VO_DENOM_POWER", 0.5))
 VO_HEAD = os.environ.get("VO_HEAD", "0") == "1"
+# Per-row norm control (Muown #23 ideas; defaults = rec-46). ROW_PIN=1 replaces the whole-matrix radius pin by a
+# per-row pin (each row keeps its own first-order radial change). ROW_GAIN_LR=a > 0 makes the Muon step purely
+# angular per row and moves each row norm with its own bias-corrected Adam(0.9, 0.95) on g_i = <grad_i, W_i/|W_i|>:
+# |W_i| *= 1 - a * (lr/lr0) * adam_i.
+ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
+ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.0))
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -799,14 +812,35 @@ class Muon(torch.optim.Optimizer):
                     else:
                         scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
                         update = update * scale.to(update.dtype)
-                    target_radius = target_radius_after_update(p, update, group["lr"])
+                    row_ctl = (ROW_PIN or ROW_GAIN_LR > 0) and p.ndim == 2
+                    if row_ctl:
+                        p_before = p.float()
+                        r_rows = p_before.norm(dim=1, keepdim=True).clamp_min(1e-8)
+                        target_rows = r_rows if ROW_GAIN_LR > 0 else (
+                            r_rows - group["lr"] * (update.float() * p_before).sum(dim=1, keepdim=True) / r_rows)
+                        target_rows = target_rows.clamp_min(1e-8)
+                    else:
+                        target_radius = target_radius_after_update(p, update, group["lr"])
                     # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
                     if CWD > 0.0 and p.ndim == 2:
                         # (C) Cautious Weight Decay: mask the coords where -lr*update already shrinks |p|
                         # (update*p>0); decay only those (never fight a coord the optimizer wants to grow).
                         cwd_mask = (update.float() * p.float() > 0).to(p.dtype)
                     p.add_(update, alpha=-group["lr"])
-                    rescale_to_radius(p, target_radius)
+                    if row_ctl:
+                        p.mul_((target_rows / p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)).to(p.dtype))
+                        if ROW_GAIN_LR > 0:
+                            g_row = (grad.float() * p_before).sum(dim=1, keepdim=True) / r_rows
+                            if "row_m" not in state:
+                                state["row_m"], state["row_v"], state["row_t"] = torch.zeros_like(g_row), torch.zeros_like(g_row), 0
+                            state["row_t"] += 1
+                            state["row_m"].lerp_(g_row, 0.1)
+                            state["row_v"].lerp_(g_row.square(), 0.05)
+                            adam = (state["row_m"] / (1 - 0.9 ** state["row_t"])) / (
+                                (state["row_v"] / (1 - 0.95 ** state["row_t"])).sqrt() + 1e-12)
+                            p.mul_((1 - ROW_GAIN_LR * group["lr"] / group["initial_lr"] * adam).to(p.dtype))
+                    else:
+                        rescale_to_radius(p, target_radius)
                     if CWD > 0.0 and p.ndim == 2:
                         # apply AFTER the radius pin (POST) so the per-coord shape change is preserved.
                         p.mul_(1.0 - (group["lr"] * CWD) * cwd_mask)
@@ -1001,7 +1035,7 @@ print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
 print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK} muon_lr_mult={MUON_LR_MULT}")
 print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants={VO_VARIANTS} "
-       f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD}")
+       f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
@@ -1238,7 +1272,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):
@@ -1298,8 +1332,71 @@ def load_checkpoint(path):
         H.dyn.t = meta["step"]
     print0(f"resumed from {path} (step {meta['step']}, parent run {meta['run']}, parent env {meta['env']})", console=True)
 
+_lab_ref, _lab_vel, _lab_prev = {}, {}, None
+
+@torch.no_grad()
+def lab_track(t):
+    """After step t-1 (weights = after t steps): keep reference snapshots and update-EMAs (velocity)."""
+    global _lab_prev
+    params = list(model.parameters())
+    if t in LAB_REF_STEPS:
+        _lab_ref[t] = [p.detach().float().clone() for p in params]
+    if t >= LAB_VEL_START:
+        if _lab_prev is not None:
+            for b in LAB_VEL_BETAS:
+                m = _lab_vel.setdefault(b, [torch.zeros_like(q) for q in _lab_prev])
+                for mi, p, q in zip(m, params, _lab_prev):
+                    mi.lerp_(p.detach().float() - q, 1 - b)
+            for q, p in zip(_lab_prev, params):
+                q.copy_(p.detach().float())
+        else:
+            _lab_prev = [p.detach().float().clone() for p in params]
+
+@torch.no_grad()
+def lab_val():
+    loss = 0
+    for i in range(len(val_inputs) // mbs):
+        loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+    return (loss / val_tokens).item()
+
+@torch.no_grad()
+def run_readout_lab(step):
+    """Score readouts theta_eval = f(theta, Tail-EMA, references, velocities) on the val set; weights are restored."""
+    model.eval()
+    params = list(model.parameters())
+    theta = [p.detach().float().clone() for p in params]
+    ema = [t if e is None else e for t, e in zip(theta, _tailema)] if _tailema is not None else theta
+    blend = lambda lam: [(1 - lam) * t + lam * e for t, e in zip(theta, ema)]
+    results = []
+
+    def score(name, ws):
+        for p, w in zip(params, ws):
+            p.copy_(w.to(p.dtype))
+        results.append((name, lab_val()))
+        print0(f"readout step:{step} {name} val:{results[-1][1]:.5f}", console=True)
+
+    for lam in (0.0, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0):
+        score(f"tailema lam={lam}", blend(lam))
+    base_t = blend(TAILEMA_LAMBDA)
+    for base_name, base in (("raw", theta), (f"tailema{TAILEMA_LAMBDA}", base_t)):
+        for r, ref in sorted(_lab_ref.items()):
+            for g in (-0.15, -0.1, -0.075, -0.05, -0.025, 0.025, 0.05, 0.1):
+                score(f"{base_name}+ref{r} gamma={g}", [b + g * (b - q) for b, q in zip(base, ref)])
+        for b, m in sorted(_lab_vel.items()):
+            for g in (-6.0, -3.0, 3.0):
+                score(f"{base_name}+vel{b} gamma={g}", [w + g * mi for w, mi in zip(base, m)])
+    for p, t in zip(params, theta):
+        p.copy_(t.to(p.dtype))
+    if dist.get_rank() == 0:
+        with open(logfile.replace(".txt", ".readout.json"), "w") as f:
+            json.dump(dict(step=step, results=results), f)
+    model.train()
+
 if RESUME_FROM:
     load_checkpoint(RESUME_FROM)
+if READOUT_LAB:
+    lab_track(RESUME_STEP)
 for step in range(RESUME_STEP, train_steps + 1):
     H.start_step()
 
@@ -1346,6 +1443,8 @@ for step in range(RESUME_STEP, train_steps + 1):
         dist.barrier()
         t0 = time.perf_counter()
 
+    if READOUT_LAB and step == STOP_STEP:
+        run_readout_lab(step)
     if step in CKPT_STEPS and step != RESUME_STEP:
         save_checkpoint(step)
     if step >= STOP_STEP:
@@ -1389,6 +1488,8 @@ for step in range(RESUME_STEP, train_steps + 1):
             for j, p in enumerate(model.parameters()):
                 if _tailema[j] is not None:
                     _tailema[j].add_(p.detach().float() - _tailema[j], alpha=1.0 / TAILEMA_TAU)
+    if READOUT_LAB:
+        lab_track(step + 1)
     if TRAIN_PROGRESS_INTERVAL > 0 and (step + 1) % TRAIN_PROGRESS_INTERVAL == 0:
         approx_training_time = training_time + (time.perf_counter() - t0)
         print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
