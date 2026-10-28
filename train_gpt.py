@@ -190,6 +190,7 @@ ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.0))
 # one per row - separates "rows of a matrix can differ in norm" from "matrices can change scale".
 ROW_GAIN_SCOPE = set(os.environ.get("ROW_GAIN_SCOPE", "q,k,v,o,fc,proj").split(","))
 ROW_GAIN_MODE = os.environ.get("ROW_GAIN_MODE", "row")
+ROW_GAIN_START = int(os.environ.get("ROW_GAIN_START", 0))   # Muon step at which the row gains switch on
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -882,7 +883,7 @@ class Muon(torch.optim.Optimizer):
                     else:
                         scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
                         update = update * scale.to(update.dtype)
-                    gain = p in self.row_gain_params
+                    gain = p in self.row_gain_params and self.step_count >= ROW_GAIN_START
                     row_ctl = (ROW_PIN or gain) and p.ndim == 2
                     if row_ctl:
                         p_before = p.float()
@@ -1350,7 +1351,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("ROW_GAIN_START", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):

@@ -83,6 +83,7 @@ There is no gradient clipping and no other weight decay.
 - Per-row norm control (Muown #23; env, defaults = rec-46):
   - `ROW_PIN=1`: step 8's pin is per row: r*_i = ‖W_i‖ − η⟨O_i,W_i⟩/‖W_i‖ and each row is rescaled to r*_i.
   - `ROW_GAIN_SCOPE` (types among q,k,v,o,fc,proj; default all) limits the row gains to those matrices; `ROW_GAIN_MODE=matrix` uses one gain per matrix (pure angular step for the whole matrix, g = ⟨∇W, W/‖W‖⟩) instead of one per row.
+  - `ROW_GAIN_START` = t₀ (default 0): the row gains are used only from step t₀ on (before it, step 8 is the rec-46 pin).
   - `ROW_GAIN_LR` = a > 0: step 8 is purely angular per row (r*_i = ‖W_i‖), then each row norm takes its own Adam step: g_i = ⟨∇W_i, W_i/‖W_i‖⟩ (raw gradient), Adam(β = 0.9, 0.95, bias-corrected), W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i). CWD still follows.
 - SOAP variants (env, defaults = rec-46; scope `SOAP_*_SCOPE` = all | vo):
   - `SOAP_SINK=cur|ema`: step 2's P/√V is replaced by √r_i·P_ij·√c_j, with r, c the Sinkhorn scalings (10 iterations) that give r_i B_ij c_j uniform row and column marginals; B = P² (cur, as SinkSOAP #26) or B = V (ema, a factored second moment).
