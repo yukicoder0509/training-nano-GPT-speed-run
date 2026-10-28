@@ -492,4 +492,4 @@ Track 3 rule (3.28 − mean)·√n ≥ 0.004, n = 8 (`fork_compare.py --full can
 
 **16 seeds** (seeds 8–15 added): Track 3 value (3.28 − mean)·√16 = 0.00288 at 2655, 0.00407 at 2660, **0.00530 at 2665**, 0.01097 at 2690. Earliest passing step 2660 (by 0.00007; it failed with the first 8 seeds); **settled step: 2665**, which passes with both n = 8 (0.00403) and n = 16 (0.00530). Mean val_ema at 2665 = 3.27867 (n = 16).
 
-**Leaderboard submission** (user-authorized 2026-10-29): seed 0 (fixed in advance), `STOP_STEP=2665`, commit `b7ae8c3`, candidate env above, `OPTIM_DYNAMICS=0`, W&B `cerulean-labs/midterm-nanogpt` run `rowgain-tailema2100-2665-s0`, Slurm 633829.
+**Leaderboard submission** (user-authorized 2026-10-29): seed 0 (fixed in advance), `STOP_STEP=2665`, commit `b7ae8c3`, candidate env above, `OPTIM_DYNAMICS=0`, W&B `cerulean-labs/midterm-nanogpt` run `rowgain-tailema2100-2665-s0` ([wcs41r46](https://flock.cerulean.works/cerulean-labs/midterm-nanogpt/runs/wcs41r46)), Slurm 633829. Summary: `total_train_steps` 2665, `val_loss` (val_ema) 3.27759, raw val 3.28348, peak memory 34.8 GiB, no dynamics keys.
