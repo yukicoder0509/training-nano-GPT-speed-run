@@ -170,6 +170,16 @@ VO_HEAD = os.environ.get("VO_HEAD", "0") == "1"
 # per-row pin (each row keeps its own first-order radial change). ROW_GAIN_LR=a > 0 makes the Muon step purely
 # angular per row and moves each row norm with its own bias-corrected Adam(0.9, 0.95) on g_i = <grad_i, W_i/|W_i|>:
 # |W_i| *= 1 - a * (lr/lr0) * adam_i.
+# SOAP variants (defaults = rec-46). SOAP_SINK = "cur" | "ema": replace the elementwise Adam denominator in the
+# eigenbasis by a rank-1 Sinkhorn balancing (SinkSOAP #26) of the current projected energy P^2 ("cur") or of the EMA
+# second moment V ("ema", a factored V). SOAP_KL=1: KL-SOAP (#19/#25) coupled covariance estimate for the bases,
+# L ~ E[G R^-1 G^T]/n, R ~ E[G^T L^-1 G]/m, with R^-1, L^-1 from running eigenvalue estimates in the current basis.
+# SOAP_SINK_SCOPE / SOAP_KL_SCOPE: "all" or "vo" (attn.v + attn.proj only).
+SOAP_SINK = os.environ.get("SOAP_SINK", "")
+SOAP_KL = os.environ.get("SOAP_KL", "0") == "1"
+SOAP_SINK_SCOPE = os.environ.get("SOAP_SINK_SCOPE", "all")
+SOAP_KL_SCOPE = os.environ.get("SOAP_KL_SCOPE", "all")
+ENA_REST = int(os.environ.get("ENA_REST", 0))   # EMA-Nesterov lookahead end step (0 = rec-46: train_steps - 950 = 1950)
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.0))
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
@@ -483,27 +493,69 @@ def soap_basis_qr(row_gg, col_gg, q_row, q_col, exp_avg_sq):
     q_col, _ = torch.linalg.qr(col_gg @ q_col)
     return q_row, q_col, exp_avg_sq
 
-def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8, denom_power=SOAP_DENOM_POWER):
+def sinkhorn_sqrt_scalings(B, steps=10):
+    """Row/col scalings r, c with r_i B_ij c_j having uniform marginals (SinkSOAP); returns sqrt(r)[:, None], sqrt(c)."""
+    m, n = B.shape
+    B = B + B.mean() * 1e-6
+    c = torch.ones(n, device=B.device, dtype=B.dtype)
+    for _ in range(steps):
+        r = (1.0 / m) / (B @ c)
+        c = (1.0 / n) / (B.T @ r)
+    return r.sqrt()[:, None], c.sqrt()[None, :]
+
+def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8, denom_power=SOAP_DENOM_POWER, sink=""):
     update_f = update.float()
     if state["q_row"] is None:
         return update
     q_row, q_col = state["q_row"], state["q_col"]
     projected = q_row.T @ update_f if q_col is None else q_row.T @ update_f @ q_col
     state["exp_avg_sq"].mul_(beta2).add_(projected.square(), alpha=1 - beta2)
-    denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(denom_power)
-    precond = q_row @ (projected / denom) if q_col is None else q_row @ (projected / denom) @ q_col.T
+    if sink and q_col is not None:
+        sr, sc = sinkhorn_sqrt_scalings(state["exp_avg_sq"] if sink == "ema" else projected.square())
+        precond = q_row @ (projected * sr * sc) @ q_col.T
+    else:
+        denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(denom_power)
+        precond = q_row @ (projected / denom) if q_col is None else q_row @ (projected / denom) @ q_col.T
     precond.mul_(gram_frobenius_norm_estimate(update_f, eps=eps) / gram_frobenius_norm_estimate(precond, eps=eps))
     return precond.to(update.dtype)
 
+def kl_soap_targets(grad_f, state, beta):
+    """KL-SOAP coupled covariance targets: G R^-1 G^T / n and G^T L^-1 G / m, with L^-1, R^-1 diagonal in the current
+    bases (running eigenvalue estimates). Returns None until a basis exists."""
+    q_row, q_col = state["q_row"], state["q_col"]
+    if q_row is None or q_col is None:
+        return None
+    m, n = grad_f.shape
+    if "kl_eig_row" not in state:
+        state["kl_eig_row"] = torch.ones(m, device=grad_f.device)
+        state["kl_eig_col"] = torch.ones(n, device=grad_f.device)
+    inv_row = state["kl_eig_row"].clamp_min(state["kl_eig_row"].max() * 1e-8).rsqrt()
+    inv_col = state["kl_eig_col"].clamp_min(state["kl_eig_col"].max() * 1e-8).rsqrt()
+    rw = (q_col.T @ grad_f.T) * inv_col[:, None]
+    lw = (q_row.T @ grad_f) * inv_row[:, None]
+    proj = q_row.T @ grad_f @ q_col
+    fresh = "kl_started" not in state
+    for key, d in (("kl_eig_row", (proj * inv_col[None, :]).square().mean(dim=1)),
+                   ("kl_eig_col", (proj * inv_row[:, None]).square().mean(dim=0))):
+        state[key] = d if fresh else state[key].lerp_(d, 1 - beta)
+    state["kl_started"] = True
+    return rw.T @ rw / n, lw.T @ lw / m, fresh
+
 def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, precondition_frequency=SOAP_PRECONDITION_FREQUENCY,
-                               row_mask=None, col_mask=None):
+                               row_mask=None, col_mask=None, kl=False):
     # row_mask / col_mask: elementwise masks on the new statistics (per-head block-diagonal SOAP, VO_HEAD)
     grad_f = grad.float()
-    row_new = grad_f @ grad_f.T
-    state["row_gg"].lerp_(row_new if row_mask is None else row_new * row_mask, 1 - shampoo_beta)
-    if state["col_gg"] is not None:
-        col_new = grad_f.T @ grad_f
-        state["col_gg"].lerp_(col_new if col_mask is None else col_new * col_mask, 1 - shampoo_beta)
+    klt = kl_soap_targets(grad_f, state, shampoo_beta) if kl else None
+    if klt is not None:  # the first KL step replaces the plain statistics (different scale) instead of mixing in
+        row_new, col_new, fresh = klt
+        for key, new in (("row_gg", row_new), ("col_gg", col_new)):
+            state[key].copy_(new) if fresh else state[key].lerp_(new, 1 - shampoo_beta)
+    else:
+        row_new = grad_f @ grad_f.T
+        state["row_gg"].lerp_(row_new if row_mask is None else row_new * row_mask, 1 - shampoo_beta)
+        if state["col_gg"] is not None:
+            col_new = grad_f.T @ grad_f
+            state["col_gg"].lerp_(col_new if col_mask is None else col_new * col_mask, 1 - shampoo_beta)
     if state["q_row"] is None:
         state["q_row"] = soap_eigenbasis(state["row_gg"])
         state["q_col"] = None if state["col_gg"] is None else soap_eigenbasis(state["col_gg"])
@@ -703,6 +755,12 @@ class Muon(torch.optim.Optimizer):
         self.gated_params = self.attn_proj_soap_params | (self.v_params if V_GATE else set())
         self.vo_params = self.v_params | {p for n, p in named_params if is_attn_proj_param(n)}
         self.head_mask = None
+
+    def in_scope(self, p, scope):
+        return scope == "all" or (scope == "vo" and p in self.vo_params)
+
+    def sink_of(self, p):
+        return SOAP_SINK if SOAP_SINK and self.in_scope(p, SOAP_SINK_SCOPE) else ""
         self.step_count = 0
         # Probe diagnostics (harness.ProbeQuadratic): on probe steps the harness sets probe_capture and this optimizer
         # records, per param it owns, the candidate update directions below (descent convention, W -= lr*u).
@@ -768,7 +826,8 @@ class Muon(torch.optim.Optimizer):
                         if is_attn_soap:
                             soap_update = soap_precondition_momentum(
                                 momentum_update, state,
-                                denom_power=VO_DENOM_POWER if p in self.vo_params else SOAP_DENOM_POWER)
+                                denom_power=VO_DENOM_POWER if p in self.vo_params else SOAP_DENOM_POWER,
+                                sink=self.sink_of(p))
                             self._capture(p, "soap", soap_update)
                             if self.newton is not None and NEWTON_MODE in ("soap", "right"):
                                 soap_update = self.newton.apply(soap_update, p)
@@ -784,7 +843,7 @@ class Muon(torch.optim.Optimizer):
                                                     self.probe_capture) if self.vo is not None and p in self.vo.kind else None)
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
-                            momentum_update = soap_precondition_momentum(momentum_update, state)
+                            momentum_update = soap_precondition_momentum(momentum_update, state, sink=self.sink_of(p))
                             self._capture(p, "soap", momentum_update)
                             if self.newton is not None and NEWTON_MODE in ("soap", "right"):
                                 momentum_update = self.newton.apply(momentum_update, p)
@@ -853,7 +912,7 @@ class Muon(torch.optim.Optimizer):
                             soap_update_preconditioner(grad, state, row_mask=self.head_mask if p in self.v_params else None,
                                                        col_mask=None if p in self.v_params else self.head_mask)
                         else:
-                            soap_update_preconditioner(grad, state)
+                            soap_update_preconditioner(grad, state, kl=SOAP_KL and self.in_scope(p, SOAP_KL_SCOPE))
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
         self.step_count += 1
 
@@ -1035,7 +1094,8 @@ print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
 print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK} muon_lr_mult={MUON_LR_MULT}")
 print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants={VO_VARIANTS} "
-       f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR}")
+       f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR} "
+       f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
@@ -1197,7 +1257,7 @@ optimizers = [EMA_Nesterov(
         use_scheduled_lookahead_stepsize=True,
         lookahead_ema=0.99,
         prefill_steps=300,
-        rest_steps=train_steps - 950,
+        rest_steps=ENA_REST or train_steps - 950,
     )]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
@@ -1272,7 +1332,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):

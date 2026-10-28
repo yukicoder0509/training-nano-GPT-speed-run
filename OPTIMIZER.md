@@ -18,7 +18,7 @@ Notation: t is the loop step; g = ∇L, the gradient summed over ranks. W is a p
 
 The wrapper keeps a buffer b and the previous weights W_prev for every parameter.
 
-- **Before the forward pass, only when 300 ≤ t < 1950:**
+- **Before the forward pass, only when 300 ≤ t < 1950** (the end is `ENA_REST`, default 1950):
   W ← W + β_t·b, with β_t = 0.3·η_{t−1}/η₀.
   - The LR ratio is taken from the embedding Adam group, using the previous step's LR.
   - The shift is not undone afterwards.
@@ -83,6 +83,9 @@ There is no gradient clipping and no other weight decay.
 - Per-row norm control (Muown #23; env, defaults = rec-46):
   - `ROW_PIN=1`: step 8's pin is per row: r*_i = ‖W_i‖ − η⟨O_i,W_i⟩/‖W_i‖ and each row is rescaled to r*_i.
   - `ROW_GAIN_LR` = a > 0: step 8 is purely angular per row (r*_i = ‖W_i‖), then each row norm takes its own Adam step: g_i = ⟨∇W_i, W_i/‖W_i‖⟩ (raw gradient), Adam(β = 0.9, 0.95, bias-corrected), W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i). CWD still follows.
+- SOAP variants (env, defaults = rec-46; scope `SOAP_*_SCOPE` = all | vo):
+  - `SOAP_SINK=cur|ema`: step 2's P/√V is replaced by √r_i·P_ij·√c_j, with r, c the Sinkhorn scalings (10 iterations) that give r_i B_ij c_j uniform row and column marginals; B = P² (cur, as SinkSOAP #26) or B = V (ema, a factored second moment).
+  - `SOAP_KL=1`: step 9's statistics become KL-SOAP's coupled estimates (#19/#25): L ← 0.9·L + 0.1·G·Q_R·diag(1/λ_R)·Q_Rᵀ·Gᵀ/n and R ← 0.9·R + 0.1·Gᵀ·Q_L·diag(1/λ_L)·Q_Lᵀ·G/m, where λ_L, λ_R are EMAs (0.9) of the row/column energies of Q_Lᵀ·G·Q_R whitened by the other side. The first KL step replaces L and R instead of mixing.
 - Screening only: `VO_VARIANTS=1` also computes V/O SOAP variant directions (per-head statistics, a shared V–O basis, V^¼ denominator, trust gate on V; class `VOVariants`) and records them on probe steps. They are never applied, so the update above is unchanged.
 - V/O ablation knobs (env, default 1 = rec-46): `VO_LR_MULT` multiplies m_type for attn.v and attn.proj (same PowerCool scaling), and `VO_FLOOR_MULT` multiplies their RowFloor target (0.3825 in step 7).
 
