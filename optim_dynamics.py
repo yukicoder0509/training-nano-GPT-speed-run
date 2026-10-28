@@ -648,9 +648,10 @@ class ProbeQuadratic:
         losses = torch.stack([loss0, loss1])
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             ws = torch.distributed.get_world_size()
-            torch.distributed.all_reduce(vals[:, :2], op=torch.distributed.ReduceOp.SUM)
+            ac = vals[:, :2].contiguous()
+            torch.distributed.all_reduce(ac, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.SUM)
-            vals[:, :2] /= ws  # a, c: average of per-rank probe shards; <u,v> and norms are identical on all ranks
+            vals[:, :2] = ac / ws  # a, c: average of per-rank probe shards; <u,v> and norms are identical on all ranks
             losses /= ws
         with torch.no_grad():
             for n in names_all:
