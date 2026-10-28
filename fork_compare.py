@@ -21,7 +21,12 @@ Readout lab (--readouts <prefix>): reads the <log>.readout.json of each run <pre
 and ranks every readout by its paired difference from the rec-46 readout (Tail-EMA lambda=0.6), mean and SE over
 seeds, also converted to steps with the controls' end-of-run slope.
 
+Full runs (--full <prefix> [--full-controls p1,p2,...]): for runs logs/<prefix>-s<seed>-<jobid>.out, the Track 3
+rule (3.28 - mean) * sqrt(n) >= 0.004 at every dense validation step, the earliest step that passes, and the
+seed-paired difference from the control runs (the mean over control prefixes that have that seed).
+
 Example
+  python fork_compare.py --full cand-rg20 --full-controls ckpt-rec46,aux-control,ctrl-rec46
   python fork_compare.py fork-vgate fork-vohead --parent ckpt-rec46 --control fork-ctrl
   python fork_compare.py --readouts lab --ks 2000
 """
@@ -68,6 +73,9 @@ def first_pass(v: dict[int, float], target: float, end: int):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--readouts", help="readout-lab run-name prefix")
+    ap.add_argument("--full", help="full-run name prefix (Track 3 significance per dense step)")
+    ap.add_argument("--full-controls", default="", help="comma list of control full-run prefixes")
+    ap.add_argument("--max-seed", type=int, default=20)
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("variants", nargs="*", help="variant run-name prefixes (e.g. fork-vgate)")
     ap.add_argument("--parent", default="ckpt-rec46", help="parent run-name prefix (also a control replica)")
@@ -80,6 +88,8 @@ def main():
     E = args.end
     if args.readouts:
         return readouts(args)
+    if args.full:
+        return full(args)
 
     # control replicas per (seed, k)
     ctrl = {}
@@ -128,6 +138,40 @@ def main():
             if sv:
                 line += f"   mean steps_saved {st.mean(sv):+.1f}"
             print(line + "\n")
+
+
+def full(args):
+    def runs(prefix):
+        out = {}
+        for s in range(args.max_seed):
+            vs = [read(p) for p in logs(prefix, s, None)]
+            vs = [v for v in vs if args.end in v]
+            if vs:
+                out[s] = vs[0]
+        return out
+    cand = runs(args.full)
+    ctrls = [runs(p) for p in args.full_controls.split(",") if p]
+    n = len(cand)
+    print(f"{args.full}: n={n} seeds {sorted(cand)}")
+    steps = sorted(t for t in next(iter(cand.values())) if args.end - 50 <= t <= args.end and all(t in v for v in cand.values()))
+    print(f"  {'step':>5} {'mean':>9} {'(3.28-mean)*sqrt(n)':>20} pass")
+    first = None
+    for t in steps:
+        m = st.mean(v[t] for v in cand.values())
+        z = (args.target - m) * n ** .5
+        if z >= 0.004 and first is None:
+            first = t
+        print(f"  {t:>5} {m:>9.5f} {z:>20.5f} {'yes' if z >= 0.004 else ''}")
+    print(f"  earliest passing step: {first}")
+    if ctrls:
+        diffs = []
+        for s, v in sorted(cand.items()):
+            cs = [c[s][args.end] for c in ctrls if s in c]
+            if cs:
+                diffs.append(v[args.end] - st.mean(cs))
+                print(f"  seed {s}: {v[args.end]:.5f} vs control {st.mean(cs):.5f} ({len(cs)} runs)  diff {diffs[-1]:+.5f}")
+        if len(diffs) > 1:
+            print(f"  paired diff @ {args.end}: {st.mean(diffs):+.5f} +- {st.stdev(diffs) / len(diffs) ** .5:.5f} (SE, n={len(diffs)})")
 
 
 def uuid_of(out_path: str) -> str | None:

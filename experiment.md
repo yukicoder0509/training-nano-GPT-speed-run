@@ -278,3 +278,193 @@ Commit `257e962`, paired with the same-seed controls.
 - `V_GATE`: the 2-seed −0.0021 shrank to −0.0009 at 5 seeds (paired t ≈ 1.6, p ≈ 0.19). Possibly a small real gain, not established. Same pattern as gain β₂: the first seeds overstated it.
 - `V_GATE + VO_HEAD` is worse than `V_GATE` alone on the same seeds (−0.0005 vs −0.0021): the two do not add.
 - Defaults stay at rec-46.
+
+## 2026-10-29 — Fork protocol: checkpoints + same-checkpoint control forks
+
+**Why.** Seed-to-seed SD of val@2690 is ≈ 0.0010, while the gains left in this stack are 15–40 steps (0.0007–0.0018). Detecting 0.0009 at 80% power needs ≈ 20 seeds per arm, so every 2–5 seed V/O result above is unresolved, not refuted. Most of a seed's luck is fixed early (corr(val@2000, val@2690) = 0.98 across 13 control runs).
+
+**Setup** (commit `3bc552a` on `main`).
+- `CKPT_STEPS=1000,1500,2000` saves the full training state at the top of those steps: weights, Muon momentum, SOAP statistics/bases/second moments, AdamW and Adam moments, EMA-Nesterov buffers and counter, Tail-EMA buffer, Muon step count (trust-gate schedule), data position, GNS held-out position, RNG. Rank 0 writes the replicated state; each rank writes its Muon shard, keyed by parameter name. 4.9 GB per checkpoint, under `/work/$USER/nanogpt-ckpt/<run>-seed<s>/step<k>/`.
+- `RESUME_FROM=<dir>` starts at step k; env knobs given to the fork apply from step k on. Not covered: Newton-Muon state (asserted off) and the `VO_VARIANTS` shadow states.
+- `DENSE_VAL=2650:2690:5` (default) adds val every 5 steps near the end.
+- Parents: `ckpt-rec46`, rec-46 settings, seeds 0–2 (val_ema 3.27876 / 3.27949 / 3.27771; first step ≤ 3.28: 2675 / 2685 / 2655).
+- Scoring: `fork_compare.py` compares each fork with the parent and the control forks of the same checkpoint; steps = −Δ / (controls' val_ema slope over 2650–2690 ≈ 0.000067/step).
+
+**Restore check.** Every fork reproduces the parent's val at its fork step to the last digit (smoke test at 125; 1000/1500/2000 in the real runs).
+
+**Fork noise** (identical control forks, val_ema@2690, parent + 2 forks per checkpoint, seeds 0–1):
+
+| Fork step | SD across replicas |
+|---|---|
+| 1000 | 0.000075 |
+| 1500 | 0.000042 |
+| 2000 | 0.000012 |
+| (independent seeds) | ≈ 0.0010 |
+
+A variant–control fork difference has SD ≈ 0.0001 (≈ 1.5 steps) from step 1000, so one fork per seed resolves a 0.0009 effect at ≈ 9σ. Three seeds per arm test whether an effect is consistent across seeds, not noise. Caveat: a fork measures only the gain over the segment after the fork, plus any cost of switching mid-run.
+
+### Fork results, round 1 (seeds 0–2, Δ val_ema@2690 vs same-checkpoint controls; positive = worse)
+
+| Variant (env) | Fork at | Δ mean ± SE | Steps | Verdict |
+|---|---|---|---|---|
+| `V_GATE=1` | 1000 | +0.00086 ± 0.00007 | −12.9 | worse, reject |
+| `V_GATE=1` | 1500 | +0.00066 ± 0.00008 | −9.8 | worse, reject |
+| `VO_DENOM_POWER=0.25` | 1000 | +0.00073 ± 0.00004 | −10.9 | worse, reject |
+| `VO_HEAD=1` | 1000 | +0.00028 ± 0.00002 | −4.2 | worse, reject |
+| `GAIN_BETA2=0.997` | 1000 | +0.00000 ± 0.00012 | 0 | no effect, reject |
+| `ROW_PIN=1` (per-row radius pin) | 1000 | +0.00001 ± 0.00007 | −0.2 | no effect, reject |
+| `ROW_GAIN_LR=0.001` (Muown row gains) | 1000 | +0.00107 ± 0.00002 | −15.9 | worse |
+| `ROW_GAIN_LR=0.003` | 1000 | +0.00045 ± 0.00013 | −6.7 | worse; improving with lr, larger lr queued |
+
+- The V/O variants that looked like −0.001 to −0.002 in the 2–5 seed full runs are clearly worse after step 1000. The full-run "gains" were seed noise (or come only from steps < 1000, which the forks cannot see; the full-run evidence for that was p ≈ 0.19).
+- The probe screen's D ranking (gate > head ≈ V^¼ > baseline on V∪O) did not predict the fork outcome. One-step greedy D on a held-out batch rewards directions that descend faster now; the fork measures the whole remaining trajectory.
+
+### Fork results, round 2 (seeds 0–2)
+
+| Variant (env) | Fork at | Δ mean ± SE | Steps | Verdict |
+|---|---|---|---|---|
+| `SOAP_SINK=cur` (SinkSOAP balancing of current P²) | 1000 | +0.00159 ± 0.00005 | −23.7 | much worse, reject |
+| `SOAP_SINK=ema` (Sinkhorn-factored V) | 1000 | +0.00150 ± 0.00002 | −22.5 | much worse, reject |
+| `SOAP_KL=1` (KL-SOAP coupled covariance) | 1000 | +0.00010 ± 0.00007 | −1.5 | no gain, reject |
+| `ROW_GAIN_LR=0.01` | 1000 | **−0.00047 ± 0.00009** | **+7.0** | better on all 3 seeds → sweep |
+| `ROW_GAIN_LR=0.03` | 1000 | −0.00003 ± 0.00006 | +0.4 | no effect |
+| `ENA_REST=2300` (EMA-Nesterov on longer) | 1500 | +0.00023 ± 0.00001 | −3.5 | worse, reject |
+| `ENA_REST=2690` | 1500 | +0.00044 ± 0.00007 | −6.5 | worse, reject |
+
+- Row gains (Muown #23 port: angular-only Muon step per row + Adam on row norms) have an optimum: lr 0.001 −16 steps, 0.003 −7, **0.01 +7**, 0.03 0.
+- Outer acceleration after 1950 hurts: EMA-Nesterov's lookahead is switched off at the right time. MuLoCo / SODA (same slot) not ported.
+
+### Readout lab (fork from 2000, seeds 0–2; Δ vs rec-46 Tail-EMA readout, val = selection set, held-out = 10.5M tokens of the last train shard)
+
+| Readout | Δ val | Δ held-out | Steps |
+|---|---|---|---|
+| EMA start 2200, τ 150, λ 0.6 | **−0.00041 ± 0.00001** | **−0.00039** | **+6.2** |
+| EMA 2200/150, λ 0.7 | −0.00039 | −0.00036 | +5.8 |
+| Tail-EMA + 5% toward θ₂₂₀₀ (#42 style, γ = −0.05) | −0.00029 | −0.00021 | +4.3 |
+| Tail-EMA + #38 velocity readout (any γ, β) | ≥ +0.00003 | – | worse (removed from the lab) |
+| Tail-EMA + RRE (#34), capped | +0.00014 | +0.00014 | −2.1 |
+| any reference *extrapolation* (γ > 0) | ≥ +0.00001 | – | worse |
+
+- #42's γ = −0.075 is an interpolation toward the reference (θ_eval = 0.925θ + 0.075θ_ref), not an extrapolation; extrapolating away from any reference was worse in every setting.
+- The gain comes from a longer averaging window: starting the Tail-EMA at 2200 instead of 2400 (same τ, λ). Confirmed on held-out data (−0.00039 vs −0.00041 on val), so it is not selection on the val set.
+- Refinement (start 2100–2300 × τ 100–200) running as `lab3`.
+
+### Round 3: row-gain lr sweep, readout refinement, first mechanism statistics
+
+**Row-gain lr** (`ROW_GAIN_LR`, fork at 1000, seeds 0–2; steps vs same-checkpoint controls):
+
+| lr | 0.001 | 0.003 | 0.005 | 0.007 | 0.01 | **0.015** | 0.02 | 0.03 |
+|---|---|---|---|---|---|---|---|---|
+| Δ val_ema | +0.00107 | +0.00045 | −0.00004 | −0.00020 | −0.00047 | **−0.00065 ± 0.00005** | −0.00051 | −0.00003 |
+| steps | −15.9 | −6.7 | +0.6 | +3.0 | +7.0 | **+9.7** | +7.7 | +0.4 |
+
+- A smooth optimum at 0.015, consistent on every seed. lr 0.01 forked at 1500 gives only +2.6 (vs +7.0 from 1000): the gain accumulates over training, so a full run (on from step 0) may gain more.
+
+**Readout refinement** (lab3, fork from 2000, seeds 0–2; vs Tail-EMA 2400/150/0.6):
+
+| EMA start : τ, λ | Δ val | Δ held-out | steps |
+|---|---|---|---|
+| **2100 : 200, 0.6** | **−0.00056** | **−0.00045** | **+8.3** |
+| 2100 : 150, 0.6 | −0.00044 | −0.00041 | +6.6 |
+| 2200 : 200, 0.6 | −0.00046 | −0.00035 | +6.8 |
+| 2200 : 150, 0.6 | −0.00039 | −0.00037 | +5.9 |
+| 2300 : 150, 0.6 | −0.00028 | −0.00028 | +4.2 |
+
+- Flat optimum around an earlier start (2100) and slightly longer τ (150–200), λ 0.6 throughout. Chosen: 2100 / 200 / 0.6 (best on both sets). Now env knobs `TAILEMA_START`, `TAILEMA_TAU`, `TAILEMA_LAMBDA` (defaults = rec-46).
+
+**Row-norm statistics** (`<log>.rowstat.jsonl`, control fork vs `ROW_GAIN_LR=0.01` fork, seed 0, at 2690):
+
+| type | mean row norm ctrl → gain | CV of row norms ctrl → gain |
+|---|---|---|
+| mlp.fc | 6.88 → 5.20 | 0.187 → 0.191 |
+| mlp.proj | 7.40 → 10.63 | 0.182 → 0.348 |
+| attn.q | 4.28 → 3.91 | 0.173 → 0.204 |
+| attn.k | 4.37 → 4.20 | 0.251 → 0.334 |
+| attn.v | 5.90 → 5.23 | 0.410 → 0.479 |
+| attn.proj | 4.93 → 4.56 | 0.271 → 0.342 |
+
+Two effects: (1) rows of a matrix spread out in norm (CV up, most in mlp.proj), (2) scale moves between matrices (mlp.fc shrinks, mlp.proj grows). Ablations to separate them (lr 0.015, fork at 1000): row gains on mlp only / attention only / mlp.proj only / mlp.fc only, and one gain per matrix (`ROW_GAIN_MODE=matrix`, effect 2 without effect 1).
+
+**Full runs** (commit `243e148`, seeds 0–2): `ROW_GAIN_LR=0.015` + Tail-EMA 2100/200/0.6, with the row gains on from step 0 (`full-rg15-s0start`, also saving checkpoints) and from step 1000 (`full-rg15-1000start`).
+
+### Round 4: what row gains act through
+
+**Ablations** (lr 0.015, fork at 1000, seeds 0–2, commit `243e148`):
+
+| Row gains on | Δ val_ema | steps |
+|---|---|---|
+| all six types (reference, same commit) | −0.00050 ± 0.00006 | +7.4 |
+| attention only (q, k, v, o) | −0.00046 ± 0.00005 | +6.9 |
+| mlp.fc only | −0.00045 ± 0.00006 | +6.7 |
+| mlp (fc + proj) | −0.00017 ± 0.00004 | +2.5 |
+| mlp.proj only | +0.00025 ± 0.00001 | −3.7 |
+| one gain per matrix (`ROW_GAIN_MODE=matrix`), all types | +0.00214 ± 0.00016 | −31.9 |
+
+- The benefit is per-row freedom, not moving scale between matrices: a single gain per matrix is far worse. (Caveat: the matrix-level gain reuses the per-row lr 0.015, which is large for one scalar per matrix.)
+- Row gains help on attention and mlp.fc and hurt on mlp.proj — the type whose row norms grew most (7.4 → 10.6) and spread most (CV 0.18 → 0.35). Next: all types except mlp.proj.
+- The same configuration (all types, lr 0.015) gave −0.00065 in round 3 and −0.00050 here (code identical in function). That 0.00015 gap is about 2 SE; read single-config differences under ~0.0002 with care.
+
+**Full runs, row gains switched on at step 1000** (`full-rg15-1000start`, + Tail-EMA 2100/200/0.6, seeds 0–2):
+
+| seed | rec-46 (`ckpt-rec46`) val_ema@2690 / first step ≤ 3.28 | row gains + new Tail-EMA |
+|---|---|---|
+| 0 | 3.27876 / 2675 | 3.27782 / 2655 |
+| 1 | 3.27949 / 2685 | 3.27733 / 2650 |
+| 2 | 3.27771 / 2655 | 3.27745 / 2650 |
+| mean | 3.27865 | **3.27753 (−0.00112)** |
+
+**Row gains from step 0 diverge** (loss 5.86 at step 125 vs 4.44, NaN at 440): attn.proj and mlp.proj are zero-initialized, and with the angular-only step a zero row cannot grow. Row gains need a start step after the projections have grown (`ROW_GAIN_START`).
+
+### Round 5: scope and lr without mlp.proj; first mechanism test
+
+| Row gains on (fork at 1000) | lr | Δ val_ema | steps |
+|---|---|---|---|
+| q, k, v, o, fc (no mlp.proj) | 0.01 | −0.00047 ± 0.00006 | +7.0 |
+| q, k, v, o, fc | 0.015 | −0.00070 ± 0.00008 | +10.5 |
+| q, k, v, o, fc | **0.02** | **−0.00081 ± 0.00010** | **+12.1** |
+| q, k only | 0.015 | −0.00005 ± 0.00007 | +0.7 |
+| v, o only | 0.015 | −0.00032 ± 0.00002 | +4.8 |
+
+- Inside attention the gain is in V/O, not Q/K. Contributions: v/o ≈ +5, fc ≈ +7, q/k ≈ 0, mlp.proj < 0.
+- The optimal lr moves up once mlp.proj is excluded; 0.025 and 0.03 queued.
+
+**Full runs** (Tail-EMA 2100/200/0.6 in all; seeds 0 / 1 / 2; val_ema@2690 and first step ≤ 3.28):
+
+| Run | seed 0 | seed 1 | seed 2 | mean | Δ vs rec-46 |
+|---|---|---|---|---|---|
+| rec-46 (`ckpt-rec46`) | 3.27876 / 2675 | 3.27949 / 2685 | 3.27771 / 2655 | 3.27865 | – |
+| row gains all types, on at 1000 | 3.27782 / 2655 | 3.27733 / 2650 | 3.27745 / 2650 | 3.27753 | −0.00112 |
+| no mlp.proj, on at 500 | 3.27730 / 2650 | 3.27809 / 2660 | 3.27799 / 2655 | 3.27779 | −0.00086 |
+| no mlp.proj, on at 1000 | 3.27731 / 2650 | 3.27845 / 2665 | 3.27757 / 2650 | 3.27778 | −0.00087 |
+
+All nine full runs are below the mean of rec-46 on the same seeds; with the seed SD ≈ 0.001 the differences between these three variants are not resolved by 3 seeds.
+
+**Mechanism test 1: is there a persistent radial pull the pin suppresses?** `track_radial` logs, per output row, the radial gradient g_i = ⟨∇W_i, W_i/‖W_i‖⟩ and its signal-to-noise |E g| / std g over an EMA of ≈ 50 steps. In control and row-gain forks alike (seeds 0–1), the median SNR is 0.02–0.09 for every type, and no row has SNR > 1. Per-step radial gradients are noise-dominated everywhere, and row gains do not change that. So "a strong persistent pull held back by the pin" is not what distinguishes the types. Next: the whole-run t-statistic Σg / √Σg² per row (pure noise gives a median ≈ 0.67) and its correlation with each row's norm change, to see whether a weak long-horizon drift exists and whether row gains follow it.
+
+### Round 6: lr plateau, readout on the row-gain trajectory, mechanism
+
+**lr without mlp.proj** (fork at 1000): 0.015 +10.5, **0.02 +12.1**, 0.025 +11.4, 0.03 +11.4 steps; v, o, fc only at 0.02: +10.7. Plateau 0.02–0.03; q/k add ≈ 0. Chosen: `ROW_GAIN_LR=0.02 ROW_GAIN_SCOPE=q,k,v,o,fc`.
+
+**Readout on the row-gain trajectory** (lab4: forks from step 2000 of `full-noproj-start1000`, which already uses Tail-EMA 2100/200/0.6): Tail-EMA 2100/200/0.6 is still the optimum (ema 2000/200 ties at −0.00001). rec-46's Tail-EMA 2400/150/0.6 on this trajectory is +0.00055 val / +0.00045 held-out worse (−9 steps). The readout change and the row gains stack.
+
+**Mechanism.** What the data supports:
+1. *Per-row, not per-matrix.* One gain per matrix is −32 steps; per-row gains are +12. Moving scale between matrices is not the effect.
+2. *Only where row scale is visible to the function.* The model applies RMSNorm to each q and k head (`q, k = norm(q), norm(k)`), so scaling all rows of a head is invisible and only within-head ratios matter. Row gains on q/k: +0.7 steps. On v (value coordinates), attn.proj (attention-output coordinates of the residual stream) and mlp.fc (pre-activation scale of each relu² unit, entering squared) the row norm sets an output scale directly: +5 (v, o) and +7 (fc).
+3. *Rows sit closer to their norm equilibrium.* Whole-run radial-gradient t-statistic per row, |Σg_i| / √Σg_i² from the fork at 1000 to 2690 (pure noise: median 0.67), control → row gains (lr 0.02, no mlp.proj), seeds 0–1 agree:
+
+| type | median \|t\| ctrl → gain | rows with \|t\| > 3 ctrl → gain | corr(t_i, Δlog‖W_i‖) ctrl → gain |
+|---|---|---|---|
+| attn.q | 0.69 → 0.45 | 7% → 1–2% | −0.60 → −0.61 |
+| attn.k | 0.91 → 0.44 | 9% → 1% | −0.62 → −0.61 |
+| attn.v | 0.61 → 0.42 | 1% → 0% | −0.62 → −0.36 |
+| attn.proj | 0.43 → 0.30 | 0–1% → 0% | −0.64 → −0.20 |
+| mlp.fc | 0.32 → 0.24 | 0% | −0.31 → −0.10 |
+| mlp.proj (gains off in both) | 0.90 → 0.84 | 3% | −0.09 → −0.15 |
+
+   - In the control, v / attn.proj / mlp.fc have |t| *below* the noise level: their radial gradients are mean-reverting (rows oscillate around a norm equilibrium). q/k rows have a persistent drift (7–9% of rows at |t| > 3).
+   - Row gains lower |t| in every type they act on: each row's radial gradient cancels more completely over the run, i.e. each row's norm stays nearer its own equilibrium. In rec-46 the per-row norms can only move through the whole-matrix radius pin, radial damping (outward radial motion halved) and the RowFloor, so individual rows lag their equilibrium.
+   - The correlation between a row's accumulated radial gradient and its norm change weakens for v / o / fc (rows no longer need large drifts to cancel a pull, because the pull never builds up), and stays for q/k.
+   - Consistent picture: row gains equilibrate every row's norm quickly; that matters where the row norm is visible to the loss (v, o, fc), not behind QK-norm (q, k). Not explained: why mlp.proj, whose row norm is also visible, is hurt (its rows grew 7.4 → 10.6 and spread CV 0.18 → 0.35 with gains on; one guess is that it lets MLP outputs dominate the residual stream).
+   - Per-step SNR (EMA ≈ 50 steps) is 0.02–0.09 everywhere, so the equilibrium is only visible over hundreds of steps; this rules out "a strong persistent pull held back by the pin".
+
+**Candidate for full-run validation** (commit `b7ae8c3`): `ROW_GAIN_LR=0.02 ROW_GAIN_SCOPE=q,k,v,o,fc ROW_GAIN_START=1000 TAILEMA_START=2100 TAILEMA_TAU=200` (λ 0.6), seeds 0–7 (`cand-rg20`), plus rec-46 controls for seeds 5–7 (`ctrl-rec46`). Scored by `fork_compare.py --full`: Track 3 rule at each dense step, earliest passing step, and seed-paired difference from the rec-46 controls.
