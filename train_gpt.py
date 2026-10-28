@@ -185,6 +185,11 @@ SOAP_KL_SCOPE = os.environ.get("SOAP_KL_SCOPE", "all")
 ENA_REST = int(os.environ.get("ENA_REST", 0))   # EMA-Nesterov lookahead end step (0 = rec-46: train_steps - 950 = 1950)
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.0))
+# ROW_GAIN_SCOPE: comma list of matrix types it applies to (q,k,v,o,fc,proj; default all). ROW_GAIN_MODE=matrix: one
+# gain per matrix (pure angular step for the whole matrix, then W *= 1 - a*(lr/lr0)*adam(<grad, W/|W|>)) instead of
+# one per row - separates "rows of a matrix can differ in norm" from "matrices can change scale".
+ROW_GAIN_SCOPE = set(os.environ.get("ROW_GAIN_SCOPE", "q,k,v,o,fc,proj").split(","))
+ROW_GAIN_MODE = os.environ.get("ROW_GAIN_MODE", "row")
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -758,6 +763,9 @@ class Muon(torch.optim.Optimizer):
         self.gated_params = self.attn_proj_soap_params | (self.v_params if V_GATE else set())
         self.vo_params = self.v_params | {p for n, p in named_params if is_attn_proj_param(n)}
         self.head_mask = None
+        _kind = lambda n: {"attn.q": "q", "attn.k": "k", "attn.v": "v", "attn.proj": "o", "mlp.fc": "fc",
+                           "mlp.proj": "proj"}.get(n.split(".", 1)[1].rsplit(".", 1)[0])
+        self.row_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_SCOPE} if ROW_GAIN_LR > 0 else set()
         self.step_count = 0
         # Probe diagnostics (harness.ProbeQuadratic): on probe steps the harness sets probe_capture and this optimizer
         # records, per param it owns, the candidate update directions below (descent convention, W -= lr*u).
@@ -874,11 +882,14 @@ class Muon(torch.optim.Optimizer):
                     else:
                         scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
                         update = update * scale.to(update.dtype)
-                    row_ctl = (ROW_PIN or ROW_GAIN_LR > 0) and p.ndim == 2
+                    gain = p in self.row_gain_params
+                    row_ctl = (ROW_PIN or gain) and p.ndim == 2
                     if row_ctl:
                         p_before = p.float()
                         r_rows = p_before.norm(dim=1, keepdim=True).clamp_min(1e-8)
-                        target_rows = r_rows if ROW_GAIN_LR > 0 else (
+                        if gain and ROW_GAIN_MODE == "matrix":
+                            r_rows = p_before.norm().clamp_min(1e-8).reshape(1, 1)
+                        target_rows = r_rows if gain else (
                             r_rows - group["lr"] * (update.float() * p_before).sum(dim=1, keepdim=True) / r_rows)
                         target_rows = target_rows.clamp_min(1e-8)
                     else:
@@ -890,9 +901,12 @@ class Muon(torch.optim.Optimizer):
                         cwd_mask = (update.float() * p.float() > 0).to(p.dtype)
                     p.add_(update, alpha=-group["lr"])
                     if row_ctl:
-                        p.mul_((target_rows / p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)).to(p.dtype))
-                        if ROW_GAIN_LR > 0:
-                            g_row = (grad.float() * p_before).sum(dim=1, keepdim=True) / r_rows
+                        cur = (p.float().norm().reshape(1, 1) if gain and ROW_GAIN_MODE == "matrix"
+                               else p.float().norm(dim=1, keepdim=True))
+                        p.mul_((target_rows / cur.clamp_min(1e-8)).to(p.dtype))
+                        if gain:
+                            g_row = ((grad.float() * p_before).sum().reshape(1, 1) if ROW_GAIN_MODE == "matrix"
+                                     else (grad.float() * p_before).sum(dim=1, keepdim=True)) / r_rows
                             if "row_m" not in state:
                                 state["row_m"], state["row_v"], state["row_t"] = torch.zeros_like(g_row), torch.zeros_like(g_row), 0
                             state["row_t"] += 1
@@ -1098,6 +1112,7 @@ print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FIN
 print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK} muon_lr_mult={MUON_LR_MULT}")
 print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants={VO_VARIANTS} "
        f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR} "
+       f"row_gain_scope={sorted(ROW_GAIN_SCOPE)} row_gain_mode={ROW_GAIN_MODE} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
@@ -1335,7 +1350,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):
