@@ -30,6 +30,12 @@ and measures, for every parameter tensor, then aggregates per block type
 
 GradNoiseScale / GradNoiseCallback (separate, all ranks): gradient noise scale B_simple = tr(Sigma) / |G|^2 from two
 fresh micro-batches at the same weights -> gns_G2, gns_trS, gns_B per group (see the class docstring).
+B_simple is the critical-batch-size estimate: training batches well above it waste data, well below it waste steps.
+
+ProbeQuadratic (separate, all ranks): quadratic model of the loss along update directions on a FIXED held-out probe
+batch -> per direction and group: first-order gain a = <g_probe, u>, curvature c = u^T H u (finite-difference
+Hessian-vector product), greedy step-scale ratio a / c for the realized step, and the direction quality
+D(u) = a^2 / (2c) (see the class docstring).
 
 Group values for norms / cosines / curvature are exact: they are computed from summed
 dot products, i.e. as if the group's tensors were flattened into one vector (the
@@ -536,6 +542,132 @@ class GradNoiseScale:
             rec[f"{gname}/gns_G2"] = _safe(g12)
             rec[f"{gname}/gns_trS"] = _safe(trS)
             rec[f"{gname}/gns_B"] = _safe(_div(trS, g12)) if g12 > 0 else None
+        return rec
+
+
+# ---------------------------------------------------------------------------
+# probe-batch quadratic diagnostics
+# ---------------------------------------------------------------------------
+
+
+class ProbeQuadratic:
+    """Quadratic model of the probe loss along update directions, at the weights theta0 where a step started.
+
+    Along a direction u (descent convention: the optimizer moves theta -> theta - s*u),
+        L(theta0 - s u) ~ L(theta0) - s a + s^2 c / 2,   a = <g_probe(theta0), u>,   c = u^T H u,
+    with g_probe the gradient of a FIXED held-out probe batch (independent of the training batch, so a counts only
+    signal; noise in u inflates c but not a) and c a central finite-difference Hessian-vector product:
+        c ~ <u, g(theta0 + eps u) - g(theta0 - eps u)> / (2 eps),   eps = eps_rel * ||theta0_G|| / ||u_G||
+    (two extra forward/backward passes per (direction, group); no second derivatives). eps is relative because the
+    forward casts weights to bf16: a perturbation far below bf16 resolution would vanish.
+    Per (direction, group G), u restricted to G's tensors:
+        probe_<dir>_a, probe_<dir>_c
+        probe_<dir>_D      = a^2 / (2c): the largest one-step probe-loss drop along u at the best scale; scale-free,
+                             so it compares DIRECTIONS (None when c <= 0)
+        probe_<dir>_cos    = cos(u, realized step) over G
+    For the realized step v = theta0 - theta1 (dir "step"; includes every floor/pin/decay/lookahead the optimizer
+    applied), the step taken is s = 1, so
+        probe_step_ratio   = a / c = eta* / eta, the greedy optimal step scale relative to the one taken
+                             (>1 under-stepping, <1 overshooting; one-step greedy is biased small, Wu et al. 2018 -
+                             compare across groups and over time, not in absolute terms)
+        probe_step_dL_pred = -a + c/2 (quadratic model of the realized step), and on "global" only
+        probe_step_dL      = L(theta1) - L(theta0), the measured probe-loss change, as a check of the model.
+    Groups: "global" and "type/<block type>". Collective under torch.distributed: every rank calls measure() at the
+    same step with the same direction/parameter keys (directions must be identical on all ranks); per-rank probe
+    shards are averaged. The model's weights are restored bit-exactly afterwards and p.grad is untouched.
+
+    loss_fn() -> mean probe loss at the current weights (same fixed batch on every call).
+    """
+
+    def __init__(self, model: torch.nn.Module, loss_fn: Callable[[], torch.Tensor],
+                 rules: list[tuple[str, str]] | None = None, eps_rel: float = 2e-2, per_type: bool = True):
+        self.loss_fn = loss_fn
+        self.eps_rel = eps_rel
+        self.per_type = per_type
+        self.params = [(n, p, *classify(n, p, rules or DEFAULT_RULES)) for n, p in model.named_parameters()
+                       if p.requires_grad]
+        self.p_of = {n: p for n, p, _, _ in self.params}
+        self.typ_of = {n: typ for n, _, _, typ in self.params}
+
+    def _grads(self, names: list[str]):
+        loss = self.loss_fn()
+        gs = torch.autograd.grad(loss, [self.p_of[n] for n in names])
+        return loss.detach().double(), dict(zip(names, gs))
+
+    @staticmethod
+    def _dot(x: dict, y: dict, names) -> torch.Tensor:
+        return sum((x[n].double() * y[n].double()).sum() for n in names)
+
+    def measure(self, theta0: dict[str, torch.Tensor], directions: dict[str, dict[str, torch.Tensor]] | None = None
+                ) -> dict:
+        """theta0: name -> weights where the step started (the model holds theta1 = after the step).
+        directions: dir name -> {param name -> u} (any subset of params); "step" = theta0 - theta1 is added."""
+        names_all = [n for n, _, _, _ in self.params]
+        with torch.no_grad():
+            theta1 = {n: self.p_of[n].detach().clone() for n in names_all}
+            loss1 = self.loss_fn().detach().double()
+            for n in names_all:
+                self.p_of[n].copy_(theta0[n])
+        hi = {n: torch.promote_types(self.p_of[n].dtype, torch.float32) for n in names_all}  # >= fp32 arithmetic
+        dirs = {"step": {n: theta0[n].to(hi[n]) - theta1[n].to(hi[n]) for n in names_all}, **(directions or {})}
+        loss0, g0 = self._grads(names_all)
+
+        jobs = []  # (dir, group name, names)
+        for d, u in dirs.items():
+            groups: dict[str, list[str]] = defaultdict(list)
+            for n in u:
+                groups["global"].append(n)
+                if self.per_type:
+                    groups[f"type/{self.typ_of[n]}"].append(n)
+            jobs += [(d, g, ns) for g, ns in groups.items()]
+        dev = g0[names_all[0]].device
+        vals = torch.zeros(len(jobs), 4, dtype=torch.float64, device=dev)  # a, c, <u,v>, |u||v|
+        for j, (d, gname, ns) in enumerate(jobs):
+            u = dirs[d]
+            u_norm = self._dot(u, u, ns).sqrt()
+            if u_norm <= 0:
+                vals[j, 1] = float("nan")
+                continue
+            th_norm = self._dot(theta0, theta0, ns).sqrt()
+            eps = (self.eps_rel * th_norm / u_norm).item()
+            vals[j, 0] = self._dot(g0, u, ns)
+            gpm = []
+            for sign in (1.0, -1.0):
+                with torch.no_grad():
+                    for n in ns:
+                        self.p_of[n].copy_((theta0[n].to(hi[n]) + sign * eps * u[n].to(hi[n])).to(self.p_of[n].dtype))
+                gpm.append(self._grads(ns)[1])
+            with torch.no_grad():
+                for n in ns:
+                    self.p_of[n].copy_(theta0[n])
+            vals[j, 1] = sum((u[n].double() * (gpm[0][n].double() - gpm[1][n].double())).sum() for n in ns) / (2 * eps)
+            v = dirs["step"]
+            vals[j, 2] = self._dot(u, v, ns)
+            vals[j, 3] = u_norm * self._dot(v, v, ns).sqrt()
+            del gpm
+        losses = torch.stack([loss0, loss1])
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            ws = torch.distributed.get_world_size()
+            torch.distributed.all_reduce(vals[:, :2], op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.SUM)
+            vals[:, :2] /= ws  # a, c: average of per-rank probe shards; <u,v> and norms are identical on all ranks
+            losses /= ws
+        with torch.no_grad():
+            for n in names_all:
+                self.p_of[n].copy_(theta1[n])
+
+        V = vals.cpu().tolist()
+        loss0, loss1 = losses.tolist()
+        rec: dict = {"global/probe_loss": _safe(loss0), "global/probe_step_dL": _safe(loss1 - loss0)}
+        for (d, gname, _), (a, c, uv, nn) in zip(jobs, V):
+            k = f"{gname}/probe_{d}"
+            rec[f"{k}_a"], rec[f"{k}_c"] = _safe(a), _safe(c)
+            rec[f"{k}_D"] = _safe(a * a / (2 * c)) if c > 0 else None
+            if d == "step":
+                rec[f"{k}_ratio"] = _safe(a / c) if c > 0 else None
+                rec[f"{k}_dL_pred"] = _safe(-a + c / 2)
+            else:
+                rec[f"{k}_cos"] = _safe(_div(uv, nn))
         return rec
 
 

@@ -555,6 +555,11 @@ class Muon(torch.optim.Optimizer):
         self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_param(n)}
         self.attn_proj_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
         self.step_count = 0
+        # Probe diagnostics (harness.ProbeQuadratic): on probe steps the harness sets probe_capture and this optimizer
+        # records, per param it owns, the candidate update directions below (descent convention, W -= lr*u).
+        # A new direction idea ("variant") is screened by adding its name here and a self._capture call.
+        self.probe_capture, self.probe_dirs = False, {}
+        self.probe_dir_names = ["momentum", "soap"] + (["newton"] if newton is not None and NEWTON_MODE != "grad" else []) + ["ns"]
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         if all(m == 1.0 for m in MUON_LR_MULT.values()):
             params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
@@ -567,6 +572,10 @@ class Muon(torch.optim.Optimizer):
                            lr=lr * MUON_LR_MULT[kind], lr_mult=MUON_LR_MULT[kind])
                       for kind, ps in by_type.items()]
         super().__init__(params, defaults)
+
+    def _capture(self, p, name, u):
+        if self.probe_capture:
+            self.probe_dirs.setdefault(p, {})[name] = u.detach().float().clone()
 
     @torch.no_grad()
     def step(self):
@@ -597,13 +606,16 @@ class Muon(torch.optim.Optimizer):
                         grad = self.newton.apply(grad, p, rescale=False)
                     state["momentum"].lerp_(grad, 1 - group["mu"])
                     momentum_update = grad.lerp(state["momentum"], group["mu"])
+                    self._capture(p, "momentum", momentum_update)
                     is_attn_soap = p in self.attn_soap_params
                     use_soap = p in self.soap_params
                     if use_soap:
                         if is_attn_soap:
                             soap_update = soap_precondition_momentum(momentum_update, state)
+                            self._capture(p, "soap", soap_update)
                             if self.newton is not None and NEWTON_MODE in ("soap", "right"):
                                 soap_update = self.newton.apply(soap_update, p)
+                                self._capture(p, "newton", soap_update)
                             if p in self.attn_proj_soap_params:
                                 gate = bounded_trust_gate(
                                     trust_gate(momentum_update, soap_update, grad),
@@ -614,9 +626,12 @@ class Muon(torch.optim.Optimizer):
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
                             momentum_update = soap_precondition_momentum(momentum_update, state)
+                            self._capture(p, "soap", momentum_update)
                             if self.newton is not None and NEWTON_MODE in ("soap", "right"):
                                 momentum_update = self.newton.apply(momentum_update, p)
+                                self._capture(p, "newton", momentum_update)
                     update = muon_update(momentum_update)
+                    self._capture(p, "ns", update)
                     update = scale_radial_update(update, p)
                     # u/w-floor. SOAP and non-SOAP params can use different floors.
                     p_fro = p.float().norm().clamp_min(1e-8)
@@ -852,6 +867,19 @@ batch_size = 8 * 64 * 1024
 mbs = 64
 train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+# Held-out training data for the diagnostics (harness: ProbeQuadratic, GradNoiseScale): the last train shard, which
+# training never reaches. Its first batch is the FIXED probe batch; later batches are fresh GNS batches.
+_train_files = sorted(Path.cwd().glob("data/fineweb10B/fineweb_train_*.bin"))
+assert FINAL_TRAIN_STEPS * batch_size < sum((f.stat().st_size - 1024) // 2 for f in _train_files[:-1])
+heldout_loader = distributed_data_generator(str(_train_files[-1].relative_to(Path.cwd())), batch_size)
+probe_inputs, probe_targets = next(heldout_loader)
+
+def probe_loss_fn():
+    return model(probe_inputs, probe_targets) / probe_targets.numel()
+
+def gns_loss_fn(i):
+    inputs, targets = next(heldout_loader)
+    return model(inputs, targets) / targets.numel(), targets.numel()
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
@@ -1034,7 +1062,8 @@ training_time = 0
 _tailema = None   # (A) Tail-EMA buffer: one fp32 tensor per non-embed param; lazy-init at TAILEMA_START
 dist.barrier()
 t0 = time.perf_counter()
-H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None, config=dict(train_steps=train_steps, newton_muon=NEWTON_MUON, newton_mode=NEWTON_MODE,
+H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None,
+                    probe_loss_fn=probe_loss_fn, gns_loss_fn=gns_loss_fn, config=dict(train_steps=train_steps, newton_muon=NEWTON_MUON, newton_mode=NEWTON_MODE,
                                    newton_refresh=NEWTON_REFRESH, newton_damping=NEWTON_DAMPING,
                                    muon_lr_mult=MUON_LR_MULT))
 for step in range(train_steps + 1):

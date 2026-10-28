@@ -5,11 +5,15 @@ Kept out of the record scripts so each record's diff is only its optimization ch
   - VRAM cap at 80GB (competition targets H100-80GB, we run on H200-141GB)
   - W&B logging of train/val metrics + leaderboard summary (total_train_steps, val_loss)
   - optimization dynamics (optim_dynamics.py), rank 0 only, never to a cerulean-labs entity
+  - critical batch size (GradNoiseScale, every GNS_EVERY steps) and probe-batch quadratic diagnostics
+    (ProbeQuadratic, every PROBE_EVERY steps), all ranks, on held-out batches the caller provides
   - early stop at the record step (STOP_STEP) with the LR schedule horizon unchanged
 
 Usage inside a record script:
     harness.setup(device)                         # right after torch.cuda.set_device
-    H = harness.Harness(model, optimizers, logfile, config=dict(...))
+    H = harness.Harness(model, optimizers, logfile, config=dict(...),
+                        probe_loss_fn=..., gns_loss_fn=..., names=...)   # the two loss fns are optional
+    ... top of each iteration: H.start_step()
     ... each val step:   H.log_val(step, val_loss=..., **extra)
                          if H.should_stop(step): break   (and add `or H.should_stop(step)` to the val condition)
     ... each train step: H.before_step(); <optimizer steps>; H.after_step(step, train_loss)
@@ -22,7 +26,7 @@ import subprocess
 import torch
 import torch.distributed as dist
 
-from optim_dynamics import OptimDynamicsLogger, make_wandb_log_fn
+from optim_dynamics import GradNoiseScale, OptimDynamicsLogger, ProbeQuadratic, make_wandb_log_fn
 
 # nanogpt parameter names -> optim_dynamics block types (the default rules target HF names)
 NANOGPT_RULES = [
@@ -51,7 +55,10 @@ def _git_commit():
 
 
 class Harness:
-    def __init__(self, model, optimizers, logfile, config=None):
+    def __init__(self, model, optimizers, logfile, config=None, probe_loss_fn=None, gns_loss_fn=None):
+        """probe_loss_fn() -> mean loss of a FIXED held-out batch (ProbeQuadratic);
+        gns_loss_fn(i) -> (mean loss, #tokens) of a FRESH held-out batch (GradNoiseScale). Both at the current weights,
+        same per-rank batch size on every rank; neither may overlap the training stream."""
         self.model = model
         # wrappers (EMA-Nesterov) hold the lr-carrying optimizers in .inner_optimizer
         self.optimizers = []
@@ -65,6 +72,18 @@ class Harness:
         self.last_val = None
         self.dyn = None
         self.run = None
+        self.t = 0   # index of the next training iteration
+        # optimization dynamics are off when OPTIM_DYNAMICS=0, and so are the collective probes below
+        dynamics = os.environ.get("OPTIM_DYNAMICS", "1") == "1"
+        self.gns_every = int(os.environ.get("GNS_EVERY", 100)) if dynamics and gns_loss_fn else 0
+        self.probe_every = int(os.environ.get("PROBE_EVERY", 200)) if dynamics and probe_loss_fn else 0
+        self.gns = GradNoiseScale(model, gns_loss_fn, rules=NANOGPT_RULES) if self.gns_every else None
+        self.probe = (ProbeQuadratic(model, probe_loss_fn, rules=NANOGPT_RULES,
+                                     eps_rel=float(os.environ.get("PROBE_EPS", 2e-2))) if self.probe_every else None)
+        self.name_of = {p: n for n, p in model.named_parameters()}
+        self._theta0 = None
+        self.probe_log_fn = None
+        self.probe_out = None
         if not self.rank0:
             return
         import wandb
@@ -88,6 +107,9 @@ class Harness:
                                            spectral_every=int(os.environ.get("DYN_SPECTRAL_EVERY", 5 * log_every)),
                                            out_path=logfile.replace(".txt", ".dyn.jsonl"), rules=NANOGPT_RULES,
                                            log_fn=make_wandb_log_fn(step_key="step"))
+        if self.gns is not None or self.probe is not None:
+            self.probe_log_fn = make_wandb_log_fn(step_key="step", per_layer="none")
+            self.probe_out = logfile.replace(".txt", ".probe.jsonl")
 
     # -- training step hooks (call on every rank; work happens on rank 0) --------------
     def start_step(self):
@@ -96,6 +118,12 @@ class Harness:
         self._w0 = None
         if self.dyn is not None and self.dyn._phase() is not None:
             self._w0 = {name: p.detach().clone() for name, p, _, _ in self.dyn.params}
+        # probe step: keep theta0 (before the lookahead) and have capable optimizers record candidate directions
+        if self.probe is not None and self.t > 0 and self.t % self.probe_every == 0:
+            self._theta0 = {n: p.detach().clone() for n, p in self.model.named_parameters()}
+            for opt in self.optimizers:
+                if hasattr(opt, "probe_dir_names"):
+                    opt.probe_capture, opt.probe_dirs = True, {}
 
     def before_step(self):
         if self.dyn is not None:
@@ -108,11 +136,50 @@ class Harness:
                         b["w_before"] = self._w0[name]
                 self._w0 = None
 
+    def _gather_dirs(self):
+        """Candidate directions recorded by capable optimizers on the rank that owns each param -> full copies on
+        every rank (zeros elsewhere + all_reduce SUM). Returns {dir: {param name: tensor}}."""
+        dirs = {}
+        for opt in self.optimizers:
+            if not getattr(opt, "probe_capture", False):
+                continue
+            ps = [p for g in opt.param_groups for p in g["params"]]
+            for d in opt.probe_dir_names:
+                flat = torch.zeros(sum(p.numel() for p in ps), dtype=torch.float32, device=self.device)
+                i = 0
+                for p in ps:
+                    rec = opt.probe_dirs.get(p)
+                    if rec is not None and d in rec:
+                        flat[i:i + p.numel()].copy_(rec[d].reshape(-1))
+                    i += p.numel()
+                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+                dirs[d] = {self.name_of[p]: u.view_as(p) for p, u in zip(ps, flat.split([p.numel() for p in ps]))}
+            opt.probe_capture, opt.probe_dirs = False, {}
+        return dirs
+
+    def _emit(self, rec, step):
+        if not self.rank0:
+            return
+        import json
+        import time
+        with open(self.probe_out, "a") as f:
+            f.write(json.dumps({"step": step, "time": time.time(), **rec}) + "\n")
+        self.probe_log_fn({k: v for k, v in rec.items() if v is not None}, step)
+
     def after_step(self, step, train_loss=None):
         """train_loss: this rank's mean per-token loss (tensor); averaged over ranks here."""
         if self.dyn is not None:
             with torch.random.fork_rng(devices=[self.device]):
                 self.dyn.after_step()
+        self.t = step + 1
+        if self._theta0 is not None:
+            # quadratic diagnostics of the step just taken, at the weights where it started (logged at `step`)
+            rec = self.probe.measure(self._theta0, self._gather_dirs())
+            self._theta0 = None
+            self._emit(rec, step)
+        if self.gns is not None and self.t % self.gns_every == 0:
+            # critical batch size at the weights after the step (logged at step + 1)
+            self._emit(self.gns.measure(), self.t)
         if train_loss is not None:
             train_loss = train_loss.detach().float().clone()
             dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
