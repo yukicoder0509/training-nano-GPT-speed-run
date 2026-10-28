@@ -141,6 +141,12 @@ VO_FLOOR_MULT = float(os.environ.get("VO_FLOOR_MULT", 1.0))
 # Screening only: compute V/O SOAP variant directions (class VOVariants) and record them on probe steps for
 # harness.ProbeQuadratic. They are never applied, so training is unchanged; costs extra compute every step.
 VO_VARIANTS = os.environ.get("VO_VARIANTS", "0") == "1"
+# Applied V/O SOAP changes (defaults = rec-46): V_GATE=1 puts the attn.proj trust gate on attn.v too;
+# VO_DENOM_POWER is the SOAP denominator power for attn.v / attn.proj (rec-46: SOAP_DENOM_POWER = 0.5);
+# VO_HEAD=1 uses per-head (block-diagonal) SOAP statistics on V's output side and O's input side.
+V_GATE = os.environ.get("V_GATE", "0") == "1"
+VO_DENOM_POWER = float(os.environ.get("VO_DENOM_POWER", 0.5))
+VO_HEAD = os.environ.get("VO_HEAD", "0") == "1"
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -449,23 +455,27 @@ def soap_basis_qr(row_gg, col_gg, q_row, q_col, exp_avg_sq):
     q_col, _ = torch.linalg.qr(col_gg @ q_col)
     return q_row, q_col, exp_avg_sq
 
-def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8):
+def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8, denom_power=SOAP_DENOM_POWER):
     update_f = update.float()
     if state["q_row"] is None:
         return update
     q_row, q_col = state["q_row"], state["q_col"]
     projected = q_row.T @ update_f if q_col is None else q_row.T @ update_f @ q_col
     state["exp_avg_sq"].mul_(beta2).add_(projected.square(), alpha=1 - beta2)
-    denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(SOAP_DENOM_POWER)
+    denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(denom_power)
     precond = q_row @ (projected / denom) if q_col is None else q_row @ (projected / denom) @ q_col.T
     precond.mul_(gram_frobenius_norm_estimate(update_f, eps=eps) / gram_frobenius_norm_estimate(precond, eps=eps))
     return precond.to(update.dtype)
 
-def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, precondition_frequency=SOAP_PRECONDITION_FREQUENCY):
+def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, precondition_frequency=SOAP_PRECONDITION_FREQUENCY,
+                               row_mask=None, col_mask=None):
+    # row_mask / col_mask: elementwise masks on the new statistics (per-head block-diagonal SOAP, VO_HEAD)
     grad_f = grad.float()
-    state["row_gg"].lerp_(grad_f @ grad_f.T, 1 - shampoo_beta)
+    row_new = grad_f @ grad_f.T
+    state["row_gg"].lerp_(row_new if row_mask is None else row_new * row_mask, 1 - shampoo_beta)
     if state["col_gg"] is not None:
-        state["col_gg"].lerp_(grad_f.T @ grad_f, 1 - shampoo_beta)
+        col_new = grad_f.T @ grad_f
+        state["col_gg"].lerp_(col_new if col_mask is None else col_new * col_mask, 1 - shampoo_beta)
     if state["q_row"] is None:
         state["q_row"] = soap_eigenbasis(state["row_gg"])
         state["q_col"] = None if state["col_gg"] is None else soap_eigenbasis(state["col_gg"])
@@ -661,6 +671,10 @@ class Muon(torch.optim.Optimizer):
         self.soap_params = {p for n, p in named_params if should_soap_param(n)}
         self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_param(n)}
         self.attn_proj_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
+        self.v_params = {p for n, p in named_params if n.endswith(".attn.v.weight")}
+        self.gated_params = self.attn_proj_soap_params | (self.v_params if V_GATE else set())
+        self.vo_params = self.v_params | {p for n, p in named_params if is_attn_proj_param(n)}
+        self.head_mask = None
         self.step_count = 0
         # Probe diagnostics (harness.ProbeQuadratic): on probe steps the harness sets probe_capture and this optimizer
         # records, per param it owns, the candidate update directions below (descent convention, W -= lr*u).
@@ -724,12 +738,14 @@ class Muon(torch.optim.Optimizer):
                     use_soap = p in self.soap_params
                     if use_soap:
                         if is_attn_soap:
-                            soap_update = soap_precondition_momentum(momentum_update, state)
+                            soap_update = soap_precondition_momentum(
+                                momentum_update, state,
+                                denom_power=VO_DENOM_POWER if p in self.vo_params else SOAP_DENOM_POWER)
                             self._capture(p, "soap", soap_update)
                             if self.newton is not None and NEWTON_MODE in ("soap", "right"):
                                 soap_update = self.newton.apply(soap_update, p)
                                 self._capture(p, "newton", soap_update)
-                            if p in self.attn_proj_soap_params:
+                            if p in self.gated_params:
                                 gate = bounded_trust_gate(
                                     trust_gate(momentum_update, soap_update, grad),
                                     self.step_count
@@ -780,7 +796,15 @@ class Muon(torch.optim.Optimizer):
                         # apply AFTER the radius pin (POST) so the per-coord shape change is preserved.
                         p.mul_(1.0 - (group["lr"] * CWD) * cwd_mask)
                     if use_soap:
-                        soap_update_preconditioner(grad, state)
+                        if VO_HEAD and p in self.vo_params:
+                            if self.head_mask is None:
+                                h = p.size(0) // HEAD_DIM
+                                self.head_mask = torch.block_diag(*[torch.ones(HEAD_DIM, HEAD_DIM, device=p.device)] * h)
+                            # heads live on V's output side (rows) and O's input side (columns)
+                            soap_update_preconditioner(grad, state, row_mask=self.head_mask if p in self.v_params else None,
+                                                       col_mask=None if p in self.v_params else self.head_mask)
+                        else:
+                            soap_update_preconditioner(grad, state)
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
         self.step_count += 1
 
@@ -961,7 +985,8 @@ print0(f"Intuition={EXPERIMENT_INTUITION}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
 print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK} muon_lr_mult={MUON_LR_MULT}")
-print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants={VO_VARIANTS}")
+print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants={VO_VARIANTS} "
+       f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
@@ -1187,7 +1212,8 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
                                    newton_refresh=NEWTON_REFRESH, newton_damping=NEWTON_DAMPING,
                                    muon_lr_mult=MUON_LR_MULT, gain_beta2=GAIN_BETA2,
                                    aux_beta1=AUX_BETA1, aux_lr_mult=AUX_LR_MULT,
-                                   vo_lr_mult=VO_LR_MULT, vo_floor_mult=VO_FLOOR_MULT))
+                                   vo_lr_mult=VO_LR_MULT, vo_floor_mult=VO_FLOOR_MULT,
+                                   v_gate=V_GATE, vo_denom_power=VO_DENOM_POWER, vo_head=VO_HEAD))
 for step in range(train_steps + 1):
     H.start_step()
 

@@ -76,6 +76,10 @@ There is no gradient clipping and no other weight decay.
 **Muon learning rate:** η₀ = 0.0375 · m_type.
 - The multipliers m_type are set by `MUON_LR_MULT` = "m_qkv, m_attn.proj, m_mlp", default "1,1,1". #15's ratios are 0.8, 1, 1.2.
 - Each type's PowerCool constant is c·m_type, so η_t = m_type·η_t^(base) and every type starts decaying at the same step.
+- V/O SOAP knobs (env, defaults = rec-46):
+  - `V_GATE=1`: the trust gate of step 4 is also applied on attn.v (default: attn.proj only).
+  - `VO_DENOM_POWER` = p: for attn.v and attn.proj, step 2 divides by V^p instead of V^½ (default 0.5).
+  - `VO_HEAD=1`: step 9's new statistics are masked to the 6 head blocks (128×128) on V's output side (L) and O's input side (R), so those bases are block-diagonal per head.
 - Screening only: `VO_VARIANTS=1` also computes V/O SOAP variant directions (per-head statistics, a shared V–O basis, V^¼ denominator, trust gate on V; class `VOVariants`) and records them on probe steps. They are never applied, so the update above is unchanged.
 - V/O ablation knobs (env, default 1 = rec-46): `VO_LR_MULT` multiplies m_type for attn.v and attn.proj (same PowerCool scaling), and `VO_FLOOR_MULT` multiplies their RowFloor target (0.3825 in step 7).
 
