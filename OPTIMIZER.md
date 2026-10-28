@@ -76,6 +76,7 @@ There is no gradient clipping and no other weight decay.
 **Muon learning rate:** η₀ = 0.0375 · m_type.
 - The multipliers m_type are set by `MUON_LR_MULT` = "m_qkv, m_attn.proj, m_mlp", default "1,1,1". #15's ratios are 0.8, 1, 1.2.
 - Each type's PowerCool constant is c·m_type, so η_t = m_type·η_t^(base) and every type starts decaying at the same step.
+- V/O ablation knobs (env, default 1 = rec-46): `VO_LR_MULT` multiplies m_type for attn.v and attn.proj (same PowerCool scaling), and `VO_FLOOR_MULT` multiplies their RowFloor target (0.3825 in step 7).
 
 ### 2a. Newton-Muon preconditioner K_ℓ
 

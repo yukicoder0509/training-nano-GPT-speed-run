@@ -134,6 +134,10 @@ NEWTON_DAMPING = float(os.environ.get("NEWTON_DAMPING", 0.2))   # larger -> K cl
 MUON_LR_MULT = dict(zip(("qkv", "attn_proj", "mlp"),
                         (float(x) for x in os.environ.get("MUON_LR_MULT", "1,1,1").split(","))))
 NEWTON_BLOCK = 768
+# attn.v + attn.proj (V/O) ablation knobs, on top of MUON_LR_MULT; defaults are rec-46. VO_LR_MULT scales their
+# Muon lr (and PowerCool constant); VO_FLOOR_MULT scales their RowFloor target u/w.
+VO_LR_MULT = float(os.environ.get("VO_LR_MULT", 1.0))
+VO_FLOOR_MULT = float(os.environ.get("VO_FLOOR_MULT", 1.0))
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -566,16 +570,18 @@ class Muon(torch.optim.Optimizer):
         self.probe_capture, self.probe_dirs = False, {}
         self.probe_dir_names = ["momentum", "soap"] + (["newton"] if newton is not None and NEWTON_MODE != "grad" else []) + ["ns"]
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
-        if all(m == 1.0 for m in MUON_LR_MULT.values()):
+        if all(m == 1.0 for m in MUON_LR_MULT.values()) and VO_LR_MULT == 1.0 and VO_FLOOR_MULT == 1.0:
             params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
         else:
             by_type = {}
             for n, p in named_params:
                 kind = "attn_proj" if is_attn_proj_param(n) else "qkv" if is_attn_param(n) else "mlp"
-                by_type.setdefault(kind, []).append(p)
+                is_vo = is_attn_proj_param(n) or n.endswith(".attn.v.weight")
+                key = (MUON_LR_MULT[kind] * (VO_LR_MULT if is_vo else 1.0), VO_FLOOR_MULT if is_vo else 1.0)
+                by_type.setdefault(key, []).append(p)
             params = [dict(params=sorted(ps, key=lambda x: x.size(), reverse=True),
-                           lr=lr * MUON_LR_MULT[kind], lr_mult=MUON_LR_MULT[kind])
-                      for kind, ps in by_type.items()]
+                           lr=lr * lr_mult, lr_mult=lr_mult, floor_mult=floor_mult)
+                      for (lr_mult, floor_mult), ps in by_type.items()]
         super().__init__(params, defaults)
 
     def _capture(self, p, name, u):
@@ -642,7 +648,7 @@ class Muon(torch.optim.Optimizer):
                     p_fro = p.float().norm().clamp_min(1e-8)
                     u_fro = update.float().norm().clamp_min(1e-8)
                     cur_uw = u_fro / p_fro
-                    target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
+                    target_uw = (SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW) * group.get("floor_mult", 1.0)
                     if ROWFLOOR and p.ndim == 2:
                         # (B) RowFloor: boost each under-updated OUTPUT ROW to its target update/weight
                         # ratio. Per-row SHAPE change; magnitude is re-pinned below, so only the shape
@@ -847,6 +853,7 @@ print0(f"Intuition={EXPERIMENT_INTUITION}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
 print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK} muon_lr_mult={MUON_LR_MULT}")
+print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
@@ -1071,7 +1078,8 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
                     probe_loss_fn=probe_loss_fn, gns_loss_fn=gns_loss_fn, config=dict(train_steps=train_steps, newton_muon=NEWTON_MUON, newton_mode=NEWTON_MODE,
                                    newton_refresh=NEWTON_REFRESH, newton_damping=NEWTON_DAMPING,
                                    muon_lr_mult=MUON_LR_MULT, gain_beta2=GAIN_BETA2,
-                                   aux_beta1=AUX_BETA1, aux_lr_mult=AUX_LR_MULT))
+                                   aux_beta1=AUX_BETA1, aux_lr_mult=AUX_LR_MULT,
+                                   vo_lr_mult=VO_LR_MULT, vo_floor_mult=VO_FLOOR_MULT))
 for step in range(train_steps + 1):
     H.start_step()
 
