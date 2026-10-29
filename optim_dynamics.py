@@ -28,6 +28,9 @@ and measures, for every parameter tensor, then aggregates per block type
              ||dW||_F. (Its QK-product variant, Delta_2 = dWq Wk^T + Wq dWk^T, is not
              implemented here.)
 
+PathEfficiency (separate, rank 0): chord / path length of the weight trajectory per group over windows of K steps,
+||theta_{t+K} - theta_t|| / sum_j ||dtheta_{t+j}||, with a random-walk reference (see the class docstring).
+
 GradNoiseScale / GradNoiseCallback (separate, all ranks): gradient noise scale B_simple = tr(Sigma) / |G|^2 from two
 fresh micro-batches at the same weights -> gns_G2, gns_trS, gns_B per group (see the class docstring).
 B_simple is the critical-batch-size estimate: training batches well above it waste data, well below it waste steps.
@@ -475,6 +478,79 @@ class OptimDynamicsLogger:
 # ---------------------------------------------------------------------------
 # gradient noise scale
 # ---------------------------------------------------------------------------
+
+
+class PathEfficiency:
+    """Path efficiency of the weight trajectory per parameter group (rank 0, single-device parameters).
+
+    Call step(t) at the top of every iteration, i.e. with theta_t = the weights after t steps. Every `every` steps it
+    keeps a CPU snapshot, and for each window length K in `ks` it writes one record per group:
+
+      eff     = ||theta_{t} - theta_{t-K}|| / sum_{j<K} ||dtheta_{t-K+j}||   (chord / path)
+      eff_rw  = sqrt(sum_j ||dtheta_j||^2) / sum_j ||dtheta_j||   (expected eff of a random walk with the same step sizes)
+      drift   = eff / eff_rw = chord / sqrt(sum_j ||dtheta_j||^2)   (1: random walk, < 1: steps cancel, > 1: persist)
+
+    dtheta_j is the whole iteration's change, so it includes lookahead shifts and weight decay. A group's norms are those
+    of its tensors flattened into one vector. tensor_eff_median is the median of the per-tensor eff in the group.
+    """
+
+    def __init__(self, model, rules, every=50, ks=(50, 200), out_path=None):
+        assert all(k % every == 0 for k in ks)
+        self.every, self.ks, self.out_path = every, tuple(ks), out_path
+        self.params = []
+        for name, p in model.named_parameters():
+            _, typ = classify(name, p, rules)
+            if typ == "bias" and "." not in name.removesuffix(".bias"):
+                typ = "lm_head_bias"   # the vocab-sized output bias would swamp the other biases
+            self.params.append((name, p, typ))
+        self.groups = sorted({typ for _, _, typ in self.params})
+        self.gidx = torch.tensor([self.groups.index(typ) for _, _, typ in self.params])
+        self.prev = None
+        n = len(self.params)
+        self.path_t = torch.zeros(n, dtype=torch.float64)          # cumulative per-tensor path
+        self.path_g = torch.zeros(len(self.groups), dtype=torch.float64)    # cumulative per-group path
+        self.sq_g = torch.zeros(len(self.groups), dtype=torch.float64)      # cumulative per-group sum of ||d||^2
+        self.snaps = {}   # t -> (list of CPU tensors, path_t, path_g, sq_g)
+
+    @torch.no_grad()
+    def step(self, t):
+        cur = [p.detach() for _, p, _ in self.params]
+        if self.prev is not None:
+            d2 = torch.stack([(c.float() - q).square().sum() for c, q in zip(cur, self.prev)]).double().cpu()
+            self.path_t += d2.sqrt()
+            g2 = torch.zeros(len(self.groups), dtype=torch.float64).index_add_(0, self.gidx, d2)
+            self.path_g += g2.sqrt()
+            self.sq_g += g2
+            for q, c in zip(self.prev, cur):
+                q.copy_(c.float())
+        else:
+            self.prev = [c.float().clone() for c in cur]
+        if t % self.every:
+            return
+        self.snaps[t] = ([c.to("cpu", torch.float32, copy=True) for c in cur], self.path_t.clone(), self.path_g.clone(), self.sq_g.clone())
+        for old in [s for s in self.snaps if s < t - max(self.ks)]:
+            del self.snaps[old]
+        recs = []
+        for k in self.ks:
+            if t - k not in self.snaps:
+                continue
+            w0, pt0, pg0, sq0 = self.snaps[t - k]
+            c2 = torch.stack([(c.float() - w.to(c.device)).square().sum() for c, w in zip(cur, w0)]).double().cpu()
+            chord_g = torch.zeros(len(self.groups), dtype=torch.float64).index_add_(0, self.gidx, c2).sqrt()
+            path_g, rw_g = self.path_g - pg0, (self.sq_g - sq0).sqrt()
+            eff_t = c2.sqrt() / (self.path_t - pt0).clamp_min(1e-30)
+            groups = {}
+            for i, g in enumerate(self.groups):
+                path = path_g[i].item()
+                groups[g] = dict(chord=chord_g[i].item(), path=path, eff=chord_g[i].item() / max(path, 1e-30),
+                                 eff_rw=rw_g[i].item() / max(path, 1e-30),
+                                 drift=chord_g[i].item() / max(rw_g[i].item(), 1e-30),
+                                 tensor_eff_median=eff_t[self.gidx == i].median().item())
+            recs.append(dict(step=t, K=k, groups=groups))
+        if self.out_path and recs:
+            with open(self.out_path, "a") as f:
+                for r in recs:
+                    f.write(json.dumps(r) + "\n")
 
 
 class GradNoiseScale:

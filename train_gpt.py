@@ -54,6 +54,7 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
 import harness
+import optim_dynamics
 
 
 # cuDNN SDPA can fail to build an execution plan for this compiled causal-attention
@@ -126,6 +127,10 @@ VAL_EVERY = int(os.environ.get("VAL_EVERY", 125))
 # ROW_TRANSPLANT="<dirA>;<dirB>;<steps>" (eval only, no training): loads snap<k>.pt of two runs and scores row-length
 # transplants (directions of one run, row or matrix lengths of the other) on val and held-out data.
 ANATOMY = os.environ.get("ANATOMY", "0") == "1"
+# PATH_EFF=1 (diagnostics only, rank 0): path efficiency ||theta_t - theta_{t-K}|| / sum of the K per-step update norms
+# per parameter group, from a weight snapshot every 50 steps, K = 50 and 200 -> <log>.patheff.jsonl
+# (optim_dynamics.PathEfficiency).
+PATH_EFF = os.environ.get("PATH_EFF", "0") == "1"
 SNAP_STEPS = {int(x) for x in os.environ.get("SNAP_STEPS", "").split(",") if x}
 ROW_TRANSPLANT = os.environ.get("ROW_TRANSPLANT", "")
 RADIAL_OUTWARD_SCALE = 0.5
@@ -1794,9 +1799,14 @@ if ROW_TRANSPLANT:
 
 if RESUME_FROM:
     load_checkpoint(RESUME_FROM)
+path_eff = (optim_dynamics.PathEfficiency(model, harness.NANOGPT_RULES, every=50, ks=(50, 200),
+                                          out_path=logfile.replace(".txt", ".patheff.jsonl"))
+            if PATH_EFF and dist.get_rank() == 0 else None)
 if READOUT_LAB:
     lab_track(RESUME_STEP)
 for step in range(RESUME_STEP, train_steps + 1):
+    if path_eff is not None:
+        path_eff.step(step)
     H.start_step()
 
     # --------------- VALIDATION SECTION -----------------
