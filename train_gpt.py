@@ -132,6 +132,9 @@ ANATOMY = os.environ.get("ANATOMY", "0") == "1"
 # per parameter group, from a weight snapshot every 50 steps, K = 50 and 200 -> <log>.patheff.jsonl
 # (optim_dynamics.PathEfficiency).
 PATH_EFF = os.environ.get("PATH_EFF", "0") == "1"
+# TRAJ_REC=1 (diagnostics only, rank 0): every step, theta / lookahead jump / gradient of the norm gains and biases
+# (float32, optim_dynamics.TrajRecorder) -> TRAJ_DIR (default CKPT_DIR/traj), for offline river forecasting.
+TRAJ_REC = os.environ.get("TRAJ_REC", "0") == "1"
 SNAP_STEPS = {int(x) for x in os.environ.get("SNAP_STEPS", "").split(",") if x}
 ROW_TRANSPLANT = os.environ.get("ROW_TRANSPLANT", "")
 RADIAL_OUTWARD_SCALE = 0.5
@@ -1929,6 +1932,8 @@ if RESUME_FROM:
 path_eff = (optim_dynamics.PathEfficiency(model, harness.NANOGPT_RULES, every=50, ks=(50, 200),
                                           out_path=logfile.replace(".txt", ".patheff.jsonl"))
             if PATH_EFF and dist.get_rank() == 0 else None)
+traj = (optim_dynamics.TrajRecorder(model, os.environ.get("TRAJ_DIR", os.path.join(CKPT_DIR, "traj")))
+        if TRAJ_REC and dist.get_rank() == 0 else None)
 if READOUT_LAB:
     lab_track(RESUME_STEP)
 for step in range(RESUME_STEP, train_steps + 1):
@@ -1991,13 +1996,19 @@ for step in range(RESUME_STEP, train_steps + 1):
     if step in CKPT_STEPS and step != RESUME_STEP:
         save_checkpoint(step)
     if step >= STOP_STEP:
+        if traj is not None:
+            traj.finish()
         break
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
+    if traj is not None:
+        traj.before_jump()
     optimizers[0].nesterov_step()
+    if traj is not None:
+        traj.after_jump()
     newton_capture = newton is not None and newton.is_refresh_step(step)
     if newton_capture:
         newton.enable_capture()
@@ -2020,6 +2031,11 @@ for step in range(RESUME_STEP, train_steps + 1):
         anat_pre_step(step)
     # set optimization hyperparameters and take a step
     set_hparams(step)
+    if traj is not None:
+        _ena = optimizers[0]
+        traj.after_grad(step, lr_aux=optimizer3.param_groups[0]["lr"], lr_scale=_ena.get_lr_lambda(),
+                        beta=_ena.current_lookahead_stepsize, beta_g=getattr(_ena, "g_beta", 0.0) if _ena.g_active else 0.0,
+                        loss=train_loss.item() / inputs.numel())
     H.before_step()
     for opt in optimizers:
         opt.step()

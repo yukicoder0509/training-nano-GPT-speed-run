@@ -553,6 +553,62 @@ class PathEfficiency:
                     f.write(json.dumps(r) + "\n")
 
 
+class TrajRecorder:
+    """Full per-step trajectory of the small parameter groups (rank 0), for offline forecasting of the "river".
+
+    Groups: norm (RMSNorm gains), bias (Linear biases inside the blocks), lm_head_bias (the vocab-sized output bias).
+    Per training iteration t, one float32 row of all recorded parameters (flattened, manifest order) in each of
+      theta.f32  theta_t, the weights at the top of the iteration (before the lookahead jump)
+      jump.f32   the lookahead jump applied before the forward pass (weights after nesterov_step - theta_t)
+      grad.f32   the summed (all-reduced) gradient, taken at the jumped point
+    plus one theta row for the final weights (theta has one row more than jump and grad). The inner optimizer's own
+    step is u_t = theta_{t+1} - theta_t - jump_t. steps.jsonl holds per-step scalars (lr scale, jump sizes, loss);
+    manifest.json the parameter names, groups, shapes and offsets.
+    """
+
+    def __init__(self, model, out_dir):
+        import os
+        os.makedirs(out_dir, exist_ok=True)
+        self.dir, self.params, man, off = out_dir, [], [], 0
+        for name, p in model.named_parameters():
+            if name.endswith(".gains") and "norm" in name:
+                g = "norm"
+            elif name.endswith(".bias"):
+                g = "bias" if name.startswith("blocks.") else "lm_head_bias"
+            else:
+                continue
+            self.params.append(p)
+            man.append(dict(name=name, group=g, shape=list(p.shape), offset=off, numel=p.numel()))
+            off += p.numel()
+        with open(f"{out_dir}/manifest.json", "w") as f:
+            json.dump(dict(params=man, numel=off), f)
+        self.files = {k: open(f"{out_dir}/{k}.f32", "ab") for k in ("theta", "jump", "grad")}
+        self.steps = open(f"{out_dir}/steps.jsonl", "a")
+
+    def _flat(self, xs):
+        return torch.cat([x.detach().float().flatten() for x in xs]).cpu().numpy()
+
+    @torch.no_grad()
+    def before_jump(self):
+        self._theta = self._flat(self.params)
+        self.files["theta"].write(self._theta.tobytes())
+
+    @torch.no_grad()
+    def after_jump(self):
+        self.files["jump"].write((self._flat(self.params) - self._theta).tobytes())
+
+    @torch.no_grad()
+    def after_grad(self, step, **scalars):
+        self.files["grad"].write(self._flat(p.grad for p in self.params).tobytes())
+        self.steps.write(json.dumps(dict(step=step, **scalars)) + "\n")
+
+    @torch.no_grad()
+    def finish(self):
+        self.files["theta"].write(self._flat(self.params).tobytes())
+        for f in (*self.files.values(), self.steps):
+            f.close()
+
+
 class GradNoiseScale:
     """Gradient noise scale B_simple = tr(Sigma) / |G|^2 (McCandlish et al. 2018, "An Empirical Model of Large-Batch
     Training"): G = full-data gradient, Sigma = covariance of the gradient of ONE unit (token or sequence).
