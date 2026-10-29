@@ -207,6 +207,9 @@ ROW_GAIN_END = int(os.environ.get("ROW_GAIN_END", 0))   # Muon step at which the
 # ROW_GAIN_FIXED=1: the direction-only step per row without the Adam length step (row lengths move only by CWD), i.e.
 # separates "drop the radial part of the Muon update" from "learn the row lengths".
 ROW_GAIN_FIXED = os.environ.get("ROW_GAIN_FIXED", "0") == "1"
+# ROW_GAIN_NO_CWD=1: no cautious weight decay on the matrices while their row gains are active (with ROW_GAIN_FIXED=1:
+# row lengths stay exactly constant).
+ROW_GAIN_NO_CWD = os.environ.get("ROW_GAIN_NO_CWD", "0") == "1"
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -918,7 +921,7 @@ class Muon(torch.optim.Optimizer):
                     else:
                         target_radius = target_radius_after_update(p, update, group["lr"])
                     # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
-                    if CWD > 0.0 and p.ndim == 2:
+                    if CWD > 0.0 and p.ndim == 2 and not (gain and ROW_GAIN_NO_CWD):
                         # (C) Cautious Weight Decay: mask the coords where -lr*update already shrinks |p|
                         # (update*p>0); decay only those (never fight a coord the optimizer wants to grow).
                         cwd_mask = (update.float() * p.float() > 0).to(p.dtype)
@@ -943,7 +946,7 @@ class Muon(torch.optim.Optimizer):
                                 a_gain = gstep.reshape(-1).expand(p.size(0)).clone()
                     else:
                         rescale_to_radius(p, target_radius)
-                    if CWD > 0.0 and p.ndim == 2:
+                    if CWD > 0.0 and p.ndim == 2 and not (gain and ROW_GAIN_NO_CWD):
                         # apply AFTER the radius pin (POST) so the per-coord shape change is preserved.
                         p.mul_(1.0 - (group["lr"] * CWD) * cwd_mask)
                     if self.anat is not None and p.ndim == 2:
@@ -1141,7 +1144,7 @@ print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFR
 print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants={VO_VARIANTS} "
        f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR} "
        f"row_gain_scope={sorted(ROW_GAIN_SCOPE)} row_gain_mode={ROW_GAIN_MODE} "
-       f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} anatomy={ANATOMY} "
+       f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
@@ -1379,7 +1382,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):
