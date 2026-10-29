@@ -237,6 +237,12 @@ ENA_G_MIN = float(os.environ.get("ENA_G_MIN", 0.0))
 ENA_G_LS = float(os.environ.get("ENA_G_LS", 0.0))
 # ENA_G_SWITCH=t1 with ENA_G_MULT_AFTER=m2: the multiplier is ENA_G_MULT before step t1 and m2 from t1 on (not with AUTO).
 ENA_G_SWITCH = int(os.environ.get("ENA_G_SWITCH", 0))
+# ENA_G_DIR = buf (default: the shared EMA-0.99 lookahead buffer) | ema<b>, e.g. ema0.995: the group jumps along its own
+# EMA (beta b) of the per-step displacement instead (initialised from the buffer, so a fork starts warm).
+# ENA_X = "grp:mult:dir,..." extra groups with their own jump, beta = mult * global beta_t in the global window;
+# grp = bbias (Linear biases in the blocks) | lmbias (lm_head bias) | norm | embed | head | hidden, dir = buf | ema<b>.
+ENA_G_DIR = os.environ.get("ENA_G_DIR", "buf")
+ENA_X = os.environ.get("ENA_X", "")
 ENA_G_MULT_AFTER = float(os.environ.get("ENA_G_MULT_AFTER", 1.0))
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
@@ -1068,6 +1074,7 @@ class EMA_Nesterov(torch.optim.Optimizer):
         self.lookahead_status = False
         self.current_lookahead_stepsize = 0
         self.gset = set()   # parameters with their own jump (configure_group)
+        self.xspec = {}     # extra groups: param -> (mult, dir) (configure_extra)
         self.initialize_buffers()
 
     def configure_group(self, params, mult, start, end, auto, auto_max, ls, log_path=None):
@@ -1077,7 +1084,23 @@ class EMA_Nesterov(torch.optim.Optimizer):
         self.g_zm, self.g_zq, self.g_zn, self.g_pre = 0.0, 0.0, 0, {}
         self.g_ls_buf, self.g_w = {}, [0.0, 0.0, 0.0]   # S0, S1 per param; W0, W1, W2
 
+    def configure_extra(self, specs):
+        """specs: list of (params, mult, dir) -> per-param jump multiplier and direction (dir: 'buf' or 'ema<b>')."""
+        for params, mult, d in specs:
+            for p in params:
+                self.xspec[p] = (mult, d)
+
+    def _dir(self, p, d):
+        if d == "buf":
+            return self.state[p]['lookahead_buffer'][0]
+        st = self.state[p]
+        if 'dir_ema' not in st:
+            st['dir_ema'] = st['lookahead_buffer'][0].clone()
+        return st['dir_ema']
+
     def _group_dir(self, p):
+        if ENA_G_DIR != "buf":
+            return self._dir(p, ENA_G_DIR)
         if self.g_ls:
             W0, W1, W2 = self.g_w
             den = W0 * W2 - W1 * W1
@@ -1175,6 +1198,11 @@ class EMA_Nesterov(torch.optim.Optimizer):
                     continue
                 if not self.global_active:
                     continue
+                if p in self.xspec:
+                    mult_x, d = self.xspec[p]
+                    if mult_x:
+                        p.add_(self._dir(p, d), alpha=lookahead_stepsize * mult_x)
+                    continue
 
                 param_state = self.state[p]
 
@@ -1197,6 +1225,9 @@ class EMA_Nesterov(torch.optim.Optimizer):
                 buf = param_state['lookahead_buffer'][0]
 
                 param_state['lookahead_buffer'] = (buf.lerp_(look, 1 - lookahead_ema), self.it) # m^{t+1} = beta * m^t + (1-beta) * look
+                d = ENA_G_DIR if p in self.gset else self.xspec.get(p, (0, "buf"))[1]
+                if d != "buf":
+                    self._dir(p, d).lerp_(look, 1 - float(d[3:]))
 
                 # update prev_params buffer
                 param_state['prev_params'] = (param_state['prev_params'][0].copy_(p), self.it)
@@ -1287,7 +1318,7 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
-       f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN}")
+       f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN} dir={ENA_G_DIR} extra={ENA_X}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT} msm={MSM}/{MSM_GROUPS}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
@@ -1460,6 +1491,17 @@ if ENA_GROUP:
     optimizers[0].configure_group([p for n, p in model.named_parameters() if _ena_sel(n, p)], ENA_G_MULT, ENA_G_START,
                                   ENA_G_END, ENA_G_AUTO, ENA_G_MAX, ENA_G_LS,
                                   logfile.replace(".txt", ".ena.jsonl") if dist.get_rank() == 0 else None)
+if ENA_X:
+    _x_sel = dict(bbias=lambda n, p: n.startswith("blocks.") and n.endswith(".bias"), lmbias=lambda n, p: n == "proj.bias",
+                  norm=lambda n, p: "norm" in n and n.endswith("gains"), embed=lambda n, p: n == "embed.weight",
+                  head=lambda n, p: n == "proj.weight", hidden=lambda n, p: n.startswith("blocks.") and p.ndim == 2)
+    _x_specs = []
+    for _spec in ENA_X.split(","):
+        _g, _m, _d = _spec.split(":")
+        _ps = [p for n, p in model.named_parameters() if _x_sel[_g](n, p)]
+        assert not set(_ps) & optimizers[0].gset, f"ENA_X group {_g} overlaps ENA_GROUP"
+        _x_specs.append((_ps, float(_m), _d))
+    optimizers[0].configure_extra(_x_specs)
 for opt in optimizers[0].inner_optimizer:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
@@ -1536,7 +1578,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
-             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS")
+             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"

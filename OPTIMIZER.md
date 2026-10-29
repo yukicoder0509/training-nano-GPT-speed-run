@@ -33,6 +33,8 @@ The wrapper keeps a buffer b and the previous weights W_prev for every parameter
   - `ENA_G_SWITCH`=t₁, `ENA_G_MULT_AFTER`=m₂: the multiplier is `ENA_G_MULT` before step t₁ and m₂ from t₁ on.
   - `ENA_G_SIGNAL` (with `ENA_G_AUTO`=κ): `slope` (above, one batch at a time); `slope_z`: z = mean(s)/√(var(s)/50) from EMAs (0.98) of s and s², `ENA_G_MULT` ← `ENA_G_MULT`·e^(−κ·clip(z/2, −1, 1)); `update_z`: the same z-score of c_t = ⟨u_t, d⟩ with u_t the inner optimizer's own step on the group, `ENA_G_MULT` ← `ENA_G_MULT`·e^(+κ·clip(z/2, −1, 1)) (the optimizer moving on along the jump grows it, moving back shrinks it). `ENA_G_MIN` is the lower clip (default 0).
   - `ENA_G_LS`=λ: d is the exponentially weighted least-squares velocity of the group's weights (weights λ^age; S0 ← θ + λS0, S1 ← λ(S1 + S0_old), d = (W1·S0 − W0·S1)/(W0·W2 − W1²)) instead of b.
+  - `ENA_G_DIR`=ema⟨b'⟩ (default `buf` = b): d is the group's own EMA of the per-step displacement, d ← b'·d + (1−b')·(W′ − W_prev), initialised from b (so a fork starts warm).
+- **Extra jump groups (env, off by default):** `ENA_X`="grp:m:dir,…" with grp = bbias (Linear biases in the blocks) | lmbias (lm_head bias) | norm | embed | head | hidden: that group jumps W ← W + m·β_t·d in the global window, d = b (`buf`) or its own EMA (`ema⟨b'⟩`, as above); m = 0 turns its jump off.
 
 ## 2. Muon: hidden 2-D matrices (q, k, v, attn.proj, mlp.fc, mlp.proj)
 
