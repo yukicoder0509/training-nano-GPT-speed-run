@@ -538,3 +538,11 @@ Commit `97303c2`, `ROW_GAIN_NO_CWD=1` (no CWD on q,k,v,o,fc while their row gain
 - *Shrinking under CWD is worth ~15 steps on top:* G0 vs G0nc (Δ +0.00102 / +0.00098).
 - *Overall size is not it:* G0nc has the control's matrix norms and is 16 steps worse than C, whose lengths move through Muon's (damped) radial part; Gnc is 30–90 % larger than C and the best. What matters is that each row's length moves with its own gradient.
 - *CWD on the gained matrices does not help:* Gnc beats G by 0.00019 / 0.00015 (≈ 2.5 steps). Both seeds agree, but each is only ~1.5–2 fork-noise SDs of a difference (√2·0.000075), so this is a lead, not a result.
+
+### Full runs: no CWD on the gained matrices (`nocwd`, 4 seeds)
+
+Commit `bb1bc0b`, record settings + `ROW_GAIN_NO_CWD=1`, `STOP_STEP=2690`, seeds 0–3 (`nocwd-s<seed>`); compared with `cand-rg20` on the same seeds (`fork_compare.py --full nocwd --full-controls cand-rg20`).
+
+- Track 3 rule (n = 4): 0.00373 at 2660, **0.00438 at 2665** (earliest pass), 0.00721 at 2690.
+- Seed-paired vs `cand-rg20` at 2690: −0.00044, −0.00025, −0.00308, −0.00048; mean −0.00106 ± 0.00067 (SE). All 4 lower; without seed 2, −0.00039 (≈ 6 steps). At 2665: mean 3.27781 vs 3.27887.
+- The forks predicted ≈ −0.00017. The full-run difference has the same sign in every seed but its size is not resolved by 4 seeds (seed 2 alone is −0.0031).
