@@ -521,3 +521,20 @@ Track 3 rule (3.28 − mean)·√n ≥ 0.004, n = 8 (`fork_compare.py --full can
 **Reading.** Row gains help through the length dynamics, not the rotation: each row's length follows its own (anti-persistent, low-SNR) radial gradient through Adam, which lets q/k/v/o grow and spread across rows while length errors are damped faster. The gain accumulates in 1000–2000 into a different, co-adapted solution that uses long context better. Removing the radial update without a replacement (G0) shrinks the weights under CWD and costs 30 steps, so rec-46's radial part was doing real work.
 
 **Metrics changed.** Removed the per-token "control-loss decile" split (regression to the mean; identical for every variant). Transplant results are printed as absolute loss changes, with a control-vs-control pair as the baseline.
+
+### Frozen lengths without weight decay (2026-10-29)
+
+Commit `97303c2`, `ROW_GAIN_NO_CWD=1` (no CWD on q,k,v,o,fc while their row gains are active), otherwise as the anatomy forks. Steps = −Δ / 0.000067.
+
+| fork | setting | Δ val_ema@2690 vs C, s0 / s1 | ≈ steps | log(‖W‖/‖W_C‖) at 2690, q k v o fc |
+|---|---|---|---|---|
+| `anat-G` | row gains | −0.00057 / −0.00088 | +11 | +0.16 +0.31 +0.09 +0.10 −0.06 |
+| `anat-Gnc` | row gains, no CWD | −0.00076 / −0.00103 | +13 | +0.50 +0.65 +0.41 +0.43 +0.28 |
+| `anat-G0` | direction-only, CWD on | +0.00219 / +0.00201 | −31 | (−0.33 … −0.49) |
+| `anat-G0nc` | direction-only, no CWD | +0.00117 / +0.00103 | −16 | +0.02 0.00 −0.09 −0.05 −0.14 |
+
+- In G0nc the optimizer step leaves every row length unchanged (max |Δlog r| per step 2·10⁻⁷). Lengths still grow through the EMA-Nesterov lookahead until step 1950 (cumulative +0.20 in log, the same mechanism in every run), so G0nc ends with matrix norms within −14 … +2 % of C's.
+- *Learning the lengths is worth ~30 steps:* Gnc vs G0nc differ only in the Adam length step (Δ −0.00193 / −0.00206).
+- *Shrinking under CWD is worth ~15 steps on top:* G0 vs G0nc (Δ +0.00102 / +0.00098).
+- *Overall size is not it:* G0nc has the control's matrix norms and is 16 steps worse than C, whose lengths move through Muon's (damped) radial part; Gnc is 30–90 % larger than C and the best. What matters is that each row's length moves with its own gradient.
+- *CWD on the gained matrices does not help:* Gnc beats G by 0.00019 / 0.00015 (≈ 2.5 steps). Both seeds agree, but each is only ~1.5–2 fork-noise SDs of a difference (√2·0.000075), so this is a lead, not a result.
