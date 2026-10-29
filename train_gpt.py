@@ -44,6 +44,7 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import argparse
 import json
+import math
 import uuid
 import time
 from pathlib import Path
@@ -200,6 +201,22 @@ SOAP_KL = os.environ.get("SOAP_KL", "0") == "1"
 SOAP_SINK_SCOPE = os.environ.get("SOAP_SINK_SCOPE", "all")
 SOAP_KL_SCOPE = os.environ.get("SOAP_KL_SCOPE", "all")
 ENA_REST = int(os.environ.get("ENA_REST", 0))   # EMA-Nesterov lookahead end step (0 = rec-46: train_steps - 950 = 1950)
+# Per-group EMA-Nesterov jump (defaults = no change). ENA_GROUP = norm | embed | head | bias | hidden picks one parameter
+# group whose jump W <- W + beta_g * d is set separately (all other parameters keep the global jump):
+#   ENA_G_MULT     beta_g = ENA_G_MULT * (global beta_t = 0.3 * lr_t / lr_0), default 1
+#   ENA_G_START/END  the group's window, active for START < it + 1 and it < END (default: the global 300 / 1950)
+#   ENA_G_AUTO=k   self-tuning: s_t = <g_t, d> (gradient at the jumped-to point along the jump), sbar <- 0.9 sbar +
+#                  0.1 sign(s_t), ENA_G_MULT <- clip(ENA_G_MULT * exp(-k * sbar), 0, ENA_G_MAX) on every active step
+#   ENA_G_LS=lam   d = exponentially weighted least-squares velocity of the group's weights (weights lam^age; two
+#                  extra copies of the group) instead of the EMA of displacements
+# s_t, sbar, ENA_G_MULT, beta_g and |d| are logged per active step to <log>.ena.jsonl.
+ENA_GROUP = os.environ.get("ENA_GROUP", "")
+ENA_G_MULT = float(os.environ.get("ENA_G_MULT", 1.0))
+ENA_G_START = int(os.environ.get("ENA_G_START", 300))
+ENA_G_END = int(os.environ.get("ENA_G_END", 0))   # 0 = the global end
+ENA_G_AUTO = float(os.environ.get("ENA_G_AUTO", 0.0))
+ENA_G_MAX = float(os.environ.get("ENA_G_MAX", 3.0))
+ENA_G_LS = float(os.environ.get("ENA_G_LS", 0.0))
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
 # ROW_GAIN_SCOPE: comma list of matrix types it applies to (q,k,v,o,fc,proj; default all but proj). ROW_GAIN_MODE=matrix: one
@@ -1020,7 +1037,38 @@ class EMA_Nesterov(torch.optim.Optimizer):
         self.it = 0
         self.lookahead_status = False
         self.current_lookahead_stepsize = 0
+        self.gset = set()   # parameters with their own jump (configure_group)
         self.initialize_buffers()
+
+    def configure_group(self, params, mult, start, end, auto, auto_max, ls, log_path=None):
+        self.gset, self.g_mult, self.g_start, self.g_end = set(params), mult, start, end
+        self.g_auto, self.g_max, self.g_ls, self.g_log = auto, auto_max, ls, log_path
+        self.g_sbar, self.g_active, self.g_dirs = 0.0, False, {}
+        self.g_ls_buf, self.g_w = {}, [0.0, 0.0, 0.0]   # S0, S1 per param; W0, W1, W2
+
+    def _group_dir(self, p):
+        if self.g_ls:
+            W0, W1, W2 = self.g_w
+            den = W0 * W2 - W1 * W1
+            if p in self.g_ls_buf and den > 1e-9:
+                S0, S1 = self.g_ls_buf[p]
+                return (S0 * W1 - S1 * W0) / den   # slope of the weighted LS line through the past weights
+        return self.state[p]['lookahead_buffer'][0]
+
+    @torch.no_grad()
+    def slope_feedback(self, step_log):
+        """After the gradient is ready: slope along the group's jump, and the self-tuning update of its size."""
+        if not self.gset or not self.g_active:
+            return
+        s = sum((p.grad.float() * d.float()).sum() for p, d in self.g_dirs.items()).item()
+        dn = sum(d.float().square().sum() for d in self.g_dirs.values()).item() ** 0.5
+        self.g_sbar = 0.9 * self.g_sbar + 0.1 * (1.0 if s > 0 else -1.0 if s < 0 else 0.0)
+        if self.g_auto:
+            self.g_mult = min(max(self.g_mult * math.exp(-self.g_auto * self.g_sbar), 0.0), self.g_max)
+        if self.g_log:
+            with open(self.g_log, "a") as f:
+                f.write(json.dumps(dict(it=step_log, s=s, sbar=self.g_sbar, mult=self.g_mult,
+                                        beta=self.g_beta, dnorm=dn)) + "\n")
 
     def __setstate__(self, state):
         super(EMA_Nesterov, self).__setstate__(state)
@@ -1050,10 +1098,19 @@ class EMA_Nesterov(torch.optim.Optimizer):
             lookahead_stepsize = self.lookahead_stepsize * self.get_lr_lambda()
         else:
             lookahead_stepsize = self.lookahead_stepsize
-        self.current_lookahead_stepsize = lookahead_stepsize
+        self.current_lookahead_stepsize = lookahead_stepsize if self.global_active else 0
+        self.g_beta, self.g_dirs = lookahead_stepsize * getattr(self, "g_mult", 1.0), {}
 
         for group in self.param_groups:
             for p in group['params']:
+                if p in self.gset:
+                    if self.g_active:
+                        d = self._group_dir(p)
+                        self.g_dirs[p] = d
+                        p.add_(d, alpha=self.g_beta)
+                    continue
+                if not self.global_active:
+                    continue
 
                 param_state = self.state[p]
 
@@ -1080,13 +1137,26 @@ class EMA_Nesterov(torch.optim.Optimizer):
                 # update prev_params buffer
                 param_state['prev_params'] = (param_state['prev_params'][0].copy_(p), self.it)
 
+                if self.gset and self.g_ls and p in self.gset:
+                    # S0 <- theta + lam S0, S1 <- lam (S1 + S0_old): sums over ages a of lam^a theta_{t-a} and a lam^a theta
+                    S0, S1 = self.g_ls_buf.get(p) or (torch.zeros_like(p, dtype=torch.float32), torch.zeros_like(p, dtype=torch.float32))
+                    S1.add_(S0).mul_(self.g_ls)
+                    S0.mul_(self.g_ls).add_(p.float())
+                    self.g_ls_buf[p] = (S0, S1)
+        if self.gset and self.g_ls:
+            lam, (W0, W1, W2) = self.g_ls, self.g_w
+            self.g_w = [1.0 + lam * W0, lam * (W1 + W0), lam * (W2 + 2 * W1 + W0)]
+
 
     @torch.no_grad()
     def nesterov_step(self):
-        if self.it + 1 > self.prefill_steps and self.it < self.rest_steps and not self.lookahead_status:
+        self.global_active = self.it + 1 > self.prefill_steps and self.it < self.rest_steps
+        self.g_active = bool(self.gset) and self.it + 1 > self.g_start and self.it < (self.g_end or self.rest_steps)
+        if (self.global_active or self.g_active) and not self.lookahead_status:
             self.lookahead_step()
         else:
             self.current_lookahead_stepsize = 0
+            self.g_active = False
         self.lookahead_status = True
 
     @torch.no_grad()
@@ -1150,7 +1220,8 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR} "
        f"row_gain_scope={sorted(ROW_GAIN_SCOPE)} row_gain_mode={ROW_GAIN_MODE} "
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
-       f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST}")
+       f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
+       f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
@@ -1316,6 +1387,13 @@ optimizers = [EMA_Nesterov(
     )]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
+if ENA_GROUP:
+    _ena_sel = dict(norm=lambda n, p: "norm" in n and n.endswith("gains"), embed=lambda n, p: n == "embed.weight",
+                    head=lambda n, p: n == "proj.weight", bias=lambda n, p: n.endswith(".bias"),
+                    hidden=lambda n, p: n.startswith("blocks.") and p.ndim == 2)[ENA_GROUP]
+    optimizers[0].configure_group([p for n, p in model.named_parameters() if _ena_sel(n, p)], ENA_G_MULT, ENA_G_START,
+                                  ENA_G_END, ENA_G_AUTO, ENA_G_MAX, ENA_G_LS,
+                                  logfile.replace(".txt", ".ena.jsonl") if dist.get_rank() == 0 else None)
 for opt in optimizers[0].inner_optimizer:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
@@ -1387,7 +1465,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):
@@ -1888,6 +1966,7 @@ for step in range(RESUME_STEP, train_steps + 1):
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
     track_radial()
+    optimizers[0].slope_feedback(step)
     if ANATOMY:
         anat_pre_step(step)
     # set optimization hyperparameters and take a step
