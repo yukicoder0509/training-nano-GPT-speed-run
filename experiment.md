@@ -648,3 +648,47 @@ Commit `10ef1aa`; forks from step 50 of `ckpt-best`, seeds 0–2, `ENA_GROUP=nor
 **Leaderboard submission** (user-authorized 2026-10-29): seed 0 (fixed in advance), `STOP_STEP=2640`, commit `e893e4d` (defaults), `OPTIM_DYNAMICS=0`, W&B `cerulean-labs/midterm-nanogpt` run `normjump25-2640-s0` ([2x69kegk](https://flock.cerulean.works/cerulean-labs/midterm-nanogpt/runs/2x69kegk)), Slurm 638170. Summary: `total_train_steps` 2640, `val_loss` (val_ema) 3.27866, raw val 3.28571, peak memory 34.8 GiB, no dynamics keys.
 
 **2.5× fork and path-efficiency runs** (commit `f85c3d0`): `ena-x25` (forks from step 50, seeds 0–2) −0.00099 ± 0.00017 (+17 steps), the best jump size. `patheff-rec2640-s0` (2640-record settings, `PATH_EFF=1`, to 2700): only the norm gains change against rec-46 (eff200/eff50 1.02 / 0.94 / 0.94 in 500–1000 / 1000–1500 / 1500–2000 vs 0.95 / 0.77 / 0.54). Write-up with all tables: `NORM_JUMP.md`.
+
+### Offline river forecasting on recorded trajectories (norm gains, biases)
+
+**Recording.** `TRAJ_REC=1` (commit `b01f9ce`, `optim_dynamics.TrajRecorder`): every step, float32, θ_t (before the jump), the jump, and the gradient of the norm gains (19 968), block biases (82 944) and lm_head bias (50 304) → `CKPT_DIR/traj` (4.9 GB per run). Runs (full, to 2690, `CKPT_STEPS=50,1000`, also the fork parents below): `traj-rec` seeds 0–2 (2640-record settings; val_ema@2690 3.27692 / 3.27691 / 3.27557) and `traj-x1-s0` (norm jump 1×, 3.27750).
+
+**Scoring** (`river_fit.py`, every 20 steps, only past data): forecast of the inner optimizer's displacement over the next H steps, U_t(H) = Σ u (u = Δθ − jump); median cos(forecast, U) per phase, R²* = fraction explained with the best scale per phase. Mean of the 3 `traj-rec` seeds, H = 50 (H = 200 in brackets):
+
+| group, phase | ema0.99 (the jump) | best single estimator |
+|---|---|---|
+| norm 300–1000 | 0.35 (0.61) | ls200 0.40 (0.61) |
+| norm 1000–1500 | 0.37 (0.78) | exp100 / ls200 / ls400 0.43–0.44 (0.82) |
+| norm 1500–1950 | 0.25 (0.69) | ls400 / exp100 0.35 (0.77) |
+| block biases 1000–1500 | 0.00 (0.49) | ls400 / exp 0.31 (0.72) |
+| block biases 1500–1950 | −0.19 (0.17) | exp300 0.21 (0.57) |
+| lm_head bias 1000–1500 | −0.29 (−0.02) | exp300 0.17 (0.50) |
+
+- Longer memory (LS over 200–400 steps, EMA 0.995–0.999, exponential-saturation fit) forecasts better than EMA 0.99 after step 1000, most for the biases; for the lm_head bias the EMA-0.99 jump direction is anti-predictive (the inner optimizer undoes it).
+- Fast + slow mixes (AdEMAMix-style ema0.9 + ema0.999, equal-weight mix) and the slow-Adam gradient direction are worse than the slow EMA alone; −Adam(0.99, 0.999) is anti-predictive after 1000.
+- Learned linear combinations of EMAs (fit-ema / fit-all, fitted online on past targets) win only at H = 10 (cos 0.3–0.47 vs ≤ 0.15) by predicting the short-term reversal of recent steps (mean reversion), not a drift.
+
+**Fork tests of the better directions** (commit `9e604aa`, `ENA_G_DIR` / `ENA_X`; forks from step 1000 of `traj-rec`, seeds 0–2, control `rec-ctrl` k1000, noise SD 0.000041; `python fork_compare.py <v> --parent traj-rec --control rec-ctrl --ks 1000`):
+
+| Variant | Δ val_ema@2690 | Steps |
+|---|---|---|
+| `lmb0` lm_head-bias jump off | +0.00010 ± 0.00006 | −1.7 |
+| `lmb999` lm_head bias along its EMA 0.999 | +0.00003 ± 0.00002 | −0.5 |
+| `bb999` block biases along their EMA 0.999 | −0.00006 ± 0.00007 | +1.1 |
+| `nd995` norm gains along their EMA 0.995 (2.5×) | +0.00012 ± 0.00001 | −2.1 |
+| `nd999` norm gains along their EMA 0.999 (2.5×) | −0.00001 ± 0.00004 | +0.2 |
+| `long` nd995 + bb999 + lmb999 | −0.00004 ± 0.00007 | +0.6 |
+
+Better forecasts after step 1000 do not turn into steps: every variant is within ±2 steps. The jump on these small groups matters before 1000 (NORM_JUMP.md), where EMA 0.99 is already close to the best forecaster.
+
+**Multi-scale momentum on the 1-D Adam** (commit `38dc818`, `MSM`; forks from step 50 of `traj-rec`, control `rec-ctrl` k50, noise SD 0.00058):
+
+| Variant | Δ val_ema@2690 | Steps |
+|---|---|---|
+| `msm-g1` gains, α 1, β₃ 0.99 | +0.00022 ± 0.00029 | −3.8 |
+| `msm-g2` gains, α 2, β₃ 0.999 | +0.00100 ± 0.00009 | −17.0 |
+| `msm-all2` all 1-D groups, α 2, β₃ 0.999 | +0.00098 ± 0.00029 | −16.6 |
+
+Reject: a slow gradient EMA in the 1-D Adam hurts, matching the offline result that the slow gradient direction is anti-predictive after 1000.
+
+**Frontier check.** Extra-Merge (arXiv 2605.26484: PCA of recent averaged checkpoints, extrapolate along PC1) is a readout extrapolation, which the readout lab already rejected here (every extrapolation lost to Tail-EMA). Leap+Verify (arXiv 2602.19580: finite-difference weight prediction verified on held-out loss) uses the same linear/quadratic predictors scored above. SODA (Pethick et al., arXiv 2605.11172: uniform averaging anchored at the initialization, pull (x − x₀)/(k+2) in place of weight decay) is the one untested family; it replaces the outer wrapper (EMA-Nesterov) rather than its direction.

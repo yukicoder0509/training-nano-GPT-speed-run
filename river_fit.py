@@ -50,12 +50,16 @@ EMAS = (0.5, 0.9, 0.97, 0.99, 0.995, 0.999)
 def load(d):
     man = json.load(open(os.path.join(d, "manifest.json")))
     D = man["numel"]
-    jump = np.fromfile(os.path.join(d, "jump.f32"), dtype=np.float32).reshape(-1, D)
-    grad = np.fromfile(os.path.join(d, "grad.f32"), dtype=np.float32).reshape(-1, D)
-    theta = np.fromfile(os.path.join(d, "theta.f32"), dtype=np.float32).reshape(-1, D)
+    mm = lambda k: np.memmap(os.path.join(d, f"{k}.f32"), dtype=np.float32, mode="r").reshape(-1, D)
+    jump, grad, theta = mm("jump"), mm("grad"), mm("theta")
     steps = [json.loads(l) for l in open(os.path.join(d, "steps.jsonl"))]
     N = min(len(jump), len(grad), len(steps), len(theta) - 1)
     return man, theta[:N + 1], jump[:N], grad[:N], steps[:N]
+
+
+def cols(mm, idx, chunk=256):
+    """mm[:, idx] read in row chunks (the groups are interleaved in the rows)."""
+    return np.concatenate([np.asarray(mm[i:i + chunk])[:, idx] for i in range(0, len(mm), chunk)])
 
 
 def group_idx(man, g):
@@ -186,7 +190,7 @@ def main():
     ap.add_argument("traj")
     ap.add_argument("--groups", default="norm,bias")
     ap.add_argument("--H", default="10,50,200")
-    ap.add_argument("--every", type=int, default=10)
+    ap.add_argument("--every", type=int, default=20)
     ap.add_argument("--target", default="inner", choices=("inner", "total"))
     ap.add_argument("--json", default="")
     args = ap.parse_args()
@@ -202,18 +206,24 @@ def main():
     results = {}
     for gname in args.groups.split(","):
         idx = group_idx(man, gname)
-        th = theta[:, idx].astype(np.float64)
+        th, jp, g = (cols(x, idx) for x in (theta, jump, grad))
         De = np.diff(th, axis=0)
-        u = De - jump[:, idx]
-        g = grad[:, idx].astype(np.float64)
-        Cu = np.concatenate([np.zeros((1, len(idx))), np.cumsum(u, 0)])
+        u = De - jp
+        del jp
+        Cu = np.concatenate([np.zeros((1, len(idx))), np.cumsum(u, 0, dtype=np.float64)])
+        tgts = {}
+        for H in Hs:
+            tg = np.zeros((len(evals), len(idx)), np.float32)
+            for i, t in enumerate(evals):
+                if t + H <= N:
+                    tg[i] = (Cu[t + H] - Cu[t]) if args.target == "inner" else (th[t + H] - th[t])
+            tgts[H] = tg
+        del Cu
         est = estimators(th, De, u, g, s, evals, Hs)
+        del De, u, g
         for H in Hs:
             ev_ok = [i for i, t in enumerate(evals) if t + H <= N]
-            tgt = np.zeros((len(evals), len(idx)), np.float32)
-            for i in ev_ok:
-                t = evals[i]
-                tgt[i] = (Cu[t + H] - Cu[t]) if args.target == "inner" else (th[t + H] - th[t])
+            tgt = tgts[H]
             names_ema = [f"ema{b}" for b in EMAS]
             est.setdefault("fit-ema", {})[H] = fit_online([est[n][H] for n in names_ema], tgt, evals, H)
             names_all = names_ema + [n for n in ("ls100", "ls200", "quad200", "holt", "pca200", "-gema", "-adam")
