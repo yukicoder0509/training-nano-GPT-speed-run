@@ -116,6 +116,18 @@ LAB_EMAS = [tuple(int(v) for v in x.split(":")) for x in
 LAB_RRE_K, LAB_RRE_EVERY = 4, 5   # RRE (#34) from the iterates at STOP_STEP - k*every, ..., STOP_STEP
 # Dense validation near the end, "lo:hi:stride" (inclusive), to score a run at the earliest step that passes.
 DENSE_VAL = os.environ.get("DENSE_VAL", "2650:2690:5")
+VAL_EVERY = int(os.environ.get("VAL_EVERY", 125))
+# Anatomy dump (diagnostics only, training is unchanged). ANATOMY=1 records, for every output row of every hidden
+# matrix and every step from the start/fork step: the radial gradient, log row norm before and after the optimizer
+# step, the angle the row turns in the step (rank 0), and the Muon u/w after RowFloor, the RowFloor flag and the
+# row-gain length step (owning rank); at validation steps the residual budget and fc unit statistics on 16 val
+# sequences; at STOP_STEP the per-token val loss (raw and Tail-EMA). Written to CKPT_DIR/anatomy/.
+# SNAP_STEPS="1500,2000,2690" saves the weights (+ Tail-EMA) after those steps to CKPT_DIR/snap<k>.pt.
+# ROW_TRANSPLANT="<dirA>;<dirB>;<steps>" (eval only, no training): loads snap<k>.pt of two runs and scores row-length
+# transplants (directions of one run, row or matrix lengths of the other) on val and held-out data.
+ANATOMY = os.environ.get("ANATOMY", "0") == "1"
+SNAP_STEPS = {int(x) for x in os.environ.get("SNAP_STEPS", "").split(",") if x}
+ROW_TRANSPLANT = os.environ.get("ROW_TRANSPLANT", "")
 RADIAL_OUTWARD_SCALE = 0.5
 RADIAL_INWARD_SCALE = 1.0
 HEAD_DIM = 128
@@ -191,6 +203,10 @@ ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
 ROW_GAIN_SCOPE = set(os.environ.get("ROW_GAIN_SCOPE", "q,k,v,o,fc").split(","))
 ROW_GAIN_MODE = os.environ.get("ROW_GAIN_MODE", "row")
 ROW_GAIN_START = int(os.environ.get("ROW_GAIN_START", 1000))   # Muon step at which the row gains switch on
+ROW_GAIN_END = int(os.environ.get("ROW_GAIN_END", 0))   # Muon step at which they switch off again (0 = never)
+# ROW_GAIN_FIXED=1: the direction-only step per row without the Adam length step (row lengths move only by CWD), i.e.
+# separates "drop the radial part of the Muon update" from "learn the row lengths".
+ROW_GAIN_FIXED = os.environ.get("ROW_GAIN_FIXED", "0") == "1"
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -766,8 +782,9 @@ class Muon(torch.optim.Optimizer):
         self.head_mask = None
         _kind = lambda n: {"attn.q": "q", "attn.k": "k", "attn.v": "v", "attn.proj": "o", "mlp.fc": "fc",
                            "mlp.proj": "proj"}.get(n.split(".", 1)[1].rsplit(".", 1)[0])
-        self.row_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_SCOPE} if ROW_GAIN_LR > 0 else set()
+        self.row_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_SCOPE} if ROW_GAIN_LR > 0 or ROW_GAIN_FIXED else set()
         self.step_count = 0
+        self.anat = {} if ANATOMY else None   # param -> list of (3, rows) fp16: u/w, RowFloor flag, row-gain step
         # Probe diagnostics (harness.ProbeQuadratic): on probe steps the harness sets probe_capture and this optimizer
         # records, per param it owns, the candidate update directions below (descent convention, W -= lr*u).
         # A new direction idea ("variant") is screened by adding its name here and a self._capture call.
@@ -883,7 +900,12 @@ class Muon(torch.optim.Optimizer):
                     else:
                         scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
                         update = update * scale.to(update.dtype)
-                    gain = p in self.row_gain_params and self.step_count >= ROW_GAIN_START
+                    if self.anat is not None and p.ndim == 2:
+                        a_uw = update.float().norm(dim=1) / p.float().norm(dim=1).clamp_min(1e-8)
+                        a_floor = (f_row.squeeze(1) > 1).float() if ROWFLOOR else torch.zeros_like(a_uw)
+                        a_gain = torch.zeros_like(a_uw)
+                    gain = (p in self.row_gain_params and self.step_count >= ROW_GAIN_START
+                            and (ROW_GAIN_END == 0 or self.step_count < ROW_GAIN_END))
                     row_ctl = (ROW_PIN or gain) and p.ndim == 2
                     if row_ctl:
                         p_before = p.float()
@@ -905,7 +927,7 @@ class Muon(torch.optim.Optimizer):
                         cur = (p.float().norm().reshape(1, 1) if gain and ROW_GAIN_MODE == "matrix"
                                else p.float().norm(dim=1, keepdim=True))
                         p.mul_((target_rows / cur.clamp_min(1e-8)).to(p.dtype))
-                        if gain:
+                        if gain and not ROW_GAIN_FIXED:
                             g_row = ((grad.float() * p_before).sum().reshape(1, 1) if ROW_GAIN_MODE == "matrix"
                                      else (grad.float() * p_before).sum(dim=1, keepdim=True)) / r_rows
                             if "row_m" not in state:
@@ -915,12 +937,17 @@ class Muon(torch.optim.Optimizer):
                             state["row_v"].lerp_(g_row.square(), 0.05)
                             adam = (state["row_m"] / (1 - 0.9 ** state["row_t"])) / (
                                 (state["row_v"] / (1 - 0.95 ** state["row_t"])).sqrt() + 1e-12)
-                            p.mul_((1 - ROW_GAIN_LR * group["lr"] / group["initial_lr"] * adam).to(p.dtype))
+                            gstep = ROW_GAIN_LR * group["lr"] / group["initial_lr"] * adam
+                            p.mul_((1 - gstep).to(p.dtype))
+                            if self.anat is not None:
+                                a_gain = gstep.reshape(-1).expand(p.size(0)).clone()
                     else:
                         rescale_to_radius(p, target_radius)
                     if CWD > 0.0 and p.ndim == 2:
                         # apply AFTER the radius pin (POST) so the per-coord shape change is preserved.
                         p.mul_(1.0 - (group["lr"] * CWD) * cwd_mask)
+                    if self.anat is not None and p.ndim == 2:
+                        self.anat.setdefault(p, []).append(torch.stack([a_uw, a_floor, a_gain]).half())
                     if use_soap:
                         if VO_HEAD and p in self.vo_params:
                             if self.head_mask is None:
@@ -1114,6 +1141,7 @@ print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFR
 print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants={VO_VARIANTS} "
        f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR} "
        f"row_gain_scope={sorted(ROW_GAIN_SCOPE)} row_gain_mode={ROW_GAIN_MODE} "
+       f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} anatomy={ANATOMY} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
@@ -1173,7 +1201,7 @@ train_steps = FINAL_TRAIN_STEPS
 # so evals at steps <= STOP_STEP are IDENTICAL to the full run). Target boundary ~2775 only needs evals
 # up to ~2800-2850, so STOP_STEP=2850 saves the unused 2850-2900 tail. Default = full run.
 STOP_STEP = int(os.environ.get("STOP_STEP", FINAL_TRAIN_STEPS))   # default: full schedule; set env to early-stop
-val_regular_interval = 125
+val_regular_interval = VAL_EVERY
 _dv = [int(x) for x in DENSE_VAL.split(":")] if DENSE_VAL else None
 extra_val_steps = set(range(_dv[0], _dv[1] + 1, _dv[2])) if _dv else set()
 extra_val_steps |= {2700, 2705, 2710, 2715, 2720, 2725, 2730, 2735, 2740, 2745, 2750, 2755, 2760, 2765, 2770, 2775, 2780, 2785, 2790, 2795, 2800, 2805, 2810, 2820, 2830, 2840, 2850, 2860, 2870, 2880, 2890, 2895, 2900, 2910, 2920, 2930, 2940, 2950, 2960, 2965, 2970, 2975, 2980, 2985, 2990, 2995, 2999, 3000, 3010, 3020}
@@ -1351,7 +1379,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("ROW_GAIN_START", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):
@@ -1576,6 +1604,191 @@ def log_rowstats(step):
     with open(logfile.replace(".txt", ".rowstat.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
 
+# ---- Anatomy dump (ANATOMY=1), snapshots (SNAP_STEPS), row-length transplants (ROW_TRANSPLANT) ----
+_hidden = [(n, p) for n, p in model.blocks.named_parameters() if p.ndim == 2]
+_anat = dict(steps=[], lr=[], gamma=[], logr_pre=[], logr_post=[], theta=[], func={})
+_anat_pre = None
+ANAT_DIR = Path(CKPT_DIR) / "anatomy"
+
+@torch.no_grad()
+def anat_pre_step(step):
+    """Rank 0, after the gradient all-reduce: radial gradient and row directions at the point the gradient is taken."""
+    global _anat_pre
+    if dist.get_rank() != 0:
+        return
+    gam, logr, dirs = [], [], []
+    for n, p in _hidden:
+        w = p.float()
+        r = w.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        gam.append(((p.grad.float() * w).sum(dim=1, keepdim=True) / r).squeeze(1))
+        logr.append(r.log().squeeze(1))
+        dirs.append(w / r)
+    _anat["steps"].append(step)
+    _anat["gamma"].append(torch.cat(gam).half())
+    _anat["logr_pre"].append(torch.cat(logr))
+    _anat_pre = dirs
+
+@torch.no_grad()
+def anat_post_step():
+    """Rank 0, after the optimizer step: log row norm and the angle each row turned in the step (atan2, stable)."""
+    if dist.get_rank() != 0:
+        return
+    logr, theta = [], []
+    for (n, p), d in zip(_hidden, _anat_pre):
+        w = p.float()
+        along = (w * d).sum(dim=1, keepdim=True)
+        perp = (w - along * d).norm(dim=1)
+        theta.append(torch.atan2(perp, along.squeeze(1)))
+        logr.append(w.norm(dim=1).clamp_min(1e-8).log())
+    _anat["logr_post"].append(torch.cat(logr))
+    _anat["theta"].append(torch.cat(theta).half())
+    _anat["lr"].append(optimizer2.param_groups[0]["lr"])
+
+@torch.no_grad()
+def manual_forward(inputs, stats=None):
+    """Eager forward (same math as GPT.forward) returning soft-capped logits; optionally collects per-block stats."""
+    rms = lambda t: t.float().square().mean().sqrt().item()
+    x = model.norm1(model.embed(inputs))
+    for l, block in enumerate(model.blocks):
+        a = block.attn(block.norm1(x))
+        if stats is not None:
+            stats.setdefault("rms_x_attn", []).append(rms(x))
+            stats.setdefault("rms_attn", []).append(rms(a))
+        x = x + a
+        h = block.mlp.fc(block.norm2(x))
+        act = h.relu().square()
+        m = block.mlp.proj(act)
+        if stats is not None:
+            stats.setdefault("rms_x_mlp", []).append(rms(x))
+            stats.setdefault("rms_mlp", []).append(rms(m))
+            hf = h.float().flatten(0, -2)
+            stats.setdefault("fc_fire", []).append((hf > 0).float().mean(0).half().cpu())
+            stats.setdefault("fc_act", []).append(act.float().flatten(0, -2).mean(0).cpu())
+        x = x + m
+    logits = model.proj(model.norm2(x)).float()
+    return 15 * logits * (logits.square() + 15**2).rsqrt()
+
+@torch.no_grad()
+def anat_func_stats(step):
+    """Rank 0, at validation steps: residual budget per block and fc unit firing/activation on 16 val sequences."""
+    if dist.get_rank() != 0:
+        return
+    stats = {}
+    manual_forward(val_inputs[:16], stats)
+    _anat["func"][step] = {k: (torch.stack(v) if torch.is_tensor(v[0]) else torch.tensor(v)) for k, v in stats.items()}
+
+def _blend_tailema():
+    """Swap in the Tail-EMA blend; returns the stash to restore."""
+    stash = [p.detach().clone() for p in model.parameters()]
+    for j, p in enumerate(model.parameters()):
+        if _tailema is not None and _tailema[j] is not None:
+            p.copy_(((1.0 - TAILEMA_LAMBDA) * p.float() + TAILEMA_LAMBDA * _tailema[j]).to(p.dtype))
+    return stash
+
+@torch.no_grad()
+def anat_token_loss(step):
+    """Every rank: per-token val loss of its val shard, raw weights and the Tail-EMA blend."""
+    model.eval()
+    out = dict(targets=val_targets.to(torch.int32).cpu())
+    for name in ("raw", "tailema"):
+        stash = _blend_tailema() if name == "tailema" else None
+        losses = []
+        for i in range(0, len(val_inputs), 8):
+            logits = manual_forward(val_inputs[i:i + 8])
+            losses.append(F.cross_entropy(logits.flatten(0, 1), val_targets[i:i + 8].flatten(), reduction="none")
+                          .view(-1, val_targets.size(1)).cpu())
+        out[name] = torch.cat(losses)
+        if stash is not None:
+            for p, s in zip(model.parameters(), stash):
+                p.copy_(s)
+        tot = out[name].double().sum().to(device)
+        dist.all_reduce(tot, op=dist.ReduceOp.SUM)
+        print0(f"anatomy token loss step:{step} {name}:{(tot / val_tokens).item():.5f}", console=True)
+    ANAT_DIR.mkdir(parents=True, exist_ok=True)
+    torch.save(out, ANAT_DIR / f"tokloss_rank{dist.get_rank()}.pt")
+    model.train()
+
+def anat_finish():
+    ANAT_DIR.mkdir(parents=True, exist_ok=True)
+    torch.save({pname[p]: torch.stack(v).cpu() for p, v in optimizer2.anat.items()},
+               ANAT_DIR / f"muon_rank{dist.get_rank()}.pt")
+    if dist.get_rank() == 0:
+        rows = [(n, p.size(0)) for n, p in _hidden]
+        torch.save(dict(rows=rows, steps=_anat["steps"], lr=_anat["lr"], func=_anat["func"],
+                        **{k: torch.stack(_anat[k]).cpu() for k in ("gamma", "logr_pre", "logr_post", "theta")}),
+                   ANAT_DIR / "rows.pt")
+    dist.barrier()
+    print0(f"anatomy dump -> {ANAT_DIR}", console=True)
+
+def save_snapshot(step):
+    if dist.get_rank() == 0:
+        names = [n for n, _ in model.named_parameters()]
+        tail = None if _tailema is None else {n: e.cpu() for n, e in zip(names, _tailema) if e is not None}
+        Path(CKPT_DIR).mkdir(parents=True, exist_ok=True)
+        torch.save(dict(step=step, params={n: p.detach().cpu() for n, p in model.named_parameters()}, tailema=tail),
+                   Path(CKPT_DIR) / f"snap{step}.pt")
+    dist.barrier()
+    print0(f"snapshot step:{step} -> {CKPT_DIR}/snap{step}.pt", console=True)
+
+_kind_of = lambda n: {"attn.q": "q", "attn.k": "k", "attn.v": "v", "attn.proj": "o", "mlp.fc": "fc",
+                      "mlp.proj": "proj"}.get(n.split(".", 1)[1].rsplit(".", 1)[0]) if n.startswith("blocks.") and n.endswith(".weight") else None
+
+@torch.no_grad()
+def run_transplant():
+    """Directions of run D with the row (or whole-matrix) lengths of run L, for the hidden matrices of the given types;
+    every other parameter from D. Scored on val and held-out data; also the per-type mean row cosine of D vs L."""
+    dir_a, dir_b, steps = ROW_TRANSPLANT.split(";")
+    ho = next(distributed_data_generator(str(_train_files[-1].relative_to(Path.cwd())), val_tokens, skip=5))
+    params = dict(model.named_parameters())
+    scopes = {"qkvofc": {"q", "k", "v", "o", "fc"}, "all": {"q", "k", "v", "o", "fc", "proj"}, "v": {"v"}, "o": {"o"},
+              "fc": {"fc"}, "qk": {"q", "k"}, "proj": {"proj"}}
+    results, cosines = [], []
+    for k in [int(x) for x in steps.split(",")]:
+        snaps = {"A": torch.load(f"{dir_a}/snap{k}.pt", weights_only=False),
+                 "B": torch.load(f"{dir_b}/snap{k}.pt", weights_only=False)}
+        readouts = ["raw"] + (["tailema"] if snaps["A"]["tailema"] and snaps["B"]["tailema"] else [])
+        for ro in readouts:
+            W = {}
+            for r, sn in snaps.items():
+                W[r] = {n: (t.float() if ro == "raw" or n not in sn["tailema"]
+                            else (1 - TAILEMA_LAMBDA) * t.float() + TAILEMA_LAMBDA * sn["tailema"][n].float())
+                        for n, t in sn["params"].items()}
+            for n in W["A"]:
+                if _kind_of(n):
+                    a, b = W["A"][n], W["B"][n]
+                    cos = ((a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1)).clamp_min(1e-12))
+                    cosines.append(dict(step=k, readout=ro, param=n, kind=_kind_of(n), cos_mean=cos.mean().item(),
+                                        cos_min=cos.min().item(),
+                                        dlogr_sd=(b.norm(dim=1).log() - a.norm(dim=1).log()).std().item()))
+
+            def score(label, ws):
+                for n, p in params.items():
+                    p.copy_(ws[n].to(device=device, dtype=p.dtype))
+                v, h = lab_eval(val_inputs, val_targets), lab_eval(*ho)
+                results.append(dict(step=k, readout=ro, **label, val=v, heldout=h))
+                print0(f"transplant step:{k} {ro} {label} val:{v:.5f} heldout:{h:.5f}", console=True)
+
+            score(dict(D="A", L="A", scope="-", mode="-"), W["A"])
+            score(dict(D="B", L="B", scope="-", mode="-"), W["B"])
+            for d, l in (("A", "B"), ("B", "A")):
+                for sc, kinds in scopes.items():
+                    for mode in ("row", "matrix"):
+                        ws = dict(W[d])
+                        for n in ws:
+                            if _kind_of(n) in kinds:
+                                x, y = W[d][n], W[l][n]
+                                ws[n] = (x * (y.norm(dim=1, keepdim=True) / x.norm(dim=1, keepdim=True).clamp_min(1e-12))
+                                         if mode == "row" else x * (y.norm() / x.norm().clamp_min(1e-12)))
+                        score(dict(D=d, L=l, scope=sc, mode=mode), ws)
+    if dist.get_rank() == 0:
+        with open(logfile.replace(".txt", ".transplant.json"), "w") as f:
+            json.dump(dict(A=dir_a, B=dir_b, results=results, cosines=cosines), f)
+
+if ROW_TRANSPLANT:
+    run_transplant()
+    dist.destroy_process_group()
+    sys.exit(0)
+
 if RESUME_FROM:
     load_checkpoint(RESUME_FROM)
 if READOUT_LAB:
@@ -1622,6 +1835,8 @@ for step in range(RESUME_STEP, train_steps + 1):
                + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
         H.log_val(step, val_ema_loss, val_raw_loss=val_loss)
         log_rowstats(step)
+        if ANATOMY:
+            anat_func_stats(step)
         model.train()
         # start the clock again
         dist.barrier()
@@ -1629,6 +1844,10 @@ for step in range(RESUME_STEP, train_steps + 1):
 
     if READOUT_LAB and step == STOP_STEP:
         run_readout_lab(step)
+    if ANATOMY and step == STOP_STEP:
+        anat_token_loss(step)
+    if step in SNAP_STEPS:
+        save_snapshot(step)
     if step in CKPT_STEPS and step != RESUME_STEP:
         save_checkpoint(step)
     if step >= STOP_STEP:
@@ -1656,11 +1875,15 @@ for step in range(RESUME_STEP, train_steps + 1):
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
     track_radial()
+    if ANATOMY:
+        anat_pre_step(step)
     # set optimization hyperparameters and take a step
     set_hparams(step)
     H.before_step()
     for opt in optimizers:
         opt.step()
+    if ANATOMY:
+        anat_post_step()
     H.after_step(step, train_loss / inputs.numel())
     model.zero_grad(set_to_none=True)
     # (A) Tail-EMA buffer maintenance over the cooldown tail: ema += (w - ema)/TAU (exclude the
@@ -1680,5 +1903,7 @@ for step in range(RESUME_STEP, train_steps + 1):
         print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
                + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
+if ANATOMY:
+    anat_finish()
 H.finish()
 dist.destroy_process_group()
