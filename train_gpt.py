@@ -1088,6 +1088,8 @@ class EMA_Nesterov(torch.optim.Optimizer):
         self.g_zm += a * (x - self.g_zm)
         self.g_zq += a * (x * x - self.g_zq)
         n = min(self.g_zn, 50)
+        if self.g_zn < 3:   # no spread yet: the first samples would give an arbitrary huge z
+            return 0.0
         return self.g_zm / max((self.g_zq - self.g_zm ** 2) / n, 1e-60) ** 0.5
 
     @torch.no_grad()

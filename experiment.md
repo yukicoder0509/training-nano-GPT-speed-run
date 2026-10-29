@@ -604,3 +604,20 @@ Commit `bb1bc0b`, record settings + `ROW_GAIN_NO_CWD=1`, `STOP_STEP=2690`, seeds
 4. *The slope-sign rule does not work here.* In the control the slope at the jumped-to point, s = ⟨g, d⟩, is positive (overshoot) on 34 % of steps in 300–700, 59 % in 700–1200 and 92 % in 1200–1950. The self-tuning rule follows it (3× before 700, ≈ 0 after 1200) and ends level with the control, while a fixed 2× gains 12 steps: a one-batch overshoot signal does not say whether the jump helps the final loss.
 5. *Starting earlier (50 instead of 300) and the least-squares velocity do not help* (−5 and −4 steps).
 6. *Path efficiency* of the norm gains rises with the jump size (eff200 at 500–1000: off 0.24, 1× 0.29, 2× 0.38, 3× 0.52, 4× 0.73) but is not the target itself: the self-tuning fork is the straightest early (0.52) with no gain. The hidden matrices' path efficiency is unchanged in every fork (±0.005).
+
+### Self-tuning the norm-gain jump from many batches (2026-10-29)
+
+Commit `10ef1aa`; forks from step 50 of `ckpt-best`, seeds 0–2, `ENA_GROUP=norm ENA_G_AUTO=0.05 ENA_G_MAX=3 ENA_G_MIN=0.1`, window 300–1950. Signals (`ENA_G_SIGNAL`): `slope` = the one-batch sign rule; `slope_z` = z-score of s = ⟨g, d⟩ over ~50 batches; `update_z` = z-score of c = ⟨u, d⟩, u the inner Adam step taken after the jump (c > 0: Adam keeps moving along the jump → grow).
+
+| fork | signal | Δ val_ema@2690 | steps | multiplier over training (all 3 seeds) |
+|---|---|---|---|---|
+| `ena-autos300` | slope (sign) | −0.00063 ± 0.00004 | +10.6 | 3× from 350 to ~650, 1× at ~850, floor 0.1 from ~1100 |
+| `ena-autoz` | slope_z | −0.00045 ± 0.00028 | +7.7 | 3× from 350 to ~600, floor from ~900 (z > 0 from 600 on, +25 by 1950) |
+| `ena-autou` | update_z | −0.00077 ± 0.00017 | +12.9 | 3× (the cap) for the whole window; c > 0 on 86–90 % of steps in 300–700, 76–83 % in 700–1200, 97–98 % in 1200–1950 |
+| `ena-x2` / `ena-x3` (fixed) | – | −0.00072 / −0.00084 | +12 / +14 | 2× / 3× |
+
+- *The earlier self-tuning result was the window, not the signal.* The same sign rule started at 300 (instead of 50) with a floor gains +10.6 steps (tightest of all: SE 0.00004), the same as fixed 2× during 300–1000 only (+10.7), which is what its multiplier does.
+- *Averaging the slope over many batches makes it decide sooner, not differently.* `slope_z` reads "overshoot" (z > 0) from step 600 on and reaches the floor by 900, earlier than the sign rule.
+- *The two signals disagree after ~700 steps.* The slope of the raw gradient along the jump says overshoot (shrink); Adam's own step keeps moving along the jump (grow). The outcomes side with the update signal: 2× after step 1000 alone is +6 steps (`ena-x2late`).
+- *Neither signal finds an interior optimum.* `slope` and `slope_z` run to the floor, `update_z` to the cap; the result is set by the cap and floor. `update_z` with cap 3 behaves exactly like fixed 3× (same path efficiency of the norm gains, eff200 0.52 / 0.45 / 0.39 in 500–1000 / 1000–1500 / 1500–2000). With 4× unstable (`ena-x4`), a growing rule needs a cap at ~3×.
+- Logging fix (`_zscore`): the first two samples have no spread and logged an arbitrary huge z; they now return 0. The multiplier was clipped either way, so the runs are unaffected.
