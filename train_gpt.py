@@ -216,6 +216,16 @@ ENA_G_START = int(os.environ.get("ENA_G_START", 300))
 ENA_G_END = int(os.environ.get("ENA_G_END", 0))   # 0 = the global end
 ENA_G_AUTO = float(os.environ.get("ENA_G_AUTO", 0.0))
 ENA_G_MAX = float(os.environ.get("ENA_G_MAX", 3.0))
+# ENA_G_SIGNAL picks what ENA_G_AUTO reacts to (all from quantities already computed, no extra passes):
+#   slope    sign(s_t) smoothed, sbar <- 0.9 sbar + 0.1 sign(s_t)                       (one batch at a time)
+#   slope_z  z-score of s over many batches: z = mean_s / sqrt(var_s / 50) from EMAs (0.98) of s and s^2;
+#            ENA_G_MULT <- ENA_G_MULT * exp(-k * clip(z / 2, -1, 1))
+#   update_z the same z-score of c_t = <u_t, d>, u_t = the inner optimizer's own step on the group (after the jump):
+#            c > 0 the optimizer keeps moving along the jump (grow), c < 0 it moves back (overshoot, shrink);
+#            ENA_G_MULT <- ENA_G_MULT * exp(+k * clip(z / 2, -1, 1))
+# ENA_G_MIN: lower clip of ENA_G_MULT (default 0; a multiplicative rule cannot climb back from ~0).
+ENA_G_SIGNAL = os.environ.get("ENA_G_SIGNAL", "slope")
+ENA_G_MIN = float(os.environ.get("ENA_G_MIN", 0.0))
 ENA_G_LS = float(os.environ.get("ENA_G_LS", 0.0))
 # ENA_G_SWITCH=t1 with ENA_G_MULT_AFTER=m2: the multiplier is ENA_G_MULT before step t1 and m2 from t1 on (not with AUTO).
 ENA_G_SWITCH = int(os.environ.get("ENA_G_SWITCH", 0))
@@ -1047,6 +1057,7 @@ class EMA_Nesterov(torch.optim.Optimizer):
         self.gset, self.g_mult, self.g_start, self.g_end = set(params), mult, start, end
         self.g_auto, self.g_max, self.g_ls, self.g_log = auto, auto_max, ls, log_path
         self.g_sbar, self.g_active, self.g_dirs = 0.0, False, {}
+        self.g_zm, self.g_zq, self.g_zn, self.g_pre = 0.0, 0.0, 0, {}
         self.g_ls_buf, self.g_w = {}, [0.0, 0.0, 0.0]   # S0, S1 per param; W0, W1, W2
 
     def _group_dir(self, p):
@@ -1063,15 +1074,43 @@ class EMA_Nesterov(torch.optim.Optimizer):
         """After the gradient is ready: slope along the group's jump, and the self-tuning update of its size."""
         if not self.gset or not self.g_active:
             return
-        s = sum((p.grad.float() * d.float()).sum() for p, d in self.g_dirs.items()).item()
-        dn = sum(d.float().square().sum() for d in self.g_dirs.values()).item() ** 0.5
-        self.g_sbar = 0.9 * self.g_sbar + 0.1 * (1.0 if s > 0 else -1.0 if s < 0 else 0.0)
+        self.g_s = sum((p.grad.float() * d.float()).sum() for p, d in self.g_dirs.items()).item()
+        self.g_dn = sum(d.float().square().sum() for d in self.g_dirs.values()).item() ** 0.5
+        self.g_sbar = 0.9 * self.g_sbar + 0.1 * (1.0 if self.g_s > 0 else -1.0 if self.g_s < 0 else 0.0)
+        self.g_step_log = step_log
+        if ENA_G_SIGNAL == "update_z":
+            self.g_pre = {p: p.detach().float().clone() for p in self.g_dirs}
+
+    def _zscore(self, x):
+        """z-score of the mean of x over ~50 steps, from EMAs (0.98) of x and x^2."""
+        self.g_zn += 1
+        a = 0.02 if self.g_zn > 1 else 1.0
+        self.g_zm += a * (x - self.g_zm)
+        self.g_zq += a * (x * x - self.g_zq)
+        n = min(self.g_zn, 50)
+        return self.g_zm / max((self.g_zq - self.g_zm ** 2) / n, 1e-60) ** 0.5
+
+    @torch.no_grad()
+    def tune_after_step(self):
+        """After the inner step: the self-tuning update of the group's jump size, and the log line."""
+        if not self.gset or not self.g_active:
+            return
+        c = z = None
+        if ENA_G_SIGNAL == "slope":
+            factor = math.exp(-self.g_auto * self.g_sbar)
+        elif ENA_G_SIGNAL == "slope_z":
+            z = self._zscore(self.g_s)
+            factor = math.exp(-self.g_auto * min(max(z / 2, -1.0), 1.0))
+        else:
+            c = sum(((p.detach().float() - q) * self.g_dirs[p].float()).sum() for p, q in self.g_pre.items()).item()
+            z = self._zscore(c)
+            factor = math.exp(self.g_auto * min(max(z / 2, -1.0), 1.0))
         if self.g_auto:
-            self.g_mult = min(max(self.g_mult * math.exp(-self.g_auto * self.g_sbar), 0.0), self.g_max)
+            self.g_mult = min(max(self.g_mult * factor, ENA_G_MIN), self.g_max)
         if self.g_log:
             with open(self.g_log, "a") as f:
-                f.write(json.dumps(dict(it=step_log, s=s, sbar=self.g_sbar, mult=self.g_mult,
-                                        beta=self.g_beta, dnorm=dn)) + "\n")
+                f.write(json.dumps(dict(it=self.g_step_log, s=self.g_s, sbar=self.g_sbar, c=c, z=z, mult=self.g_mult,
+                                        beta=self.g_beta, dnorm=self.g_dn)) + "\n")
 
     def __setstate__(self, state):
         super(EMA_Nesterov, self).__setstate__(state)
@@ -1175,6 +1214,7 @@ class EMA_Nesterov(torch.optim.Optimizer):
         else:
             self.inner_optimizer.step()
 
+        self.tune_after_step()
         self.accum_lookahead()
 
         self.lookahead_status = False
@@ -1228,7 +1268,7 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
-       f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER}")
+       f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
@@ -1472,7 +1512,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):
