@@ -217,6 +217,9 @@ ENA_G_END = int(os.environ.get("ENA_G_END", 0))   # 0 = the global end
 ENA_G_AUTO = float(os.environ.get("ENA_G_AUTO", 0.0))
 ENA_G_MAX = float(os.environ.get("ENA_G_MAX", 3.0))
 ENA_G_LS = float(os.environ.get("ENA_G_LS", 0.0))
+# ENA_G_SWITCH=t1 with ENA_G_MULT_AFTER=m2: the multiplier is ENA_G_MULT before step t1 and m2 from t1 on (not with AUTO).
+ENA_G_SWITCH = int(os.environ.get("ENA_G_SWITCH", 0))
+ENA_G_MULT_AFTER = float(os.environ.get("ENA_G_MULT_AFTER", 1.0))
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
 # ROW_GAIN_SCOPE: comma list of matrix types it applies to (q,k,v,o,fc,proj; default all but proj). ROW_GAIN_MODE=matrix: one
@@ -1099,7 +1102,10 @@ class EMA_Nesterov(torch.optim.Optimizer):
         else:
             lookahead_stepsize = self.lookahead_stepsize
         self.current_lookahead_stepsize = lookahead_stepsize if self.global_active else 0
-        self.g_beta, self.g_dirs = lookahead_stepsize * getattr(self, "g_mult", 1.0), {}
+        mult = getattr(self, "g_mult", 1.0)
+        if self.gset and ENA_G_SWITCH and not self.g_auto and self.it >= ENA_G_SWITCH:
+            mult = ENA_G_MULT_AFTER
+        self.g_beta, self.g_dirs = lookahead_stepsize * mult, {}
 
         for group in self.param_groups:
             for p in group['params']:
@@ -1221,7 +1227,8 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"row_gain_scope={sorted(ROW_GAIN_SCOPE)} row_gain_mode={ROW_GAIN_MODE} "
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
-       f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS}")
+       f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
+       f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER}")
 print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
@@ -1465,7 +1472,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
 
 def save_checkpoint(step):

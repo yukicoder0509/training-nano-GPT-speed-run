@@ -30,6 +30,7 @@ The wrapper keeps a buffer b and the previous weights W_prev for every parameter
 - **Per-group jump (env, default off):** `ENA_GROUP` = norm | embed | head | bias | hidden gives one group its own jump W ← W + β_g·d, all others keep the one above.
   - β_g = `ENA_G_MULT`·β_t (default 1), active for `ENA_G_START` < t + 1 and t < `ENA_G_END` (defaults 300 and the global end).
   - `ENA_G_AUTO`=κ: s_t = ⟨g_t, d⟩ with g_t the gradient at the jumped-to point; s̄ ← 0.9·s̄ + 0.1·sign(s_t); `ENA_G_MULT` ← clip(`ENA_G_MULT`·e^(−κ·s̄), 0, `ENA_G_MAX`) on every active step.
+  - `ENA_G_SWITCH`=t₁, `ENA_G_MULT_AFTER`=m₂: the multiplier is `ENA_G_MULT` before step t₁ and m₂ from t₁ on.
   - `ENA_G_LS`=λ: d is the exponentially weighted least-squares velocity of the group's weights (weights λ^age; S0 ← θ + λS0, S1 ← λ(S1 + S0_old), d = (W1·S0 − W0·S1)/(W0·W2 − W1²)) instead of b.
 
 ## 2. Muon: hidden 2-D matrices (q, k, v, attn.proj, mlp.fc, mlp.proj)
