@@ -553,3 +553,28 @@ Commit `bb1bc0b`, record settings + `ROW_GAIN_NO_CWD=1`, `STOP_STEP=2690`, seeds
 - About 7 ± 6 steps: not resolved. The direction agrees with the forks (≈ −0.00017); the size does not separate from zero at n = 8.
 
 **Default on `main` from 2026-10-29:** `ROW_GAIN_NO_CWD=1` (user decision; the 2665 record is `ROW_GAIN_NO_CWD=0`). `record.env` still has `STOP_STEP=2665`.
+
+## Path efficiency of the weight trajectory (2026-10-29)
+
+**Question.** Is there a consistent drift ("river") under the step-to-step bounce that a better estimator could exploit? Path efficiency per parameter group, eff_K = ‖θ_t − θ_{t−K}‖ / Σ_{j<K} ‖Δθ‖, K = 50 and 200, snapshot every 50 steps, Δθ = the whole iteration's change (lookahead shift and weight decay included). Reference: a random walk with the same step sizes has eff ∝ 1/√K, so eff200/eff50 = 0.5 (1 = straight path); drift_K = chord / √Σ‖Δθ‖² is 1 for a random walk, < 1 when steps cancel, > 1 when they persist.
+
+**Setup.** Commit `c3b79bd`, `PATH_EFF=1` (`optim_dynamics.PathEfficiency`), full runs to 2700: `patheff-s0`, `patheff-s1` (current defaults: row gains + `ROW_GAIN_NO_CWD=1`) and `patheff-rec46-s0` (rec-46). Summary: `python path_eff.py patheff-s0 patheff-s1 patheff-rec46-s0` (medians over windows per phase).
+
+| group | phase | eff50 | eff200 | eff200/eff50 | drift50 | drift200 |
+|---|---|---|---|---|---|---|
+| attn q/k/v/o, mlp up/down | 500–2000 | 0.49–0.56 | 0.25–0.31 | 0.51–0.59 | 3.5–3.9 | 3.6–4.3 |
+| same | 2400–2700 | 0.50–0.56 | 0.26–0.31 | 0.53–0.56 | 3.5–4.0 | 3.7–4.3 |
+| embed, lm_head | all | 0.35–0.39 | 0.18–0.20 | 0.48–0.54 | 2.4–2.8 | 2.5–2.8 |
+| norm gains | 0–1000 | 0.31–0.44 | 0.29–0.41 | 0.90–0.95 | 2.2–3.0 | 4.1–5.6 |
+| norm gains | 2000–2700 | 0.20–0.26 | 0.07–0.08 | 0.30–0.34 | 1.5–1.8 | 0.97–1.16 |
+| biases (not lm_head) | 0–500 / 2000–2700 | 0.24 / 0.23–0.27 | 0.21 / 0.08–0.09 | 0.84 / 0.32–0.33 | 1.7 / 1.7–1.9 | 2.8 / 1.1–1.2 |
+| lm_head bias | 2000–2700 | 0.25–0.31 | 0.08–0.10 | 0.32 | 1.8–2.2 | 1.1–1.4 |
+
+(Values from `patheff-s0`; `patheff-s1` agrees to ±0.01 and rec-46 to ±0.01–0.02 everywhere.)
+
+**Findings.**
+1. *Matrices (q, k, v, o, mlp, embed, lm_head): no drift beyond ~50 steps.* Steps persist strongly over 50 steps (drift50 ≈ 2.4–4.0, far above a random walk), but from 50 to 200 steps the chord grows like a random walk: eff200/eff50 = 0.48–0.59 against 0.5, drift only +5–15 %. The same holds late (2400–2700), where a 200-step path is only 0.25–0.56 ‖W‖, so the sphere-like norm constraint cannot explain it. Early (≤ 1000) the 200-step path is 2–3.6 ‖W‖, so curvature of the fixed-norm surface also lowers eff there.
+2. *Gains and biases: drift early, bounce late.* Up to step 1000 the norm gains move almost straight (eff200/eff50 0.90–0.95, drift rising from 2–3 to 4–5.6), i.e. a consistent drift under the bounce. From 2000 on all 1-D groups fall faster than a random walk (eff200/eff50 0.30–0.34, drift200 ≈ 1.0–1.4 below drift50): they oscillate around a point that barely moves.
+3. *The optimizer, not the seed or row gains, sets these numbers:* the two seeds agree to ±0.01, and rec-46 differs by ≤ 0.02.
+
+**Reading for the "river" round.** Late in training, where a readout or estimator would act, no group shows eff far below 1 that rises with K. Matrices diffuse beyond ~50 steps; 1-D parameters mean-revert, which favours averaging (Tail-EMA) over extrapolation. This agrees with the earlier readout lab, where every extrapolation (RRE, #38 velocity, reference extrapolation) lost to Tail-EMA. The only drift-under-bounce signature is in the norm gains and biases before step 1000.
