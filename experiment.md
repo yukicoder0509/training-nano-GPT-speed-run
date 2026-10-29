@@ -578,3 +578,29 @@ Commit `bb1bc0b`, record settings + `ROW_GAIN_NO_CWD=1`, `STOP_STEP=2690`, seeds
 3. *The optimizer, not the seed or row gains, sets these numbers:* the two seeds agree to ±0.01, and rec-46 differs by ≤ 0.02.
 
 **Reading for the "river" round.** Late in training, where a readout or estimator would act, no group shows eff far below 1 that rises with K. Matrices diffuse beyond ~50 steps; 1-D parameters mean-revert, which favours averaging (Tail-EMA) over extrapolation. This agrees with the earlier readout lab, where every extrapolation (RRE, #38 velocity, reference extrapolation) lost to Tail-EMA. The only drift-under-bounce signature is in the norm gains and biases before step 1000.
+
+## Per-group jump on the norm gains, early stage (2026-10-29)
+
+**Setup.** Current best setting (row gains + `ROW_GAIN_NO_CWD=1`). Parents `ckpt-best` seeds 0–2 (commit `1389e1f`, `CKPT_STEPS=50,1000`, `PATH_EFF=1`, stop 2690). Forks from step 50 with `ENA_GROUP=norm` (all RMSNorm gains), `PATH_EFF=1`; round 1 at `1389e1f`, round 2 at `96d2a54` (adds `ENA_G_SWITCH`). Control `ena-ctrl` (`ENA_G_MULT=1`, the same math, logs the slope). Scoring `python fork_compare.py <variants> --parent ckpt-best --control ena-ctrl --ks 50`. **Fork noise from step 50: SD 0.00029** (4× the noise from step 1000).
+
+| fork | norm-gain jump | Δ val_ema@2690 | steps |
+|---|---|---|---|
+| `ena-off` | none | +0.00123 ± 0.00020 | −21 |
+| `ena-ctrl` | 1× (β = 0.3·η_t/η₀, steps 300–1950) | – | – |
+| `ena-x2` | 2× | −0.00072 ± 0.00017 | +12 |
+| `ena-x3` | 3× | −0.00084 ± 0.00030 | +14 |
+| `ena-x4` | 4× | +0.00086 ± 0.00012 | −15 |
+| `ena-x2early` | 2× for 300–1000, then 1× | −0.00063 ± 0.00013 | +11 |
+| `ena-x2late` | 1× until 1000, then 2× | −0.00033 ± 0.00017 | +6 |
+| `ena-early` | 1×, window from 50 | +0.00030 ± 0.00011 | −5 |
+| `ena-auto` | self-tuning (κ 0.05, max 3×), window 50–1950 | +0.00017 ± 0.00009 | −3 |
+| `ena-autofull` | self-tuning, window 50–2690 | −0.00009 ± 0.00023 | +2 |
+| `ena-ls` | least-squares velocity (λ 0.99) | +0.00021 ± 0.00021 | −4 |
+
+**Findings.**
+1. *The norm-gain jump is worth ~20 steps and is under-sized.* Dose response 0× / 1× / 2× / 3× / 4×: −21 / 0 / +12 / +14 / −15 steps; all 3 seeds better at 2×.
+2. *Most of the 2× gain is in 300–1000*, where the norm gains' path is straightest (path efficiency eff200/eff50 0.90–0.95 before 1000): 2× there only gives +11, 2× after 1000 only gives +6.
+3. *Why it helps, and why 4× breaks.* The buffer b averages the whole displacement, jump included, so for a slowly varying inner update u the displacement settles at Δ = u + βΔ, i.e. Δ = u/(1 − β): the jump amplifies the persistent part of the update by 1/(1 − β) (1.4× at 1×, 2.5× at 2×, 10× at 3× while η_t = η₀), while the bounce is averaged out by b. At 4× (β = 1.2 > 1) the recursion is unstable until η_t decays: the norm gains' 200-step chord reaches 194 at step 1500 vs 9 in the control and their path becomes a straight line (eff200 0.97), and the loss is 15 steps worse.
+4. *The slope-sign rule does not work here.* In the control the slope at the jumped-to point, s = ⟨g, d⟩, is positive (overshoot) on 34 % of steps in 300–700, 59 % in 700–1200 and 92 % in 1200–1950. The self-tuning rule follows it (3× before 700, ≈ 0 after 1200) and ends level with the control, while a fixed 2× gains 12 steps: a one-batch overshoot signal does not say whether the jump helps the final loss.
+5. *Starting earlier (50 instead of 300) and the least-squares velocity do not help* (−5 and −4 steps).
+6. *Path efficiency* of the norm gains rises with the jump size (eff200 at 500–1000: off 0.24, 1× 0.29, 2× 0.38, 3× 0.52, 4× 0.73) but is not the target itself: the self-tuning fork is the straightest early (0.52) with no gain. The hidden matrices' path efficiency is unchanged in every fork (±0.005).
