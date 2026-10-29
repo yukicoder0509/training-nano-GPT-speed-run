@@ -65,7 +65,7 @@ Each parameter is updated on one rank and then all-gathered.
 8. **Radius pin, then cautious weight decay:**
    - Target norm: r* = ‖W‖ − η·⟨O,W⟩ / ‖W‖
    - Step: W ← W − η·O, then W ← W · r* / ‖W‖
-   - Decay: W ← W ⊙ (1 − 0.025·η·1[O ⊙ W_old > 0]). The mask is taken from the weights before the step.
+   - Decay: W ← W ⊙ (1 − 0.025·η·1[O ⊙ W_old > 0]). The mask is taken from the weights before the step. Skipped on q, k, v, o, fc while their row gains are active (`ROW_GAIN_NO_CWD=1`, the default).
 9. **Update the SOAP statistics with the raw gradient** (used from the next step on):
    - L ← 0.9·L + 0.1·g·gᵀ
    - R ← 0.9·R + 0.1·gᵀ·g (skipped in `right` mode)
