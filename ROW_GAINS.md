@@ -133,4 +133,4 @@ python anatomy.py --transplant tp-CG --seeds 0,1
 python anatomy.py --transplant tp-CC2 --seeds 0
 ```
 
-Open lead (not part of the claims yet): dropping weight decay on the gained matrices (`ROW_GAIN_NO_CWD=1`). The C4 forks gave ≈ −0.00017; full runs `nocwd-s0`–`nocwd-s3` are lower than `cand-rg20` on all 4 seeds (paired −0.00106 ± 0.00067 at 2690; −0.00039 without seed 2) and pass the Track 3 rule at 2665 with n = 4. More seeds are needed to size it.
+Open lead (not part of the claims yet): dropping weight decay on the gained matrices (`ROW_GAIN_NO_CWD=1`). The C4 forks gave ≈ −0.00017. Full runs `nocwd-s0`–`nocwd-s7` vs `cand-rg20` on the same seeds: paired −0.00048 ± 0.00041 at 2690 (6 of 8 lower, median −0.00035), i.e. about 7 ± 6 steps, not resolved. With n = 8 they pass the Track 3 rule at 2660 (0.00445), where `cand-rg20` needed n = 16.

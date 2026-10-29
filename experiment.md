@@ -546,3 +546,8 @@ Commit `bb1bc0b`, record settings + `ROW_GAIN_NO_CWD=1`, `STOP_STEP=2690`, seeds
 - Track 3 rule (n = 4): 0.00373 at 2660, **0.00438 at 2665** (earliest pass), 0.00721 at 2690.
 - Seed-paired vs `cand-rg20` at 2690: −0.00044, −0.00025, −0.00308, −0.00048; mean −0.00106 ± 0.00067 (SE). All 4 lower; without seed 2, −0.00039 (≈ 6 steps). At 2665: mean 3.27781 vs 3.27887.
 - The forks predicted ≈ −0.00017. The full-run difference has the same sign in every seed but its size is not resolved by 4 seeds (seed 2 alone is −0.0031).
+
+**Seeds 4–7 added** (`nocwd-s4`–`nocwd-s7`, same commit and settings), n = 8:
+- Track 3 rule: 0.00366 at 2655, **0.00445 at 2660** (earliest pass), 0.00536 at 2665, 0.00937 at 2690. (`cand-rg20` with n = 8: 0.00315 at 2660, earliest pass 2665; with n = 16: 0.00407 at 2660.)
+- Seed-paired vs `cand-rg20` at 2690: −0.00044, −0.00025, −0.00308, −0.00048, +0.00102, +0.00014, −0.00060, −0.00013; **mean −0.00048 ± 0.00041 (SE)**, median −0.00035, 6 of 8 lower. Same at 2655–2665 (−0.00046 to −0.00048).
+- About 7 ± 6 steps: not resolved. The direction agrees with the forks (≈ −0.00017); the size does not separate from zero at n = 8.
