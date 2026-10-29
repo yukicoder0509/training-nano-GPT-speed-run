@@ -25,8 +25,15 @@ firing rate, dead units (firing < 0.1 %). Per-token loss (stop step, Tail-EMA re
 difference per target-token frequency quintile, context position bucket and control-loss decile.
 Validation timeline: val_ema of each run at every val step, variant minus control.
 
+Transplants (--transplant <prefix>): reads the ROW_TRANSPLANT result of jobs logs/<prefix>-s<seed>-<jobid>.out (A =
+control, B = variant). gap = L(B) - L(A). "A<-B" = A's directions with B's lengths: the share of the gap it recovers,
+(L(A<-B) - L(A)) / gap. "B<-A" = B's directions with A's lengths: the share of B's advantage it loses,
+(L(B<-A) - L(B)) / -gap. Row mode transplants each row's length, matrix mode only each matrix's Frobenius norm.
+Also the mean row cosine between A and B and the SD of their log row-length ratio, per type.
+
 Example
   python anatomy.py --control anat-C --variants anat-G,anat-G0,anat-Goff2000,anat-Gon2000,anat-Gproj --seeds 0,1
+  python anatomy.py --transplant tp-CG --seeds 0,1
 """
 
 from __future__ import annotations
@@ -171,19 +178,70 @@ def token_diff(C: dict, V: dict) -> dict:
     return out
 
 
+def transplant(prefix: str, seed: int):
+    outs = glob.glob(os.path.join(ROOT, "logs", f"{prefix}-s{seed}-*.out"))
+    if not outs:
+        print(f"  {prefix}-s{seed}: no log")
+        return
+    txt = open(max(outs, key=os.path.getmtime), errors="replace").read()
+    m = re.search(r"(logs/[0-9a-f-]+)\.txt", txt)
+    path = os.path.join(ROOT, m[1] + ".transplant.json")
+    if not os.path.exists(path):
+        print(f"  {prefix}-s{seed}: no result ({path})")
+        return
+    import json
+    d = json.load(open(path))
+    res = d["results"]
+    for step, ro in sorted({(r["step"], r["readout"]) for r in res}):
+        rr = [r for r in res if r["step"] == step and r["readout"] == ro]
+        base = {(r["D"], r["L"]): r for r in rr if r["scope"] == "-"}
+        a, b = base[("A", "A")], base[("B", "B")]
+        print(f"\n  step {step} {ro}: A {a['val']:.5f} / {a['heldout']:.5f}   B {b['val']:.5f} / {b['heldout']:.5f}   "
+              f"gap {b['val'] - a['val']:+.5f} / {b['heldout'] - a['heldout']:+.5f}   (val / heldout)")
+        print(f"    {'scope':>7} {'mode':>6} | {'A<-B val':>9} {'ho':>6} | {'B<-A val':>9} {'ho':>6}")
+        for sc in ("qkvofc", "all", "v", "o", "fc", "qk", "proj"):
+            for mode in ("row", "matrix"):
+                cell = []
+                for (dd, ll), sign in ((("A", "B"), 1), (("B", "A"), -1)):
+                    r = next((x for x in rr if x["D"] == dd and x["L"] == ll and x["scope"] == sc and x["mode"] == mode), None)
+                    if r is None:
+                        cell.append(" " * 16)
+                        continue
+                    ref = a if dd == "A" else b
+                    fr = [(r[key] - ref[key]) / (sign * (b[key] - a[key])) if abs(b[key] - a[key]) > 1e-7 else float("nan")
+                          for key in ("val", "heldout")]
+                    cell.append(f"{fr[0]:9.2f} {fr[1]:6.2f}")
+                print(f"    {sc:>7} {mode:>6} | {cell[0]} | {cell[1]}")
+    print("\n  row cosine A vs B (mean over rows), SD of log(|B_i|/|A_i|), per type:")
+    for step in sorted({c["step"] for c in d["cosines"]}):
+        cs = [c for c in d["cosines"] if c["step"] == step and c["readout"] == "raw"]
+        line = []
+        for k in KINDS:
+            ck = [c for c in cs if c["kind"] == k]
+            if ck:
+                line.append(f"{k} {sum(c['cos_mean'] for c in ck) / len(ck):.4f}/{sum(c['dlogr_sd'] for c in ck) / len(ck):.3f}")
+        print(f"    {step}: " + "  ".join(line))
+
+
 def fmt(v) -> str:
     return f"{v:+.4f}" if isinstance(v, float) and abs(v) < 10 else f"{v:.4g}" if isinstance(v, float) else str(v)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--control", required=True)
-    ap.add_argument("--variants", required=True)
+    ap.add_argument("--control")
+    ap.add_argument("--variants")
+    ap.add_argument("--transplant")
     ap.add_argument("--seeds", default="0,1")
     ap.add_argument("--windows", default="1000:1500,1500:2000,2000:2690")
     args = ap.parse_args()
     seeds = [int(s) for s in args.seeds.split(",")]
     windows = [tuple(int(x) for x in w.split(":")) for w in args.windows.split(",")]
+    if args.transplant:
+        for seed in seeds:
+            print(f"\n######## {args.transplant} seed {seed}")
+            transplant(args.transplant, seed)
+        return
     runs = [args.control] + args.variants.split(",")
     for seed in seeds:
         print(f"\n######## seed {seed}")
