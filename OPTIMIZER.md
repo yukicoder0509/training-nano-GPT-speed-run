@@ -1,6 +1,6 @@
 # Optimizer step (math)
 
-This is the update that `train_gpt.py` at this commit performs on each training step. Keep this file in sync with the code: any commit that changes the optimizer updates this file in the same commit.
+This is the update that `train_gpt.py` at this commit performs on each training step. The defaults are the current record (rec-46 + row gains + Tail-EMA 2100/200, 2665 steps); to get rec-46 set `NEWTON_MUON=0 ROW_GAIN_LR=0 TAILEMA_START=2400 TAILEMA_TAU=150 STOP_STEP=2690` or run the `rec-46` tag. Keep this file in sync with the code: any commit that changes the optimizer updates this file in the same commit.
 
 Notation: t is the loop step; g = ∇L, the gradient summed over ranks. W is a parameter and η_t its learning rate. ‖X‖_S4 = ‖XᵀX‖_F^½ is the Schatten-4 norm, which is what `gram_frobenius_norm_estimate` computes. ⊙ is elementwise multiplication.
 
@@ -12,7 +12,7 @@ Notation: t is the loop step; g = ∇L, the gradient summed over ranks. W is a p
   - rises linearly 0.85 → 0.95 over steps 0–300;
   - holds at 0.95;
   - falls linearly 0.95 → 0.85 over steps 2700–2900.
-- Training stops at `STOP_STEP` = 2690, so at the last step η is still 5.4 % of η₀ for Muon, and the μ cooldown never starts.
+- Training stops at `STOP_STEP` = 2665 (`record.env`; rec-46 used 2690), so at the last step η is still about 6 % of η₀ for Muon, and the μ cooldown never starts.
 
 ## 1. Outer wrapper: EMA-Nesterov (all parameters)
 
@@ -43,7 +43,7 @@ Each parameter is updated on one rank and then all-gathered.
    - Precondition and rotate back: S = Q_L·(P / √V)·Q_Rᵀ, then rescale so ‖S‖_S4 = ‖U‖_S4.
    - On step 0 there is no eigenbasis yet, so S = U.
    - **One-sided when `NEWTON_MODE=right`:** R and Q_R are not kept, and Q_R = I. So P = Q_Lᵀ·U and S = Q_L·(P / √V), and K_ℓ takes over the input (column) side.
-3. **Newton-Muon right preconditioning, only when `NEWTON_MODE` is `soap` (the default) or `right`** (`NEWTON_MUON`, record #15 / PR #281):
+3. **Newton-Muon right preconditioning, off by default** (`NEWTON_MUON=1` turns it on; it applies when `NEWTON_MODE` is `soap` (the default) or `right`; record #15 / PR #281):
    - Ŝ = S·K_ℓ, rescaled so ‖Ŝ‖_S4 = ‖S‖_S4.
    - K_ℓ is the preconditioner for this layer's input space (§2a).
    - For mlp.proj (input width 3072), K_ℓ is block-diagonal with 4 blocks of 768×768.
@@ -80,11 +80,11 @@ There is no gradient clipping and no other weight decay.
   - `V_GATE=1`: the trust gate of step 4 is also applied on attn.v (default: attn.proj only).
   - `VO_DENOM_POWER` = p: for attn.v and attn.proj, step 2 divides by V^p instead of V^½ (default 0.5).
   - `VO_HEAD=1`: step 9's new statistics are masked to the 6 head blocks (128×128) on V's output side (L) and O's input side (R), so those bases are block-diagonal per head.
-- Per-row norm control (Muown #23; env, defaults = rec-46):
+- Per-row norm control (Muown #23; env). Default: row gains on q,k,v,o,fc from step 1000 with a = 0.02 (the current record); `ROW_GAIN_LR=0` restores rec-46.
   - `ROW_PIN=1`: step 8's pin is per row: r*_i = ‖W_i‖ − η⟨O_i,W_i⟩/‖W_i‖ and each row is rescaled to r*_i.
-  - `ROW_GAIN_SCOPE` (types among q,k,v,o,fc,proj; default all) limits the row gains to those matrices; `ROW_GAIN_MODE=matrix` uses one gain per matrix (pure angular step for the whole matrix, g = ⟨∇W, W/‖W‖⟩) instead of one per row.
-  - `ROW_GAIN_START` = t₀ (default 0): the row gains are used only from step t₀ on (before it, step 8 is the rec-46 pin).
-  - `ROW_GAIN_LR` = a > 0: step 8 is purely angular per row (r*_i = ‖W_i‖), then each row norm takes its own Adam step: g_i = ⟨∇W_i, W_i/‖W_i‖⟩ (raw gradient), Adam(β = 0.9, 0.95, bias-corrected), W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i). CWD still follows.
+  - `ROW_GAIN_SCOPE` (types among q,k,v,o,fc,proj; default q,k,v,o,fc) limits the row gains to those matrices (mlp.proj keeps the rec-46 pin); `ROW_GAIN_MODE=matrix` uses one gain per matrix (pure angular step for the whole matrix, g = ⟨∇W, W/‖W‖⟩) instead of one per row.
+  - `ROW_GAIN_START` = t₀ (default 1000): the row gains are used only from step t₀ on (before it, step 8 is the rec-46 pin).
+  - `ROW_GAIN_LR` = a > 0 (default 0.02): step 8 is purely angular per row (r*_i = ‖W_i‖), then each row norm takes its own Adam step: g_i = ⟨∇W_i, W_i/‖W_i‖⟩ (raw gradient), Adam(β = 0.9, 0.95, bias-corrected), W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i). CWD still follows.
 - SOAP variants (env, defaults = rec-46; scope `SOAP_*_SCOPE` = all | vo):
   - `SOAP_SINK=cur|ema`: step 2's P/√V is replaced by √r_i·P_ij·√c_j, with r, c the Sinkhorn scalings (10 iterations) that give r_i B_ij c_j uniform row and column marginals; B = P² (cur, as SinkSOAP #26) or B = V (ema, a factored second moment).
   - `SOAP_KL=1`: step 9's statistics become KL-SOAP's coupled estimates (#19/#25): L ← 0.9·L + 0.1·G·Q_R·diag(1/λ_R)·Q_Rᵀ·Gᵀ/n and R ← 0.9·R + 0.1·Gᵀ·Q_L·diag(1/λ_L)·Q_Lᵀ·G/m, where λ_L, λ_R are EMAs (0.9) of the row/column energies of Q_Lᵀ·G·Q_R whitened by the other side. The first KL step replaces L and R instead of mixing.
@@ -121,7 +121,7 @@ There is no gradient clipping and no other weight decay.
 
 ## 4. Evaluation only: Tail-EMA (training is unaffected)
 
-- For 2400 ≤ t < 2900, every parameter except the token embedding keeps an average: ē ← ē + (W − ē)/150. (env `TAILEMA_START`, `TAILEMA_TAU`, `TAILEMA_LAMBDA`; defaults 2400 / 150 / 0.6.)
+- For 2100 ≤ t < 2900, every parameter except the token embedding keeps an average: ē ← ē + (W − ē)/200. (env `TAILEMA_START`, `TAILEMA_TAU`, `TAILEMA_LAMBDA`; defaults 2100 / 200 / 0.6; rec-46 used 2400 / 150.)
 - Validation is scored on the blend (1 − 0.6)·W + 0.6·ē. This is the reported `val_ema_loss`.
 - Validation runs every 125 steps, at the stop step, and densely every 5 steps over 2650–2690 (`DENSE_VAL`, "lo:hi:stride"), so a run can be scored at the earliest step that passes.
 - Readout lab (`READOUT_LAB=1`, eval only): keeps weight snapshots after `LAB_REF_STEPS` and update-EMAs m_β (β = 0.9, 0.97) of Δθ from `LAB_VEL_START`; at the stop step scores θ_eval = base + γ·(base − θ_ref) and base + γ·m_β, for base = raw W or the Tail-EMA blend, plus a λ grid of the Tail-EMA blend. Results go to `<log>.readout.json`.

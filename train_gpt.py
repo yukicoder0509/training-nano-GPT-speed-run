@@ -131,8 +131,8 @@ ROWFLOOR_RHO = 1.0
 CWD = 0.025
 # (A) Tail-EMA eval readout: slow weight EMA over [START,END] (token embed excluded), eval the
 #     partial blend (1-LAMBDA)*w + LAMBDA*ema. TAILEMA_TAU=0 -> off (eval raw weights only).
-TAILEMA_TAU = float(os.environ.get("TAILEMA_TAU", 150.0))
-TAILEMA_START = int(os.environ.get("TAILEMA_START", 2400))
+TAILEMA_TAU = float(os.environ.get("TAILEMA_TAU", 200.0))
+TAILEMA_START = int(os.environ.get("TAILEMA_START", 2100))
 TAILEMA_END = 2900
 TAILEMA_LAMBDA = float(os.environ.get("TAILEMA_LAMBDA", 0.6))
 # (D) Newton-Muon (record #15, PR #281, arXiv:2604.01472): right-precondition every hidden matrix's
@@ -144,7 +144,7 @@ TAILEMA_LAMBDA = float(os.environ.get("TAILEMA_LAMBDA", 0.6))
 #     trust gate all see the preconditioned gradient.
 #     NEWTON_MODE="right": one-sided SOAP (output/row side only) then U <- SOAP_L(U) K, i.e. K replaces
 #     SOAP's input-side (column) whitening instead of stacking on it.
-NEWTON_MUON = os.environ.get("NEWTON_MUON", "1") == "1"
+NEWTON_MUON = os.environ.get("NEWTON_MUON", "0") == "1"
 NEWTON_MODE = os.environ.get("NEWTON_MODE", "soap")
 assert NEWTON_MODE in ("soap", "grad", "right")
 SOAP_ONE_SIDED = NEWTON_MUON and NEWTON_MODE == "right"
@@ -184,13 +184,13 @@ SOAP_SINK_SCOPE = os.environ.get("SOAP_SINK_SCOPE", "all")
 SOAP_KL_SCOPE = os.environ.get("SOAP_KL_SCOPE", "all")
 ENA_REST = int(os.environ.get("ENA_REST", 0))   # EMA-Nesterov lookahead end step (0 = rec-46: train_steps - 950 = 1950)
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
-ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.0))
-# ROW_GAIN_SCOPE: comma list of matrix types it applies to (q,k,v,o,fc,proj; default all). ROW_GAIN_MODE=matrix: one
+ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
+# ROW_GAIN_SCOPE: comma list of matrix types it applies to (q,k,v,o,fc,proj; default all but proj). ROW_GAIN_MODE=matrix: one
 # gain per matrix (pure angular step for the whole matrix, then W *= 1 - a*(lr/lr0)*adam(<grad, W/|W|>)) instead of
 # one per row - separates "rows of a matrix can differ in norm" from "matrices can change scale".
-ROW_GAIN_SCOPE = set(os.environ.get("ROW_GAIN_SCOPE", "q,k,v,o,fc,proj").split(","))
+ROW_GAIN_SCOPE = set(os.environ.get("ROW_GAIN_SCOPE", "q,k,v,o,fc").split(","))
 ROW_GAIN_MODE = os.environ.get("ROW_GAIN_MODE", "row")
-ROW_GAIN_START = int(os.environ.get("ROW_GAIN_START", 0))   # Muon step at which the row gains switch on
+ROW_GAIN_START = int(os.environ.get("ROW_GAIN_START", 1000))   # Muon step at which the row gains switch on
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
