@@ -1731,7 +1731,7 @@ def save_snapshot(step):
     print0(f"snapshot step:{step} -> {CKPT_DIR}/snap{step}.pt", console=True)
 
 _kind_of = lambda n: {"attn.q": "q", "attn.k": "k", "attn.v": "v", "attn.proj": "o", "mlp.fc": "fc",
-                      "mlp.proj": "proj"}.get(n.split(".", 1)[1].rsplit(".", 1)[0]) if n.startswith("blocks.") and n.endswith(".weight") else None
+                      "mlp.proj": "proj"}.get(n.split(".", 2)[2].rsplit(".", 1)[0]) if n.startswith("blocks.") and n.endswith(".weight") else None
 
 @torch.no_grad()
 def run_transplant():
