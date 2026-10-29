@@ -6,7 +6,7 @@ Only claims backed by measurements are listed. Full tables and run details: `exp
 - **Size of the effect:** about 12 steps on its own. Together with the Tail-EMA retune it moved the record from 2690 to 2665 steps.
 - **Where it acts:** v, o and mlp.fc. q and k contribute about nothing; on mlp.proj it hurts.
 - **What it needs:** one length per row (not per matrix), switched on from step 1000.
-- **What training reaches:** a different solution. The attention matrices end larger, and row lengths within a matrix are more spread out. That solution predicts better, mostly at context positions ≥ 128 and on rare tokens.
+- **What training reaches:** a different solution. The attention matrices end larger, and row lengths within a matrix are more spread out. That solution predicts better on every context position past the first 16, and most on the rarest target tokens.
 
 ## 1. The change
 
@@ -76,14 +76,25 @@ Starting at step 0 is impossible. attn.proj and mlp.proj start at zero, and a ze
 - Swapping row lengths between two *control* forks from the same checkpoint costs +0.002 (swapping matrix norms costs about 0).
 - Swapping between control and row gains costs +0.28 to +0.51 by row, and +0.14 to +0.21 by matrix norm. This holds in both directions and both seeds.
 
-**C8. The payoff is long context and rare tokens.**
+**C8. The gain is spread over context positions and largest on the rarest tokens.** Mean Δ loss per token (row gains − control, Tail-EMA readout, val set at 2690) in each bucket, with the bucket's token count:
 
-| Measurement | Seed 0 / seed 1 |
-|---|---|
-| Share of the gain at context positions ≥ 128 | 88 % / 90 % |
-| Share of the gain on the rarest 40 % of target tokens | 52 % / 98 % |
-| Last-layer attention output vs residual stream | +27 % / +58 % |
-| Layer-0 MLP output vs residual stream | +12 % to +14 % |
+| Bucket | Tokens | Seed 0 | Seed 1 |
+|---|---|---|---|
+| All tokens | 10,485,760 | −0.00060 | −0.00090 |
+| Positions 0–15 | 163,840 | +0.00064 | −0.00099 |
+| Positions 16–127 | 1,146,880 | −0.00060 | −0.00047 |
+| Positions 128–511 | 3,932,160 | −0.00078 | −0.00108 |
+| Positions 512–1023 | 5,242,880 | −0.00048 | −0.00082 |
+| Rarest 20 % of target tokens | 2,103,442 | −0.00147 | −0.00311 |
+| 2nd quintile | 2,097,536 | −0.00008 | −0.00132 |
+| 3rd quintile | 2,106,492 | −0.00080 | −0.00015 |
+| 4th quintile | 2,187,199 | −0.00078 | +0.00025 |
+| Most common 20 % | 1,991,091 | +0.00025 | −0.00007 |
+
+- Per token, every position bucket from 16 on improves by a similar amount in both seeds; the first 16 positions disagree between seeds. (An earlier version reported shares of the total, 88–90 % at positions ≥ 128; that mostly reflected that 87.5 % of the tokens are there.)
+- The rarest quintile improves 2.5–3.5× the all-token mean in both seeds; the most common quintile does not improve. The middle quintiles disagree between seeds.
+
+Residual-stream budget at 2690 (seed 0 / seed 1): last-layer attention output +27 % / +58 %, layer-0 MLP output +12 % to +14 %.
 
 **C9. The Tail-EMA retune (start 2100, window 200) is a separate gain and stacks with row gains.**
 - On its own it is worth about 8 steps, confirmed on a held-out shard.
@@ -103,7 +114,7 @@ All per-row statistics come from `ANATOMY=1` dumps. A row i of a hidden matrix h
 | Matrix norm ratio, row CV | log(‖W‖_F / ‖W_control‖_F) per matrix, averaged per type; CV = SD/mean of r_i within a matrix | snapshots at 2690 (`SNAP_STEPS`) |
 | Frozen check | max over steps of \|Δlog r\| across the optimizer step | `anatomy/rows.pt` |
 | Residual budget | RMS(block's attention or MLP output) / RMS(residual stream entering it), on 16 val sequences | `anatomy.py` (function section) |
-| Per-token shares | Δ per-token Tail-EMA loss (variant − control), summed by context position and by target-token frequency quintile, divided by the token count | `anatomy.py` |
+| Per-token buckets | Δ per-token Tail-EMA loss (variant − control), averaged within each context-position bucket and each target-token frequency quintile (frequency = the token's count in the val set; quintiles cut on that count), with each bucket's token count | `anatomy.py` |
 | Transplant Δ | L(directions of A with row or matrix lengths of B) − L(A) on val and held-out, read against a control-vs-control pair | `ROW_TRANSPLANT`, `anatomy.py --transplant` |
 
 ## 4. Runs behind each claim

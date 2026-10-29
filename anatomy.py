@@ -21,8 +21,9 @@ Per matrix type (q, k, v, o, fc, proj; all layers pooled), for every run:
 Over steps windows given by --windows (default 1000:1500,1500:2000,2000:2690).
 
 Function (val steps, 16 val sequences): attention / MLP output RMS relative to the residual stream per layer, fc unit
-firing rate, dead units (firing < 0.1 %). Per-token loss (stop step, Tail-EMA readout), variant minus control: mean
-difference per target-token frequency quintile and context position bucket. (A control-loss decile split was removed:
+firing rate, dead units (firing < 0.1 %). Per-token loss (stop step, Tail-EMA readout), variant minus control: the mean
+difference per token in each target-token frequency quintile and context position bucket, with each bucket's token
+count (frequency quintiles are cut on token counts, so ties make them unequal). (A control-loss decile split was removed:
 it is dominated by regression to the mean and looked the same for every variant, including the one that is worse.)
 Validation timeline: val_ema of each run at every val step, variant minus control.
 
@@ -167,11 +168,11 @@ def token_diff(C: dict, V: dict) -> dict:
     freq = torch.bincount(tgt.flatten().long(), minlength=50304)[tgt.long()]
     q = torch.quantile(freq.flatten().double()[:: max(1, n // 1_000_000)], torch.tensor([0.2, 0.4, 0.6, 0.8], dtype=torch.float64))
     fb = torch.bucketize(freq.double(), q)
-    out["freq quintile (rare->common)"] = [(diff[fb == i].sum() / n).item() for i in range(5)]
+    bucket = lambda m: (diff[m].mean().item(), int(m.sum()))   # (mean difference per token, token count)
+    out["freq quintile (rare->common)"] = [bucket(fb == i) for i in range(5)]
     pos = torch.arange(tgt.size(1)).expand_as(tgt)
     edges = [0, 16, 128, 512, tgt.size(1)]
-    out["position (0-15,16-127,128-511,512+)"] = [(diff[(pos >= l) & (pos < h)].sum() / n).item()
-                                                  for l, h in zip(edges, edges[1:])]
+    out["position (0-15,16-127,128-511,512+)"] = [bucket((pos >= l) & (pos < h)) for l, h in zip(edges, edges[1:])]
     return out
 
 
@@ -271,11 +272,12 @@ def main():
                 print(f"  {'':>16}        mlp  {[round(x, 3) for x in f['mlp']]}")
                 print(f"  {'':>16}        fire {[round(x, 3) for x in f['fire']]}  dead {[round(x, 4) for x in f['dead']]}")
         if args.control in data and data[args.control]["tok"]:
-            print("\n== per-token loss (Tail-EMA), variant - control; buckets are contributions to the mean difference")
+            print("\n== per-token loss (Tail-EMA), variant - control; per bucket: mean difference per token (token count)")
             for r, R in data.items():
                 if r != args.control and R["tok"]:
                     for key, v in token_diff(data[args.control], R).items():
-                        print(f"  {r:>16} {key}: " + (fmt(v) if isinstance(v, float) else " ".join(f"{x:+.5f}" for x in v)))
+                        print(f"  {r:>16} {key}: " + (fmt(v) if isinstance(v, float) else
+                                                      "  ".join(f"{m:+.5f} ({c})" for m, c in v)))
 
 
 if __name__ == "__main__":
