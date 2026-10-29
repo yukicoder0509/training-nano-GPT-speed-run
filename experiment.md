@@ -644,3 +644,5 @@ Commit `10ef1aa`; forks from step 50 of `ckpt-best`, seeds 0–2, `ENA_GROUP=nor
 - The 16-seed mean at 2650 (3.27828) reproduces the independent 8-seed `norm25` screen (3.27829).
 - Versus the 2665 record: −25 steps, from no CWD on the gained matrices plus the 2.5× norm-gain jump.
 - Defaults on `main` now: `ENA_GROUP=norm ENA_G_MULT=2.5`, `record.env` `STOP_STEP=2640`. Not pushed to the leaderboard.
+
+**Leaderboard submission** (user-authorized 2026-10-29): seed 0 (fixed in advance), `STOP_STEP=2640`, commit `e893e4d` (defaults), `OPTIM_DYNAMICS=0`, W&B `cerulean-labs/midterm-nanogpt` run `normjump25-2640-s0` ([2x69kegk](https://flock.cerulean.works/cerulean-labs/midterm-nanogpt/runs/2x69kegk)), Slurm 638170. Summary: `total_train_steps` 2640, `val_loss` (val_ema) 3.27866, raw val 3.28571, peak memory 34.8 GiB, no dynamics keys.
