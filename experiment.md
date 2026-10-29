@@ -551,3 +551,5 @@ Commit `bb1bc0b`, record settings + `ROW_GAIN_NO_CWD=1`, `STOP_STEP=2690`, seeds
 - Track 3 rule: 0.00366 at 2655, **0.00445 at 2660** (earliest pass), 0.00536 at 2665, 0.00937 at 2690. (`cand-rg20` with n = 8: 0.00315 at 2660, earliest pass 2665; with n = 16: 0.00407 at 2660.)
 - Seed-paired vs `cand-rg20` at 2690: −0.00044, −0.00025, −0.00308, −0.00048, +0.00102, +0.00014, −0.00060, −0.00013; **mean −0.00048 ± 0.00041 (SE)**, median −0.00035, 6 of 8 lower. Same at 2655–2665 (−0.00046 to −0.00048).
 - About 7 ± 6 steps: not resolved. The direction agrees with the forks (≈ −0.00017); the size does not separate from zero at n = 8.
+
+**Default on `main` from 2026-10-29:** `ROW_GAIN_NO_CWD=1` (user decision; the 2665 record is `ROW_GAIN_NO_CWD=0`). `record.env` still has `STOP_STEP=2665`.

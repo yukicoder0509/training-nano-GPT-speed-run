@@ -1,6 +1,6 @@
 # Optimizer step (math)
 
-This is the update that `train_gpt.py` at this commit performs on each training step. The defaults are the current record (rec-46 + row gains + Tail-EMA 2100/200, 2665 steps); to get rec-46 set `NEWTON_MUON=0 ROW_GAIN_LR=0 TAILEMA_START=2400 TAILEMA_TAU=150 STOP_STEP=2690` or run the `rec-46` tag. Keep this file in sync with the code: any commit that changes the optimizer updates this file in the same commit.
+This is the update that `train_gpt.py` at this commit performs on each training step. The defaults are the current record (rec-46 + row gains + Tail-EMA 2100/200, 2665 steps) plus no CWD on the row-gain matrices (`ROW_GAIN_NO_CWD=1`, 8 seeds, not yet a validated record; `ROW_GAIN_NO_CWD=0` gives the 2665 record); to get rec-46 set `NEWTON_MUON=0 ROW_GAIN_LR=0 TAILEMA_START=2400 TAILEMA_TAU=150 STOP_STEP=2690` or run the `rec-46` tag. Keep this file in sync with the code: any commit that changes the optimizer updates this file in the same commit.
 
 Notation: t is the loop step; g = ∇L, the gradient summed over ranks. W is a parameter and η_t its learning rate. ‖X‖_S4 = ‖XᵀX‖_F^½ is the Schatten-4 norm, which is what `gram_frobenius_norm_estimate` computes. ⊙ is elementwise multiplication.
 
@@ -85,7 +85,7 @@ There is no gradient clipping and no other weight decay.
   - `ROW_GAIN_SCOPE` (types among q,k,v,o,fc,proj; default q,k,v,o,fc) limits the row gains to those matrices (mlp.proj keeps the rec-46 pin); `ROW_GAIN_MODE=matrix` uses one gain per matrix (pure angular step for the whole matrix, g = ⟨∇W, W/‖W‖⟩) instead of one per row.
   - `ROW_GAIN_START` = t₀ (default 1000): the row gains are used only from step t₀ on (before it, step 8 is the rec-46 pin). `ROW_GAIN_END` = t₁ (default 0 = never): from step t₁ on, step 8 is the rec-46 pin again.
   - `ROW_GAIN_FIXED=1`: step 8 is the direction-only step per row (r*_i = ‖W_i‖) without the Adam length step, so row lengths change only through CWD (ablation: "drop the radial part" vs "learn the lengths").
-  - `ROW_GAIN_NO_CWD=1`: no CWD on those matrices while their row gains are active; with `ROW_GAIN_FIXED=1` every row length stays exactly constant.
+  - `ROW_GAIN_NO_CWD` (default 1): no CWD on those matrices while their row gains are active, i.e. from step 1000 on q, k, v, o, fc only mlp.proj keeps CWD; with `ROW_GAIN_FIXED=1` every row length stays exactly constant. `ROW_GAIN_NO_CWD=0` is the 2665 record.
   - `ROW_GAIN_LR` = a > 0 (default 0.02): step 8 is purely angular per row (r*_i = ‖W_i‖), then each row norm takes its own Adam step: g_i = ⟨∇W_i, W_i/‖W_i‖⟩ (raw gradient), Adam(β = 0.9, 0.95, bias-corrected), W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i). CWD still follows.
 - SOAP variants (env, defaults = rec-46; scope `SOAP_*_SCOPE` = all | vo):
   - `SOAP_SINK=cur|ema`: step 2's P/√V is replaced by √r_i·P_ij·√c_j, with r, c the Sinkhorn scalings (10 iterations) that give r_i B_ij c_j uniform row and column marginals; B = P² (cur, as SinkSOAP #26) or B = V (ema, a factored second moment).

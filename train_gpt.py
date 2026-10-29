@@ -209,7 +209,7 @@ ROW_GAIN_END = int(os.environ.get("ROW_GAIN_END", 0))   # Muon step at which the
 ROW_GAIN_FIXED = os.environ.get("ROW_GAIN_FIXED", "0") == "1"
 # ROW_GAIN_NO_CWD=1: no cautious weight decay on the matrices while their row gains are active (with ROW_GAIN_FIXED=1:
 # row lengths stay exactly constant).
-ROW_GAIN_NO_CWD = os.environ.get("ROW_GAIN_NO_CWD", "0") == "1"
+ROW_GAIN_NO_CWD = os.environ.get("ROW_GAIN_NO_CWD", "1") == "1"   # default on (nocwd, 8 seeds); 0 = the 2665 record
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
