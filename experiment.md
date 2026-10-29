@@ -646,3 +646,5 @@ Commit `10ef1aa`; forks from step 50 of `ckpt-best`, seeds 0–2, `ENA_GROUP=nor
 - Defaults on `main` now: `ENA_GROUP=norm ENA_G_MULT=2.5`, `record.env` `STOP_STEP=2640`. Not pushed to the leaderboard.
 
 **Leaderboard submission** (user-authorized 2026-10-29): seed 0 (fixed in advance), `STOP_STEP=2640`, commit `e893e4d` (defaults), `OPTIM_DYNAMICS=0`, W&B `cerulean-labs/midterm-nanogpt` run `normjump25-2640-s0` ([2x69kegk](https://flock.cerulean.works/cerulean-labs/midterm-nanogpt/runs/2x69kegk)), Slurm 638170. Summary: `total_train_steps` 2640, `val_loss` (val_ema) 3.27866, raw val 3.28571, peak memory 34.8 GiB, no dynamics keys.
+
+**2.5× fork and path-efficiency runs** (commit `f85c3d0`): `ena-x25` (forks from step 50, seeds 0–2) −0.00099 ± 0.00017 (+17 steps), the best jump size. `patheff-rec2640-s0` (2640-record settings, `PATH_EFF=1`, to 2700): only the norm gains change against rec-46 (eff200/eff50 1.02 / 0.94 / 0.94 in 500–1000 / 1000–1500 / 1500–2000 vs 0.95 / 0.77 / 0.54). Write-up with all tables: `NORM_JUMP.md`.

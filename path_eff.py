@@ -10,8 +10,12 @@ Per parameter group and training phase (windows grouped by their end step), the 
             (bounce), > 1: steps persist (drift)
   t_eff200  median over the group's tensors of the per-tensor eff_200 (the group value mixes tensors)
 
+--table prints one Markdown table per run instead: rows = parameter groups, columns = phases, cells
+"eff50 / eff200 (eff200/eff50)".
+
 Example
   python path_eff.py patheff-s0 patheff-s1 patheff-rec46-s0
+  python path_eff.py --table patheff-rec46-s0 patheff-rec2640-s0
 """
 
 from __future__ import annotations
@@ -40,10 +44,26 @@ def records(run: str) -> list[dict]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("runs", nargs="+")
+    ap.add_argument("--table", action="store_true")
     args = ap.parse_args()
     for run in args.runs:
         R = records(run)
         groups = [g for g in ORDER if g in R[0]["groups"]] + sorted(set(R[0]["groups"]) - set(ORDER))
+        if args.table:
+            print(f"\n**{run}**: eff50 / eff200 (eff200/eff50)\n")
+            print("| group | " + " | ".join(f"{lo}–{min(hi, 2700)}" for lo, hi in PHASES) + " |")
+            print("|---|" + "---|" * len(PHASES))
+            for g in groups:
+                cells = []
+                for lo, hi in PHASES:
+                    v = {k: [r["groups"][g]["eff"] for r in R if r["K"] == k and lo < r["step"] <= hi] for k in (50, 200)}
+                    if v[50] and v[200]:
+                        e50, e200 = st.median(v[50]), st.median(v[200])
+                        cells.append(f"{e50:.2f} / {e200:.2f} ({e200 / max(e50, 1e-30):.2f})")
+                    else:
+                        cells.append("–")
+                print(f"| {g} | " + " | ".join(cells) + " |")
+            continue
         print(f"\n######## {run}")
         print(f"  {'group':13} {'phase':>10} {'eff50':>7} {'eff200':>7} {'200/50':>7} {'drift50':>8} {'drift200':>9} {'t_eff200':>9}")
         for g in groups:
