@@ -621,3 +621,26 @@ Commit `10ef1aa`; forks from step 50 of `ckpt-best`, seeds 0–2, `ENA_GROUP=nor
 - *The two signals disagree after ~700 steps.* The slope of the raw gradient along the jump says overshoot (shrink); Adam's own step keeps moving along the jump (grow). The outcomes side with the update signal: 2× after step 1000 alone is +6 steps (`ena-x2late`).
 - *Neither signal finds an interior optimum.* `slope` and `slope_z` run to the floor, `update_z` to the cap; the result is set by the cap and floor. `update_z` with cap 3 behaves exactly like fixed 3× (same path efficiency of the norm gains, eff200 0.52 / 0.45 / 0.39 in 500–1000 / 1000–1500 / 1500–2000). With 4× unstable (`ena-x4`), a growing rule needs a cap at ~3×.
 - Logging fix (`_zscore`): the first two samples have no spread and logged an arbitrary huge z; they now return 0. The multiplier was clipped either way, so the runs are unaffected.
+
+## New record: 2640 steps (norm-gain jump 2.5×) (2026-10-29)
+
+**Setting.** Current best (row gains + Tail-EMA 2100/200 + `ROW_GAIN_NO_CWD=1`) plus `ENA_GROUP=norm ENA_G_MULT=2.5`: the EMA-Nesterov jump on the RMSNorm gains is 2.5× the global one (β = 0.75·η_t/η₀ over steps 300–1950); every other parameter keeps the rec-46 jump. Commit `f24f8a8`.
+
+**8-seed screen** (`norm25`, `norm3`, seeds 0–7, stop 2690, dense val 2650–2690): both pass the Track 3 rule already at 2650 (0.00484 / 0.00453). Paired vs `nocwd` at 2690: 2.5× −0.00076 ± 0.00042 (7 of 8 lower), 3× −0.00064 ± 0.00031 (6 of 8). 2.5× chosen (better mean, further from the unstable 4×).
+
+**Validation** (`norm25d`, seeds 0–15, `DENSE_VAL=2600:2690:5`, stop 2690; fresh runs, not reuses of `norm25`):
+
+| step | mean val_ema n=8 | rule n=8 | mean val_ema n=16 | rule n=16 |
+|---|---|---|---|---|
+| 2630 | 3.27920 | 0.00225 | 3.27957 | 0.00171 |
+| 2635 | 3.27885 | 0.00325 | 3.27922 | 0.00313 |
+| **2640** | 3.27852 | **0.00419** | 3.27888 | **0.00447** |
+| 2645 | 3.27818 | 0.00516 | 3.27854 | 0.00583 |
+| 2650 | 3.27792 | 0.00588 | 3.27828 | 0.00687 |
+| 2665 | 3.27698 | 0.00854 | 3.27734 | 0.01064 |
+| 2690 | 3.27557 | 0.01254 | 3.27593 | 0.01629 |
+
+- **Settled step: 2640**, the earliest step that passes with both n = 8 and n = 16 (2635 fails both). Seed SD at 2690: 0.0010.
+- The 16-seed mean at 2650 (3.27828) reproduces the independent 8-seed `norm25` screen (3.27829).
+- Versus the 2665 record: −25 steps, from no CWD on the gained matrices plus the 2.5× norm-gain jump.
+- Defaults on `main` now: `ENA_GROUP=norm ENA_G_MULT=2.5`, `record.env` `STOP_STEP=2640`. Not pushed to the leaderboard.

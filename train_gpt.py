@@ -210,8 +210,8 @@ ENA_REST = int(os.environ.get("ENA_REST", 0))   # EMA-Nesterov lookahead end ste
 #   ENA_G_LS=lam   d = exponentially weighted least-squares velocity of the group's weights (weights lam^age; two
 #                  extra copies of the group) instead of the EMA of displacements
 # s_t, sbar, ENA_G_MULT, beta_g and |d| are logged per active step to <log>.ena.jsonl.
-ENA_GROUP = os.environ.get("ENA_GROUP", "")
-ENA_G_MULT = float(os.environ.get("ENA_G_MULT", 1.0))
+ENA_GROUP = os.environ.get("ENA_GROUP", "norm")   # default: the 2640 record (norm gains, 2.5x)
+ENA_G_MULT = float(os.environ.get("ENA_G_MULT", 2.5))
 ENA_G_START = int(os.environ.get("ENA_G_START", 300))
 ENA_G_END = int(os.environ.get("ENA_G_END", 0))   # 0 = the global end
 ENA_G_AUTO = float(os.environ.get("ENA_G_AUTO", 0.0))

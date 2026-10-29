@@ -1,6 +1,6 @@
 # Optimizer step (math)
 
-This is the update that `train_gpt.py` at this commit performs on each training step. The defaults are the current record (rec-46 + row gains + Tail-EMA 2100/200, 2665 steps) plus no CWD on the row-gain matrices (`ROW_GAIN_NO_CWD=1`, 8 seeds, not yet a validated record; `ROW_GAIN_NO_CWD=0` gives the 2665 record); to get rec-46 set `NEWTON_MUON=0 ROW_GAIN_LR=0 TAILEMA_START=2400 TAILEMA_TAU=150 STOP_STEP=2690` or run the `rec-46` tag. Keep this file in sync with the code: any commit that changes the optimizer updates this file in the same commit.
+This is the update that `train_gpt.py` at this commit performs on each training step. The defaults are the current record, 2640 steps: rec-46 + row gains + Tail-EMA 2100/200 + no CWD on the row-gain matrices (`ROW_GAIN_NO_CWD=1`) + a 2.5× EMA-Nesterov jump on the norm gains (`ENA_GROUP=norm ENA_G_MULT=2.5`). The 2665 record is `ROW_GAIN_NO_CWD=0 ENA_GROUP= STOP_STEP=2665`; to get rec-46 set `NEWTON_MUON=0 ROW_GAIN_LR=0 TAILEMA_START=2400 TAILEMA_TAU=150 STOP_STEP=2690` or run the `rec-46` tag. Keep this file in sync with the code: any commit that changes the optimizer updates this file in the same commit.
 
 Notation: t is the loop step; g = ∇L, the gradient summed over ranks. W is a parameter and η_t its learning rate. ‖X‖_S4 = ‖XᵀX‖_F^½ is the Schatten-4 norm, which is what `gram_frobenius_norm_estimate` computes. ⊙ is elementwise multiplication.
 
@@ -12,7 +12,7 @@ Notation: t is the loop step; g = ∇L, the gradient summed over ranks. W is a p
   - rises linearly 0.85 → 0.95 over steps 0–300;
   - holds at 0.95;
   - falls linearly 0.95 → 0.85 over steps 2700–2900.
-- Training stops at `STOP_STEP` = 2665 (`record.env`; rec-46 used 2690), so at the last step η is still about 6 % of η₀ for Muon, and the μ cooldown never starts.
+- Training stops at `STOP_STEP` = 2640 (`record.env`; rec-46 used 2690), so at the last step η is still about 7 % of η₀ for Muon, and the μ cooldown never starts.
 
 ## 1. Outer wrapper: EMA-Nesterov (all parameters)
 
@@ -27,8 +27,8 @@ The wrapper keeps a buffer b and the previous weights W_prev for every parameter
   - b ← 0.99·b + 0.01·(W′ − W_prev)
   - W_prev ← W′
 
-- **Per-group jump (env, default off):** `ENA_GROUP` = norm | embed | head | bias | hidden gives one group its own jump W ← W + β_g·d, all others keep the one above.
-  - β_g = `ENA_G_MULT`·β_t (default 1), active for `ENA_G_START` < t + 1 and t < `ENA_G_END` (defaults 300 and the global end).
+- **Per-group jump (env; default `ENA_GROUP=norm`, `ENA_G_MULT=2.5`, the 2640 record; `ENA_GROUP=` turns it off):** `ENA_GROUP` = norm | embed | head | bias | hidden gives one group its own jump W ← W + β_g·d, all others keep the one above.
+  - β_g = `ENA_G_MULT`·β_t (default 2.5), active for `ENA_G_START` < t + 1 and t < `ENA_G_END` (defaults 300 and the global end).
   - `ENA_G_AUTO`=κ: s_t = ⟨g_t, d⟩ with g_t the gradient at the jumped-to point; s̄ ← 0.9·s̄ + 0.1·sign(s_t); `ENA_G_MULT` ← clip(`ENA_G_MULT`·e^(−κ·s̄), 0, `ENA_G_MAX`) on every active step.
   - `ENA_G_SWITCH`=t₁, `ENA_G_MULT_AFTER`=m₂: the multiplier is `ENA_G_MULT` before step t₁ and m₂ from t₁ on.
   - `ENA_G_SIGNAL` (with `ENA_G_AUTO`=κ): `slope` (above, one batch at a time); `slope_z`: z = mean(s)/√(var(s)/50) from EMAs (0.98) of s and s², `ENA_G_MULT` ← `ENA_G_MULT`·e^(−κ·clip(z/2, −1, 1)); `update_z`: the same z-score of c_t = ⟨u_t, d⟩ with u_t the inner optimizer's own step on the group, `ENA_G_MULT` ← `ENA_G_MULT`·e^(+κ·clip(z/2, −1, 1)) (the optimizer moving on along the jump grows it, moving back shrinks it). `ENA_G_MIN` is the lower clip (default 0).
