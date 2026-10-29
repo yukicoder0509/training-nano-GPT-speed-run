@@ -135,6 +135,11 @@ PATH_EFF = os.environ.get("PATH_EFF", "0") == "1"
 # TRAJ_REC=1 (diagnostics only, rank 0): every step, theta / lookahead jump / gradient of the norm gains and biases
 # (float32, optim_dynamics.TrajRecorder) -> TRAJ_DIR (default CKPT_DIR/traj), for offline river forecasting.
 TRAJ_REC = os.environ.get("TRAJ_REC", "0") == "1"
+# MSM="alpha,beta3[,warm]": multi-scale momentum on the 1-D Adam (AdEMAMix-style), numerator m + alpha_t * m_slow with
+# m_slow an EMA (beta3) of the gradient and alpha_t = alpha * min(1, steps / warm) (warm default 500, counted from the
+# first step the knob is active, so also from a fork). MSM_GROUPS = gains | bias | all (default gains).
+MSM = os.environ.get("MSM", "")
+MSM_GROUPS = os.environ.get("MSM_GROUPS", "gains")
 SNAP_STEPS = {int(x) for x in os.environ.get("SNAP_STEPS", "").split(",") if x}
 ROW_TRANSPLANT = os.environ.get("ROW_TRANSPLANT", "")
 RADIAL_OUTWARD_SCALE = 0.5
@@ -1034,7 +1039,16 @@ class Adam(torch.optim.Optimizer):
                 exp_avg_sq = state["exp_avg_sq"]
                 exp_avg.lerp_(grad, 1 - beta1)
                 exp_avg_sq.lerp_(grad.float().square(), 1 - beta2)
-                adam_dir = exp_avg.float() / (exp_avg_sq.sqrt() + eps)
+                num = exp_avg.float()
+                if group.get("msm"):
+                    # multi-scale momentum (AdEMAMix-style): + alpha_t * slow EMA of the gradient
+                    alpha, beta3, warm = group["msm"]
+                    state["step"] = state.get("step", 0) + 1
+                    if "exp_avg_slow" not in state:
+                        state["exp_avg_slow"] = torch.zeros_like(p, dtype=torch.float32)
+                    state["exp_avg_slow"].lerp_(grad.float(), 1 - beta3)
+                    num = num + alpha * min(1.0, state["step"] / max(warm, 1)) * state["exp_avg_slow"]
+                adam_dir = num / (exp_avg_sq.sqrt() + eps)
                 p.add_(adam_dir.to(p.dtype), alpha=-group["lr"])
 
 
@@ -1274,7 +1288,7 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
        f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN}")
-print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT}")
+print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT} msm={MSM}/{MSM_GROUPS}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
 print0(f"Using target_uw={TARGET_UW}")
@@ -1453,6 +1467,10 @@ optimizer1.param_groups[0]["power_c"] = ADAM_EMBED_POWER_C
 optimizer1.param_groups[1]["power_c"] = ADAM_PROJ_POWER_C
 for group in optimizer3.param_groups:
     group["power_c"] = ADAM_OTHER_POWER_C * AUX_LR_MULT
+if MSM:
+    _msm = [float(x) for x in MSM.split(",")]
+    for i in dict(gains=[0], bias=[1, 2], all=[0, 1, 2])[MSM_GROUPS]:
+        optimizer3.param_groups[i]["msm"] = (_msm[0], _msm[1], _msm[2] if len(_msm) > 2 else 500)
 for group in optimizer2.param_groups:
     group["power_c"] = MUON_POWER_C * group.get("lr_mult", 1.0)
 
@@ -1518,7 +1536,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
-             "V_GATE", "VO_DENOM_POWER", "VO_HEAD")
+             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
