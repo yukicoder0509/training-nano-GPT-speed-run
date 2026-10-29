@@ -495,3 +495,29 @@ Track 3 rule (3.28 − mean)·√n ≥ 0.004, n = 8 (`fork_compare.py --full can
 **Leaderboard submission** (user-authorized 2026-10-29): seed 0 (fixed in advance), `STOP_STEP=2665`, commit `b7ae8c3`, candidate env above, `OPTIM_DYNAMICS=0`, W&B `cerulean-labs/midterm-nanogpt` run `rowgain-tailema2100-2665-s0` ([wcs41r46](https://flock.cerulean.works/cerulean-labs/midterm-nanogpt/runs/wcs41r46)), Slurm 633829. Summary: `total_train_steps` 2665, `val_loss` (val_ema) 3.27759, raw val 3.28348, peak memory 34.8 GiB, no dynamics keys.
 
 **Defaults on `main` = this record** (2026-10-29): `NEWTON_MUON=0 ROW_GAIN_LR=0.02 ROW_GAIN_SCOPE=q,k,v,o,fc ROW_GAIN_START=1000 TAILEMA_START=2100 TAILEMA_TAU=200`, and `record.env` sets `STOP_STEP=2665`. Commands above that rely on "defaults = rec-46" now need `NEWTON_MUON=0 ROW_GAIN_LR=0 TAILEMA_START=2400 TAILEMA_TAU=150 STOP_STEP=2690` (or the `rec-46` tag).
+
+## Anatomy of the row-gain effect (2026-10-29)
+
+**Setup.** Commit `bccead1` (transplants `15a1118`). Forks from `ckpt-rec46` seeds 0–1 at step 1000 (`anat-Gon2000`: at 2000), all with `TAILEMA_START=2100 TAILEMA_TAU=200`, stop 2690, `ANATOMY=1 VAL_EVERY=50 SNAP_STEPS=1500,2000,2690`. Analysis: `python anatomy.py --control anat-C --variants anat-G,anat-G0,anat-Goff2000,anat-Gon2000,anat-Gproj --seeds 0,1` and `--transplant tp-CG` / `tp-CGproj` / `tp-CC2`.
+
+| fork | setting | Δ val_ema@2690 vs C, s0 / s1 |
+|---|---|---|
+| `anat-C` | rec-46 (`ROW_GAIN_LR=0`) | 3.27817 / 3.27888 |
+| `anat-G` | row gains q,k,v,o,fc from 1000 | −0.00057 / −0.00088 |
+| `anat-G0` | `ROW_GAIN_FIXED=1`: direction-only step per row, lengths moved only by CWD | +0.00219 / +0.00201 |
+| `anat-Goff2000` | gains 1000→2000, then the rec-46 pin | −0.00035 / −0.00077 |
+| `anat-Gon2000` | rec-46 until 2000, gains from 2000 | −0.00017 / −0.00009 |
+| `anat-Gproj` | gains also on mlp.proj | −0.00023 / −0.00049 |
+
+**Findings** (means of seeds 0–1; per-type tables in the `anatomy.py` output):
+1. *Not a per-row learning-rate effect.* RowFloor lifts 94–100 % of rows to u/w = 0.3825 in every run, and the angle a row turns per unit lr is 0.390 in every run and type (q/k/v/o/fc/proj, C/G/G0). Row gains do not change how far rows rotate.
+2. *Lengths have to move, and row gains move them on their own gradient.* With lengths left to CWD alone (G0), matrices end 28–39 % smaller than in C (q,k,v,o,fc; mlp.proj unchanged), layer-0 attention/MLP output budgets drop by 25–45 %, and the loss is 30 steps worse. Row gains: per-step |Δlog r| 3–6× larger than C; length deviations from their 201-step trend decay faster (lifetime τ_d 38 → 24 steps over 1000–1500, 31 → 22 over 2000–2690; G0: 45); corr(γ_t, d_t), the restoring push on a row longer than its trend, rises 3–4× (q/k/v/o); end state: q,k,v,o matrices 10–37 % larger than C, fc 5 % smaller, row-norm CV within a matrix 25–65 % larger.
+3. *Autocorrelation of the radial gradient γ barely changes.* γ is anti-persistent in every run, including G0: lag-1 autocorrelation −0.4 to −0.6 (1000–1500) and −0.07 to −0.23 (2000–2690), variance ratio VR(200) 0.01–0.2. G lowers VR(50/200) by 0–40 % in q/k/v and |t| by 25–45 %. So the earlier |t| statistic mostly reflected this generic anti-persistence; the length dynamics (τ_d, corr(γ,d), |Δlog r|) are where the runs differ.
+4. *Built during 1000–2000 and kept.* Gains switched off at 2000 keep ~75 % of the 2690 advantage; gains switched on at 2000 get ~15 %. The advantage appears around step 2150 in both seeds. Right after switching off (2050), Goff2000 is 0.0006–0.0007 better than G in both seeds, i.e. while active the gains also add some length jitter that costs loss at the moment (consistent with the longer Tail-EMA window helping on top).
+5. *Not a portable length profile.* Two control forks from the same checkpoint already diverge to row cosines 0.82–0.89, and transplanting their row lengths costs only +0.002 (matrix norms: ~0). Transplanting between C and G costs +0.28 to +0.51 (row) and +0.14 to +0.21 (matrix norm only), in both directions: G's lengths (log-ratio SD 0.06–0.17 per row vs 0.02 between controls) are co-adapted with its own directions. The transplant cannot attribute the gain to the length configuration alone.
+6. *Function.* G: layer-0 MLP output / residual +12–14 %, last-layer attention +27–58 %, last-layer MLP −12–16 %, fc units fire slightly more often (+3–6 % relative). Gproj: MLP outputs of layers 0 and 3–4 grow 25–50 % and mid-layer attention shrinks ~15 %: mlp.proj gains let the MLP crowd attention out of the residual stream, which fits Gproj being worse than G.
+7. *Where the loss improves.* At positions ≥ 128 in the context (≥ 90 % of the gain in both seeds) and on the rarest 40 % of target tokens (55–100 %). G0 loses at the same long positions.
+
+**Reading.** Row gains help through the length dynamics, not the rotation: each row's length follows its own (anti-persistent, low-SNR) radial gradient through Adam, which lets q/k/v/o grow and spread across rows while length errors are damped faster. The gain accumulates in 1000–2000 into a different, co-adapted solution that uses long context better. Removing the radial update without a replacement (G0) shrinks the weights under CWD and costs 30 steps, so rec-46's radial part was doing real work.
+
+**Metrics changed.** Removed the per-token "control-loss decile" split (regression to the mean; identical for every variant). Transplant results are printed as absolute loss changes, with a control-vs-control pair as the baseline.

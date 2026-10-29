@@ -22,13 +22,13 @@ Over steps windows given by --windows (default 1000:1500,1500:2000,2000:2690).
 
 Function (val steps, 16 val sequences): attention / MLP output RMS relative to the residual stream per layer, fc unit
 firing rate, dead units (firing < 0.1 %). Per-token loss (stop step, Tail-EMA readout), variant minus control: mean
-difference per target-token frequency quintile, context position bucket and control-loss decile.
+difference per target-token frequency quintile and context position bucket. (A control-loss decile split was removed:
+it is dominated by regression to the mean and looked the same for every variant, including the one that is worse.)
 Validation timeline: val_ema of each run at every val step, variant minus control.
 
 Transplants (--transplant <prefix>): reads the ROW_TRANSPLANT result of jobs logs/<prefix>-s<seed>-<jobid>.out (A =
-control, B = variant). gap = L(B) - L(A). "A<-B" = A's directions with B's lengths: the share of the gap it recovers,
-(L(A<-B) - L(A)) / gap. "B<-A" = B's directions with A's lengths: the share of B's advantage it loses,
-(L(B<-A) - L(B)) / -gap. Row mode transplants each row's length, matrix mode only each matrix's Frobenius norm.
+control, B = variant). "A<-B" = A's directions with B's lengths, shown as L(A<-B) - L(A); "B<-A" = B's directions
+with A's lengths, L(B<-A) - L(B) (loss change; compare with the gap L(B) - L(A) and with a control-vs-control pair). Row mode transplants each row's length, matrix mode only each matrix's Frobenius norm.
 Also the mean row cosine between A and B and the SD of their log row-length ratio, per type.
 
 Example
@@ -172,9 +172,6 @@ def token_diff(C: dict, V: dict) -> dict:
     edges = [0, 16, 128, 512, tgt.size(1)]
     out["position (0-15,16-127,128-511,512+)"] = [(diff[(pos >= l) & (pos < h)].sum() / n).item()
                                                   for l, h in zip(edges, edges[1:])]
-    qa = torch.quantile(a.flatten()[:: max(1, n // 1_000_000)], torch.linspace(0.1, 0.9, 9, dtype=torch.float64))
-    lb = torch.bucketize(a, qa)
-    out["control-loss decile (easy->hard)"] = [(diff[lb == i].sum() / n).item() for i in range(10)]
     return out
 
 
@@ -198,19 +195,17 @@ def transplant(prefix: str, seed: int):
         a, b = base[("A", "A")], base[("B", "B")]
         print(f"\n  step {step} {ro}: A {a['val']:.5f} / {a['heldout']:.5f}   B {b['val']:.5f} / {b['heldout']:.5f}   "
               f"gap {b['val'] - a['val']:+.5f} / {b['heldout'] - a['heldout']:+.5f}   (val / heldout)")
-        print(f"    {'scope':>7} {'mode':>6} | {'A<-B val':>9} {'ho':>6} | {'B<-A val':>9} {'ho':>6}")
+        print(f"    {'scope':>7} {'mode':>6} | {'A<-B val':>9} {'ho':>8} | {'B<-A val':>9} {'ho':>8}")
         for sc in ("qkvofc", "all", "v", "o", "fc", "qk", "proj"):
             for mode in ("row", "matrix"):
                 cell = []
-                for (dd, ll), sign in ((("A", "B"), 1), (("B", "A"), -1)):
+                for dd, ll in (("A", "B"), ("B", "A")):
                     r = next((x for x in rr if x["D"] == dd and x["L"] == ll and x["scope"] == sc and x["mode"] == mode), None)
                     if r is None:
                         cell.append(" " * 16)
                         continue
                     ref = a if dd == "A" else b
-                    fr = [(r[key] - ref[key]) / (sign * (b[key] - a[key])) if abs(b[key] - a[key]) > 1e-7 else float("nan")
-                          for key in ("val", "heldout")]
-                    cell.append(f"{fr[0]:9.2f} {fr[1]:6.2f}")
+                    cell.append(f"{r['val'] - ref['val']:+9.5f} {r['heldout'] - ref['heldout']:+8.5f}")
                 print(f"    {sc:>7} {mode:>6} | {cell[0]} | {cell[1]}")
     print("\n  row cosine A vs B (mean over rows), SD of log(|B_i|/|A_i|), per type:")
     for step in sorted({c["step"] for c in d["cosines"]}):
