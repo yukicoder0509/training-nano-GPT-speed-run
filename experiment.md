@@ -703,3 +703,34 @@ Reject: a slow gradient EMA in the 1-D Adam hurts, matching the offline result t
 | `soda-hidsoft` block matrices, c 1, k₀ 1000 | +0.00177 ± 0.00041 | −30 |
 
 Reject. The loss falls monotonically with the anchor strength (k₀ 1000 still −30 steps), so the best anchor here is none. With this tuned LR schedule and the radius pins, anchoring discounts the early progress (W − W₀ = Σ (j+2)/(n+1)·U_j), which a 2700-step run cannot afford; the paper retunes the LR for SODA, and we would have to retune the whole schedule for a change whose dose response points the wrong way.
+
+## BBP noise filtering of Muon's step (2026-10-30)
+
+**Diagnostic** (commits `d330240`, `698dea6`; `SNR_DIAG=100`, record settings, seeds 0–2 `snr-s<seed>`, val_ema@2690 3.27620 / 3.27534 / 3.27500, checkpoints at 1500). Every 100 steps, per hidden matrix: the singular values of Muon's input Y (the Nesterov momentum, and its SOAP form, which is what Newton-Schulz orthogonalizes), and its noise from the spread of the 8 ranks' local gradients (eᵣ = gᵣ − G/8, scaled by f(μ) = (1−μ²)² + μ⁴(1−μ)/(1+μ) for the Nesterov blend of an EMA, mapped through the SOAP map for the SOAP form). Per-rank SNR from the BBP inversion, SNR = ŝ²/(τ²√(mn)) (1 = the BBP detection threshold, 0 inside the noise bulk); `snr_bbp.py`.
+
+- The noise is strongly anisotropic: the median singular value is 0.2–0.5× (momentum) and 0.5–0.8× (SOAP form) what iid noise of the measured strength gives, so the plain iid BBP edge is wrong. After Kronecker whitening (Yw = Ā^{−1/2} Y B̄^{−1/2}, Ā, B̄ from the rank spread) the median matches the iid prediction for q, k, v, o (ratio 0.85–1.0) and sits above it for fc, proj (1.1–1.4: the MLP bulk carries signal). Fractions below are whitened.
+- Fraction of singular values of the SOAP form with SNR > 4 (mean of 3 seeds; plots in the scratchpad `snr_white_soap.png`):
+
+| step | q | k | v | o | fc | proj |
+|---|---|---|---|---|---|---|
+| 100 | 0.023 | 0.033 | 0.074 | 0.068 | 0.288 | 0.271 |
+| 300 | 0.015 | 0.016 | 0.071 | 0.065 | 0.234 | 0.236 |
+| 700 | 0.000 | 0.000 | 0.005 | 0.005 | 0.144 | 0.149 |
+| 1500 | 0.000 | 0.001 | 0.004 | 0.002 | 0.158 | 0.162 |
+| 2100 | 0.000 | 0.000 | 0.001 | 0.000 | 0.122 | 0.125 |
+| 2600 | 0.000 | 0.000 | 0.001 | 0.000 | 0.132 | 0.136 |
+
+  Above the BBP threshold at all (SNR > 1) mid-training: q, k, v, o 3–6%, fc, proj 26–30%. The momentum before SOAP: q, k 5–9%, v, o 5–13%, fc, proj 26–36% with SNR > 4. Reading: many noise directions throughout training, not only late, so the SNR-weighted step looked worth a test.
+
+**SNR-weighted Muon step** (commits `c5b92c5`, `8c3d714`; `SNRW`=c, `SNRW_FLOOR`; O = Σ wᵢuᵢvᵢᵀ over the exact SVD of the NS input, wᵢ = max(SNRᵢ/(SNRᵢ+c), floor), SNRᵢ from a Kronecker noise model refreshed every 10 steps, see OPTIMIZER.md §2.5; forks from step 1500 of `snr`, control `snr-ctrl`, noise SD 0.000007; `python fork_compare.py <v> --parent snr --control snr-ctrl --ks 1500`):
+
+| Variant | Δ val_ema@2690 | Steps | mean w at 2000 (fc / q / o) |
+|---|---|---|---|
+| `snrw-svd` exact SVD, w = 1 (control) | −0.00004 ± 0.00002 | +0.6 | 1 |
+| `snrw-c001` c 0.01 | +0.03300 ± 0.00061 | −564 | 0.15 / 0.07 / 0.02 |
+| `snrw-c01` c 0.1 | +0.04228 ± 0.00134 | −723 | 0.06 / 0.05 / 0.01 |
+| `snrw-c1` c 1 | +0.05033 ± 0.00055 | −860 | 0.03 / 0.02 / 0.01 |
+| `snrw-f05` c 0.1, floor 0.5 | +0.00025 ± 0.00001 | −4.4 | ≥ 0.5 |
+| `snrw-f08` c 0.1, floor 0.8 | +0.00002 ± 0.00002 | −0.3 | ≥ 0.8 |
+
+Reject. The weights are nearly binary (directions inside the bulk get SNR 0), and the loss falls monotonically with how much the "noise" directions are down-weighted: dropping them costs 560–860 steps, halving them 4 steps, 0.8× nothing. Exact SVD in place of NS₁₂ is neutral. The directions that are undetectable in one step's momentum still carry progress: their signal is consistent across steps and adds up in the weights while their noise random-walks, which a per-step SNR cannot see. Muon's equal weighting is right here (with SOAP in front of it).
