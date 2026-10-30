@@ -841,3 +841,18 @@ Gain LR at β 0.99/0.95: 0.01 → −0.2 (8), 0.02 → +10.9, 0.04 → +9.1 (8).
 - β 0.99/0.99 satisfies the bound (0.99 < √0.99), runs all 8 seeds, and gives −0.00042 ± 0.00042 at 2690 and a first pass at 2635 instead of 2640. Forks: +8.7 ± 0.3.
 - The paired full-run differences have SD ≈ 0.0009–0.0012 per seed (trajectories decorrelate long before step 1000), so n = 8 resolves only effects ≳ 0.0008 (≈ 12 steps). The fork estimates (+9–11 steps, SE ≤ 1) are the precise ones; the full runs only rule out a large loss and check stability.
 - Next: `rgb9999` seeds 8–15 for the 16-seed rule (as for the 2640 record).
+
+**16-seed validation of β 0.99/0.99** (`rgb9999`, seeds 0–15, commits `f18b1f0` (0–7) / `0d14fed` (8–15), the same code path; vs `norm25d` seeds 0–15). All 16 runs finished.
+
+Track 3 rule (3.28 − mean)·√n:
+
+| step | default n=8 | default n=16 | β 0.99/0.99 n=8 | β 0.99/0.99 n=16 |
+|---|---|---|---|---|
+| 2625 | 0.0013 | 0.0004 | 0.0026 | 0.0026 |
+| 2630 | 0.0023 | 0.0017 | 0.0035 | 0.0039 |
+| **2635** | 0.0033 | 0.0031 | **0.0045** | **0.0053** |
+| 2640 | 0.0042 | 0.0045 | 0.0055 | 0.0066 |
+
+- Earliest step passing with both n = 8 and n = 16: **2635** (default: 2640). 2630 fails both (0.0035 / 0.0039).
+- Paired with the default, n = 16: −0.00051 ± 0.00030 at 2690 (≈ +7.6 steps, 1.7 SE; 9 of 16 seeds lower), −0.00054 ± 0.00030 at 2640. Mean val_ema@2640 3.27834 vs 3.27888.
+- Consistent with the fork estimate (+8.7 ± 0.3 steps).
