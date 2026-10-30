@@ -248,6 +248,10 @@ ENA_X = os.environ.get("ENA_X", "")
 # seed's init (regenerated, so a fork from a checkpoint anchors to its parent's init). The anchor replaces CWD on the
 # matrices in scope. scope = all | hidden (block matrices) | mlpproj | aux (1-D) | embed | head.
 SODA = os.environ.get("SODA", "")
+# SNR_DIAG=N (diagnostics only): every N steps, per hidden matrix, the singular values of Muon's input (the Nesterov
+# momentum and its SOAP-preconditioned form) and its noise level from the spread of the 8 ranks' local gradients, to
+# <log>.snr/step<k>.pt; snr_bbp.py turns them into BBP-debiased per-rank SNRs.
+SNR_DIAG = int(os.environ.get("SNR_DIAG", "0"))
 ENA_G_MULT_AFTER = float(os.environ.get("ENA_G_MULT_AFTER", 1.0))
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
@@ -847,6 +851,7 @@ class Muon(torch.optim.Optimizer):
         # records, per param it owns, the candidate update directions below (descent convention, W -= lr*u).
         # A new direction idea ("variant") is screened by adding its name here and a self._capture call.
         self.probe_capture, self.probe_dirs = False, {}
+        self.snr_capture, self.snr_dirs = False, {}   # SNR_DIAG: the Nesterov momentum, its SOAP form and SOAP state
         self.probe_dir_names = ["momentum", "soap"] + (["newton"] if newton is not None and NEWTON_MODE != "grad" else []) + ["ns"]
         self.vo = VOVariants(named_params) if VO_VARIANTS else None
         if self.vo is not None:
@@ -875,6 +880,14 @@ class Muon(torch.optim.Optimizer):
     def _capture(self, p, name, u):
         if self.probe_capture:
             self.probe_dirs.setdefault(p, {})[name] = u.detach().float().clone()
+        if self.snr_capture and name in ("momentum", "soap"):
+            d = self.snr_dirs.setdefault(p, {})
+            d[name] = u.detach().float().clone()
+            st = self.state[p]
+            if name == "soap" and st["q_row"] is not None:
+                power = VO_DENOM_POWER if p in self.attn_soap_params and p in self.vo_params else SOAP_DENOM_POWER
+                d["soap_state"] = (st["q_row"].clone(), None if st["q_col"] is None else st["q_col"].clone(),
+                                   st["exp_avg_sq"].clone(), power)
 
     @torch.no_grad()
     def step(self):
@@ -2008,6 +2021,52 @@ if ROW_TRANSPLANT:
     dist.destroy_process_group()
     sys.exit(0)
 
+@torch.no_grad()
+def snr_diag(step, local):
+    """SNR_DIAG: for each hidden matrix, its owner rank gathers the 8 local-gradient deviations g_r - G/W (G the summed
+    gradient Muon sees) and records, for Y = the Nesterov momentum and its SOAP form, the singular values s of Y, the
+    entrywise noise variance tau2 of Y and the noise variance tau2_dir along each singular pair (u_i, v_i). Noise of Y
+    per unit noise of G: f = (1-mu^2)^2 + mu^4 (1-mu)/(1+mu) (Nesterov blend of an EMA, gradient noise iid in time);
+    the SOAP map is applied to the noise samples with the same state and norm rescale."""
+    assert not SOAP_SINK, "SNR_DIAG assumes the plain SOAP denominator"
+    W, rank = dist.get_world_size(), dist.get_rank()
+    mu = optimizer2.param_groups[0]["mu"]
+    f = (1 - mu * mu) ** 2 + mu ** 4 * (1 - mu) / (1 + mu)
+    c = f * W / (W - 1)   # Var(G) = W Var(g_r), Var(g_r) = sum_r dev_r^2 / (W - 1)
+    recs = []
+    for group in optimizer2.param_groups:
+        for i, p in enumerate(group["params"]):
+            owner = i % W
+            dev = local.pop(p) - p.grad.float() / W
+            bufs = [torch.empty_like(dev) for _ in range(W)] if rank == owner else None
+            dist.gather(dev, bufs, dst=owner)
+            if rank != owner:
+                continue
+            caps = optimizer2.snr_dirs.pop(p)
+            E, X = torch.stack(bufs), caps["momentum"]
+            rec = dict(name=pname[p], shape=tuple(p.shape))
+            for key in ("momentum", "soap"):
+                if key == "soap":
+                    if "soap_state" not in caps:
+                        continue
+                    q_row, q_col, eas, power = caps["soap_state"]
+                    denom = eas.clamp_min(1e-16).pow(power)
+                    L = (lambda Z: q_row @ ((q_row.mT @ Z) / denom)) if q_col is None else (
+                        lambda Z: q_row @ ((q_row.mT @ Z @ q_col) / denom) @ q_col.mT)
+                    Ex = L(E) * (gram_frobenius_norm_estimate(X, eps=1e-8) / gram_frobenius_norm_estimate(L(X), eps=1e-8))
+                else:
+                    Ex = E
+                U, S, Vh = torch.linalg.svd(caps[key], full_matrices=False)
+                proj = ((U.mT @ Ex) * Vh).sum(-1)   # (W, k): u_i^T e_r v_i
+                rec[key] = dict(s=S.cpu(), tau2=(c * Ex.square().sum() / X.numel()).item(), tau2_dir=(c * proj.square().sum(0)).cpu())
+            recs.append(rec)
+    out = [None] * W if rank == 0 else None
+    dist.gather_object(recs, out, dst=0)
+    if rank == 0:
+        d = Path(logfile.replace(".txt", ".snr"))
+        d.mkdir(exist_ok=True)
+        torch.save(dict(step=step, mu=mu, f=f, W=W, recs=[r for rs in out for r in rs]), d / f"step{step}.pt")
+
 if SODA:
     _sc, _c, _k0 = SODA.split(":")
     _s_sel = dict(all=lambda n, p: True, hidden=lambda n, p: n.startswith("blocks.") and p.ndim == 2,
@@ -2116,6 +2175,10 @@ for step in range(RESUME_STEP, train_steps + 1):
         train_loss = train_loss + loss.detach()
     if newton_capture:
         newton.disable_capture()
+    snr_on = SNR_DIAG > 0 and step > 0 and step % SNR_DIAG == 0
+    if snr_on:
+        snr_local = {p: p.grad.float().clone() for g in optimizer2.param_groups for p in g["params"]}
+        optimizer2.snr_capture = True
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
@@ -2133,6 +2196,9 @@ for step in range(RESUME_STEP, train_steps + 1):
     H.before_step()
     for opt in optimizers:
         opt.step()
+    if snr_on:
+        optimizer2.snr_capture = False
+        snr_diag(step, snr_local)
     if ANATOMY:
         anat_post_step()
     H.after_step(step, train_loss / inputs.numel())
