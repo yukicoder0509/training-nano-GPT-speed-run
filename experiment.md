@@ -796,3 +796,16 @@ k = 100, efficiency / fwd (mean of 3 seeds):
 - Column gains (one per neuron) hurt too: −4.7 with fc row gains on, −0.9 relative to `nofc` without them. Most of their cost is the redundancy with the fc gains (c_j·s_j² for the same neuron), and they also free the total norm.
 - Decision: mlp.proj keeps the whole-matrix pin. `ROW_GAIN_KEEP_FRO=proj` on its own buys nothing.
 - Side result: fc row gains are worth ~2 steps from a fork at 1000 (`nofc` −1.8).
+
+**Follow-up** (commit `2d0ba22`, same parents, control and scoring):
+
+| Variant | Δ val_ema@2690 (SE) | Steps |
+|---|---|---|
+| gain betas 0.97, 0.95 | −0.00022 (3) | **+3.8** |
+| gain betas 0.95, 0.95 (above) | −0.00021 (7) | +3.5 |
+| gain betas 0.95, 0.9 | −0.00013 (1) | +2.2 |
+| head gains a = 0.002, `HEAD_GAIN_DRIFT=1` | +0.00032 (3) | −5.4 (plain: −5.3) |
+| head gains a = 0.01, `HEAD_GAIN_DRIFT=1` | +0.00031 (7) | −5.4 (plain: −7.7) |
+
+- **Gain betas:** β₁ is what matters. β₁ 0.8–0.9 → ~0, 0.95 → +3.5, 0.97 → +3.8 (all three seeds +3.1 to +4.7). β₂ 0.95 beats 0.9 and 0.99. The gain Adam wants a longer momentum than the 0.9 it was written with. Not yet tested: β₁ ≥ 0.98; a full multi-seed run.
+- **Head gains with the plain-AdamW turning rate:** still −5.4 at both LRs; at a = 0.01 drift matching recovers only ~2 of the ~8 lost steps. So the faster head rotation is not the main cause. The loss comes from the learned lengths themselves: the median row stays near 3.0 instead of growing to 4.16, a few rows run away (max 27–422), and more positions saturate the soft-cap (0.35–0.37 vs 0.31). The head's length is better left to plain AdamW. Head-gain line closed.
