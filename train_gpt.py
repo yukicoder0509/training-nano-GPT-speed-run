@@ -2388,9 +2388,9 @@ for step in range(RESUME_STEP, train_steps + 1):
             snrw_refresh(step, snr_gathered)
         if tsnr_on:
             tsnr_anchor(step, snr_gathered)
+        del snr_gathered
     if TSNR_EVERY:
         tsnr_after_step(step)
-        del snr_gathered
     if ANATOMY:
         anat_post_step()
     H.after_step(step, train_loss / inputs.numel())
