@@ -733,4 +733,21 @@ Reject. The loss falls monotonically with the anchor strength (k₀ 1000 still �
 | `snrw-f05` c 0.1, floor 0.5 | +0.00025 ± 0.00001 | −4.4 | ≥ 0.5 |
 | `snrw-f08` c 0.1, floor 0.8 | +0.00002 ± 0.00002 | −0.3 | ≥ 0.8 |
 
-Reject. The weights are nearly binary (directions inside the bulk get SNR 0), and the loss falls monotonically with how much the "noise" directions are down-weighted: dropping them costs 560–860 steps, halving them 4 steps, 0.8× nothing. Exact SVD in place of NS₁₂ is neutral. The directions that are undetectable in one step's momentum still carry progress: their signal is consistent across steps and adds up in the weights while their noise random-walks, which a per-step SNR cannot see. Muon's equal weighting is right here (with SOAP in front of it).
+Reject. The loss falls monotonically with how much the low-SNR directions are down-weighted: dropping them costs 560–860 steps, halving them 4 steps, 0.8× nothing. Correction (from the TSNR diagnostic below): the per-pair SNR in Y's own basis is not monotone in the singular value. The noise model puts most of the noise variance along Y's top singular pairs, which therefore get SNR ≈ 0 (at steps 100–200 the top pairs of fc have SNR ≤ 0.04 while the median pair has 0.3), so the weighting suppressed the top momentum directions as well, not only the bulk. Exact SVD in place of NS₁₂ is neutral. The directions that are undetectable in one step's momentum still carry progress: their signal is consistent across steps and adds up in the weights while their noise random-walks, which a per-step SNR cannot see. Muon's equal weighting is right here (with SOAP in front of it).
+
+**Temporal persistence of Muon's step directions** (commits `2d50386` … `1db3e6d`, `TSNR_DIAG=100,10,25,50,100`, record settings, seeds 0–2 `tsnr-s<seed>`, val_ema@2690 3.27472 / 3.27717 / 3.27555; `python tsnr.py tsnr-s0 tsnr-s1 tsnr-s2 --k 100 --by snr|rank`). Every 100 steps fix the singular pairs (uᵢ, vᵢ) of Muon's input (SOAP form) and their within-step BBP SNR, then follow the weights for k steps along each pair: dᵢ(t) = uᵢᵀΔW_t vᵢ (jumps included), efficiency |Σdᵢ| / Σ|dᵢ|, and fwd = the net motion continues the anchor step's sign. Null: random orthonormal pairs tracked the same way (momentum makes any direction persist for ~20 steps, so 1/√k is not the null). The first version scored the later gradient along each pair (uᵢᵀG_t vᵢ); it is negative along nearly every pair (the optimizer overshoots along the directions it moves in), so it mixes signal with feedback and is not used.
+
+k = 100, efficiency / fwd (mean of 3 seeds):
+
+| anchors | attn SNR < 0.01 | attn SNR 0.01–0.3 | attn random | mlp SNR < 0.01 | mlp SNR 0.1–1 | mlp random |
+|---|---|---|---|---|---|---|
+| 0–700 | 0.48 / 0.84 | 0.51–0.53 / 0.95–0.97 | 0.32 / 0.54 | 0.78 / 1.00 | 0.52–0.60 / 0.97–0.98 | 0.35 / 0.55 |
+| 700–1400 | 0.72 / 0.96 | 0.79–0.83 / 1.00 | 0.37 / 0.56 | 0.86 / 1.00 | 0.85–0.87 / 1.00 | 0.39 / 0.57 |
+| 1400–2000 | 0.77 / 0.97 | 0.88 / 1.00 | 0.37 / 0.57 | 0.88 / 1.00 | 0.89–0.91 / 1.00 | 0.40 / 0.57 |
+| 2000–2700 | 0.73 / 0.97 | 0.83–0.84 / 1.00 | 0.36 / 0.57 | 0.84 / 1.00 | 0.84–0.85 / 1.00 | 0.39 / 0.57 |
+
+(Share of pairs with within-step SNR < 0.01: attention 62% → 86%, MLP 7% → 28% over training.) By singular-value rank the picture is the same: the bottom half of attention's pairs keeps fwd 0.94 and efficiency 0.65–0.69 from step 700 on; MLP's bottom half 1.00 / 0.85–0.89.
+
+- Directions that look like noise in one step move persistently over 100 steps, almost as much as the high-SNR ones and far above random directions. Only in attention at the first anchors (100–200) are the lowest-SNR pairs close to chance (fwd 0.57 in the 205-step smoke run). Within-step SNR is not a noise label for Muon's step, which matches the SNRW forks (any down-weighting costs steps).
+- Part of the persistence is structural: in the step-1500 checkpoint, W's own component along the momentum's singular pairs, uᵢᵀWvᵢ, is negative for 95–100% of the pairs (q, v, o, fc, proj of block 3; cos(Y, W) only −0.02 to −0.08), so Muon's step grows W's component along every pair, and the radius pin rescales globally. The diagnostic cannot separate that drift from loss-reducing signal.
+- Consequence for the follow-up ideas: per-direction longer averaging for low-SNR directions has little to average away after the first few hundred steps (their motion is already persistent), and a temporal-SNR weighting would rank nearly all pairs alike. SNR line closed.
