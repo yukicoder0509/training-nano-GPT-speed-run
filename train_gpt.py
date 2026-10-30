@@ -283,6 +283,23 @@ ROW_GAIN_FIXED = os.environ.get("ROW_GAIN_FIXED", "0") == "1"
 # ROW_GAIN_NO_CWD=1: no cautious weight decay on the matrices while their row gains are active (with ROW_GAIN_FIXED=1:
 # row lengths stay exactly constant).
 ROW_GAIN_NO_CWD = os.environ.get("ROW_GAIN_NO_CWD", "1") == "1"   # default on (nocwd, 8 seeds); 0 = the 2665 record
+# ROW_GAIN_BETAS="b1,b2": betas of the length Adam (default 0.9,0.95, never tuned). ROW_GAIN_COLS: comma list of matrix
+# types whose COLUMNS (input units) get the gain instead (e.g. proj: one gain per MLP neuron on mlp.proj; the type must not
+# also be in ROW_GAIN_SCOPE). ROW_GAIN_KEEP_FRO: types whose gains only redistribute length between rows/columns (after the
+# gain step the matrix is rescaled to the whole-matrix radius pin's target), i.e. separates reshaping from total scale.
+ROW_GAIN_B1, ROW_GAIN_B2 = (float(x) for x in os.environ.get("ROW_GAIN_BETAS", "0.9,0.95").split(","))
+ROW_GAIN_COLS = set(x for x in os.environ.get("ROW_GAIN_COLS", "").split(",") if x)
+ROW_GAIN_KEEP_FRO = set(x for x in os.environ.get("ROW_GAIN_KEEP_FRO", "").split(",") if x)
+assert not ROW_GAIN_COLS & ROW_GAIN_SCOPE
+# HEAD_GAIN_LR=a > 0: row gains on the LM head (one per vocabulary token). The head's AdamW step becomes direction-only
+# per row (rows rescaled back to their lengths), and each row length moves by its own Adam (HEAD_GAIN_BETAS, default =
+# ROW_GAIN_BETAS) on g_i = <grad_i, W_i/|W_i|>: |W_i| *= 1 - a * (lr/lr0) * adam_i, from HEAD_GAIN_START (the head is
+# zero-initialized, so not from step 0). HEAD_DIAG=1 (diagnostics only): at validation steps, head row-length stats, the
+# soft-cap regime of the pre-cap logits and the prior calibration per token-frequency bucket, to the log ("head step:").
+HEAD_GAIN_LR = float(os.environ.get("HEAD_GAIN_LR", 0))
+HEAD_GAIN_START = int(os.environ.get("HEAD_GAIN_START", 1000))
+HEAD_GAIN_B1, HEAD_GAIN_B2 = (float(x) for x in os.environ.get("HEAD_GAIN_BETAS", f"{ROW_GAIN_B1},{ROW_GAIN_B2}").split(","))
+HEAD_DIAG = os.environ.get("HEAD_DIAG", "0") == "1"
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -859,7 +876,9 @@ class Muon(torch.optim.Optimizer):
         _kind = lambda n: {"attn.q": "q", "attn.k": "k", "attn.v": "v", "attn.proj": "o", "mlp.fc": "fc",
                            "mlp.proj": "proj"}.get(n.split(".", 1)[1].rsplit(".", 1)[0])
         self.no_cwd = set()   # params anchored by SODA instead
-        self.row_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_SCOPE} if ROW_GAIN_LR > 0 or ROW_GAIN_FIXED else set()
+        self.row_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_SCOPE | ROW_GAIN_COLS} if ROW_GAIN_LR > 0 or ROW_GAIN_FIXED else set()
+        self.col_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_COLS} & self.row_gain_params
+        self.keep_fro_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_KEEP_FRO}
         self.step_count = 0
         self.anat = {} if ANATOMY else None   # param -> list of (3, rows) fp16: u/w, RowFloor flag, row-gain step
         # Probe diagnostics (harness.ProbeQuadratic): on probe steps the harness sets probe_capture and this optimizer
@@ -995,9 +1014,13 @@ class Muon(torch.optim.Optimizer):
                     gain = (p in self.row_gain_params and self.step_count >= ROW_GAIN_START
                             and (ROW_GAIN_END == 0 or self.step_count < ROW_GAIN_END))
                     row_ctl = (ROW_PIN or gain) and p.ndim == 2
+                    ax = 0 if gain and p in self.col_gain_params else 1   # the gains' unit: rows (1) or columns (0)
+                    keep_fro = gain and p in self.keep_fro_params
+                    if keep_fro:
+                        target_radius = target_radius_after_update(p, update, group["lr"])
                     if row_ctl:
                         p_before = p.float()
-                        r_rows = p_before.norm(dim=1, keepdim=True).clamp_min(1e-8)
+                        r_rows = p_before.norm(dim=ax, keepdim=True).clamp_min(1e-8)
                         if gain and ROW_GAIN_MODE == "matrix":
                             r_rows = p_before.norm().clamp_min(1e-8).reshape(1, 1)
                         target_rows = r_rows if gain else (
@@ -1014,22 +1037,24 @@ class Muon(torch.optim.Optimizer):
                     p.add_(update, alpha=-group["lr"])
                     if row_ctl:
                         cur = (p.float().norm().reshape(1, 1) if gain and ROW_GAIN_MODE == "matrix"
-                               else p.float().norm(dim=1, keepdim=True))
+                               else p.float().norm(dim=ax, keepdim=True))
                         p.mul_((target_rows / cur.clamp_min(1e-8)).to(p.dtype))
                         if gain and not ROW_GAIN_FIXED:
                             g_row = ((grad.float() * p_before).sum().reshape(1, 1) if ROW_GAIN_MODE == "matrix"
-                                     else (grad.float() * p_before).sum(dim=1, keepdim=True)) / r_rows
+                                     else (grad.float() * p_before).sum(dim=ax, keepdim=True)) / r_rows
                             if "row_m" not in state:
                                 state["row_m"], state["row_v"], state["row_t"] = torch.zeros_like(g_row), torch.zeros_like(g_row), 0
                             state["row_t"] += 1
-                            state["row_m"].lerp_(g_row, 0.1)
-                            state["row_v"].lerp_(g_row.square(), 0.05)
-                            adam = (state["row_m"] / (1 - 0.9 ** state["row_t"])) / (
-                                (state["row_v"] / (1 - 0.95 ** state["row_t"])).sqrt() + 1e-12)
+                            state["row_m"].lerp_(g_row, 1 - ROW_GAIN_B1)
+                            state["row_v"].lerp_(g_row.square(), 1 - ROW_GAIN_B2)
+                            adam = (state["row_m"] / (1 - ROW_GAIN_B1 ** state["row_t"])) / (
+                                (state["row_v"] / (1 - ROW_GAIN_B2 ** state["row_t"])).sqrt() + 1e-12)
                             gstep = ROW_GAIN_LR * group["lr"] / group["initial_lr"] * adam
                             p.mul_((1 - gstep).to(p.dtype))
-                            if self.anat is not None:
+                            if self.anat is not None and ax == 1:
                                 a_gain = gstep.reshape(-1).expand(p.size(0)).clone()
+                        if keep_fro:
+                            rescale_to_radius(p, target_radius)
                     else:
                         rescale_to_radius(p, target_radius)
                     if cwd_on:
@@ -1113,6 +1138,7 @@ class EMA_Nesterov(torch.optim.Optimizer):
         self.gset = set()   # parameters with their own jump (configure_group)
         self.xspec = {}     # extra groups: param -> (mult, dir) (configure_extra)
         self.soda = {}      # param -> init p0 (float32) (configure_soda)
+        self.head_gain = None   # (opt, group, lr, start, betas) (configure_head_gain)
         self.initialize_buffers()
 
     def configure_group(self, params, mult, start, end, auto, auto_max, ls, log_path=None):
@@ -1127,6 +1153,33 @@ class EMA_Nesterov(torch.optim.Optimizer):
         for params, mult, d in specs:
             for p in params:
                 self.xspec[p] = (mult, d)
+
+    def configure_head_gain(self, opt, group, lr, start, betas):
+        """HEAD_GAIN_LR: row gains on the LM head (opt.param_groups[group] holds only the head weight)."""
+        self.head_gain = (opt, opt.param_groups[group], lr, start, betas)
+
+    @torch.no_grad()
+    def head_gain_before(self):
+        opt, group, lr, start, betas = self.head_gain
+        if self.it < start:
+            return None
+        p = group["params"][0]
+        r = p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
+        return p, r, (p.grad.float() * p.float()).sum(dim=1, keepdim=True) / r   # g_i = <grad_i, W_i/|W_i|>
+
+    @torch.no_grad()
+    def head_gain_after(self, p, r, g):
+        """The head's step becomes direction-only per row, then each row length takes its own Adam step."""
+        opt, group, lr, start, (b1, b2) = self.head_gain
+        p.mul_((r / p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)).to(p.dtype))
+        st = opt.state[p]
+        if "hg_m" not in st:
+            st["hg_m"], st["hg_v"], st["hg_t"] = torch.zeros_like(g), torch.zeros_like(g), 0
+        st["hg_t"] += 1
+        st["hg_m"].lerp_(g, 1 - b1)
+        st["hg_v"].lerp_(g.square(), 1 - b2)
+        adam = (st["hg_m"] / (1 - b1 ** st["hg_t"])) / ((st["hg_v"] / (1 - b2 ** st["hg_t"])).sqrt() + 1e-12)
+        p.mul_((1 - lr * group["lr"] / group["initial_lr"] * adam).to(p.dtype))
 
     def configure_soda(self, params, c, k0):
         self.soda = {p: p.detach().float().clone() for p in params}
@@ -1307,11 +1360,14 @@ class EMA_Nesterov(torch.optim.Optimizer):
     def step(self):
         if not self.lookahead_status:
             raise ValueError("optimizer.nesterov_step() should be invoked before model forward pass.")
+        head_r = self.head_gain_before() if self.head_gain else None
         if isinstance(self.inner_optimizer, list):
             for opt in self.inner_optimizer:
                 opt.step()
         else:
             self.inner_optimizer.step()
+        if head_r is not None:
+            self.head_gain_after(*head_r)
 
         self.tune_after_step()
         if self.soda:
@@ -1367,6 +1423,8 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR} "
        f"row_gain_scope={sorted(ROW_GAIN_SCOPE)} row_gain_mode={ROW_GAIN_MODE} "
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
+       f"row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} row_gain_cols={sorted(ROW_GAIN_COLS)} keep_fro={sorted(ROW_GAIN_KEEP_FRO)} "
+       f"head_gain_lr/start/betas={HEAD_GAIN_LR}/{HEAD_GAIN_START}/{HEAD_GAIN_B1},{HEAD_GAIN_B2} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
        f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN} dir={ENA_G_DIR} extra={ENA_X}")
@@ -1558,6 +1616,8 @@ for opt in optimizers[0].inner_optimizer:
         group["initial_lr"] = group["lr"]
 optimizer1.param_groups[0]["power_c"] = ADAM_EMBED_POWER_C
 optimizer1.param_groups[1]["power_c"] = ADAM_PROJ_POWER_C
+if HEAD_GAIN_LR > 0:
+    optimizers[0].configure_head_gain(optimizer1, 1, HEAD_GAIN_LR, HEAD_GAIN_START, (HEAD_GAIN_B1, HEAD_GAIN_B2))
 for group in optimizer3.param_groups:
     group["power_c"] = ADAM_OTHER_POWER_C * AUX_LR_MULT
 if MSM:
@@ -1629,7 +1689,8 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
-             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR")
+             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR",
+             "ROW_GAIN_BETAS", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
@@ -1894,7 +1955,7 @@ def anat_post_step():
     _anat["lr"].append(optimizer2.param_groups[0]["lr"])
 
 @torch.no_grad()
-def manual_forward(inputs, stats=None):
+def manual_forward(inputs, stats=None, cap=True):
     """Eager forward (same math as GPT.forward) returning soft-capped logits; optionally collects per-block stats."""
     rms = lambda t: t.float().square().mean().sqrt().item()
     x = model.norm1(model.embed(inputs))
@@ -1915,7 +1976,38 @@ def manual_forward(inputs, stats=None):
             stats.setdefault("fc_act", []).append(act.float().flatten(0, -2).mean(0).cpu())
         x = x + m
     logits = model.proj(model.norm2(x)).float()
-    return 15 * logits * (logits.square() + 15**2).rsqrt()
+    return 15 * logits * (logits.square() + 15**2).rsqrt() if cap else logits
+
+@torch.no_grad()
+def head_diag(step):
+    """HEAD_DIAG, rank 0, at validation steps (16 val sequences): head row lengths, soft-cap regime, prior calibration."""
+    if dist.get_rank() != 0:
+        return
+    n = 16
+    r = model.proj.weight.float().norm(dim=1)
+    counts = torch.bincount(val_targets[n:].flatten(), minlength=r.numel()).float()   # token frequency, held apart
+    q = torch.quantile(r, torch.tensor([0.01, 0.5, 0.99], device=r.device))
+    seen = counts > 0
+    lr_, lc = r[seen].log(), counts[seen].log()
+    corr = ((lr_ - lr_.mean()) * (lc - lc.mean())).mean() / (lr_.std() * lc.std())
+    edges = [0, 1, 10, 100, 1000, float("inf")]
+    bucket = torch.bucketize(counts, torch.tensor(edges[1:-1], device=counts.device), right=True)   # token -> bucket
+    zmax, zt, pred = [], [], torch.zeros(len(edges) - 1, device=r.device)
+    for i in range(0, n, 2):
+        z = manual_forward(val_inputs[i:i + 2], cap=False).flatten(0, 1)
+        zmax.append(z.max(dim=1).values)
+        zt.append(z.gather(1, val_targets[i:i + 2].flatten()[:, None]).squeeze(1))
+        prob = F.softmax(15 * z * (z.square() + 225).rsqrt(), dim=1)
+        pred.index_add_(0, bucket, prob.sum(0))
+        del z, prob
+    zmax, zt, tgt = torch.cat(zmax), torch.cat(zt), val_targets[:n].flatten()
+    pred, emp = pred / tgt.numel(), torch.bincount(bucket[tgt], minlength=len(edges) - 1).float() / tgt.numel()
+    slope = lambda t: (225 / (t.square() + 225)).pow(1.5)   # d cap / dz
+    calib = [f"[{lo},{hi}):{pred[j]:.4f}/{emp[j]:.4f}" for j, (lo, hi) in enumerate(zip(edges[:-1], edges[1:]))]
+    print0(f"head step:{step} r_p1/p50/p99/max:{q[0]:.3f}/{q[1]:.3f}/{q[2]:.3f}/{r.max():.3f} corr(log r,log freq):{corr:.3f} "
+           f"zmax:{zmax.mean():.2f} frac(zmax>15):{(zmax > 15).float().mean():.4f} z_tgt:{zt.mean():.2f} "
+           f"capslope(zmax/tgt):{slope(zmax).mean():.3f}/{slope(zt).mean():.3f} pred/emp mass by val count {' '.join(calib)}",
+           console=True)
 
 @torch.no_grad()
 def anat_func_stats(step):
@@ -2323,6 +2415,8 @@ for step in range(RESUME_STEP, train_steps + 1):
         log_rowstats(step)
         if ANATOMY:
             anat_func_stats(step)
+        if HEAD_DIAG:
+            head_diag(step)
         model.train()
         # start the clock again
         dist.barrier()

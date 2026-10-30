@@ -101,6 +101,9 @@ There is no gradient clipping and no other weight decay.
   - `ROW_GAIN_FIXED=1`: step 8 is the direction-only step per row (r*_i = ‖W_i‖) without the Adam length step, so row lengths change only through CWD (ablation: "drop the radial part" vs "learn the lengths").
   - `ROW_GAIN_NO_CWD` (default 1): no CWD on those matrices while their row gains are active, i.e. from step 1000 on q, k, v, o, fc only mlp.proj keeps CWD; with `ROW_GAIN_FIXED=1` every row length stays exactly constant. `ROW_GAIN_NO_CWD=0` is the 2665 record.
   - `ROW_GAIN_LR` = a > 0 (default 0.02): step 8 is purely angular per row (r*_i = ‖W_i‖), then each row norm takes its own Adam step: g_i = ⟨∇W_i, W_i/‖W_i‖⟩ (raw gradient), Adam(β = 0.9, 0.95, bias-corrected), W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i). CWD still follows.
+  - `ROW_GAIN_BETAS`="β₁,β₂" (default 0.9,0.95): the betas of that length Adam.
+  - `ROW_GAIN_COLS` (types, default none; e.g. proj): those matrices get one gain per column (input unit; for mlp.proj, one per MLP neuron) instead of per row: step 8 is purely angular per column and c_j = ‖W_{:,j}‖ takes the Adam step on g_j = ⟨∇W_{:,j}, W_{:,j}/‖W_{:,j}‖⟩. A type is either in `ROW_GAIN_SCOPE` or here.
+  - `ROW_GAIN_KEEP_FRO` (types, default none): after the gain step, those matrices are rescaled to the rec-46 whole-matrix pin's target r* (step 8), so the gains only redistribute length between rows (columns) and cannot change the matrix's total scale.
 - SOAP variants (env, defaults = rec-46; scope `SOAP_*_SCOPE` = all | vo):
   - `SOAP_SINK=cur|ema`: step 2's P/√V is replaced by √r_i·P_ij·√c_j, with r, c the Sinkhorn scalings (10 iterations) that give r_i B_ij c_j uniform row and column marginals; B = P² (cur, as SinkSOAP #26) or B = V (ema, a factored second moment).
   - `SOAP_KL=1`: step 9's statistics become KL-SOAP's coupled estimates (#19/#25): L ← 0.9·L + 0.1·G·Q_R·diag(1/λ_R)·Q_Rᵀ·Gᵀ/n and R ← 0.9·R + 0.1·Gᵀ·Q_L·diag(1/λ_L)·Q_Lᵀ·G/m, where λ_L, λ_R are EMAs (0.9) of the row/column energies of Q_Lᵀ·G·Q_R whitened by the other side. The first KL step replaces L and R instead of mixing.
@@ -128,6 +131,7 @@ There is no gradient clipping and no other weight decay.
 - **Embedding and lm_head:** `torch.optim.AdamW`.
   - β = (0.8, 0.99), ε = 1e-10, no weight decay, standard bias correction.
   - η₀ is 0.3 for the embedding and 1/320 for lm_head.
+  - Head row gains (`HEAD_GAIN_LR` = a > 0, default 0 = off; from step `HEAD_GAIN_START`, default 1000, since lm_head is zero-initialized): with r_i = ‖W_i‖ and g_i = ⟨∇W_i, W_i/r_i⟩ taken before the AdamW step, each row is rescaled back to r_i after it (direction-only step per vocabulary row), then W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i), Adam on g_i with betas `HEAD_GAIN_BETAS` (default = `ROW_GAIN_BETAS`), bias-corrected. Applied inside EMA-Nesterov's step, before the lookahead accumulation.
 - **1-D parameters (norm gains and biases):** Adam without bias correction, η₀ = 0.01·a.
   - m ← β₁·m + (1−β₁)·g, with β₁ = 0.8
   - v ← β₂·v + (1−β₂)·g²
