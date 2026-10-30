@@ -283,11 +283,11 @@ ROW_GAIN_FIXED = os.environ.get("ROW_GAIN_FIXED", "0") == "1"
 # ROW_GAIN_NO_CWD=1: no cautious weight decay on the matrices while their row gains are active (with ROW_GAIN_FIXED=1:
 # row lengths stay exactly constant).
 ROW_GAIN_NO_CWD = os.environ.get("ROW_GAIN_NO_CWD", "1") == "1"   # default on (nocwd, 8 seeds); 0 = the 2665 record
-# ROW_GAIN_BETAS="b1,b2": betas of the length Adam (default 0.9,0.95, never tuned). ROW_GAIN_COLS: comma list of matrix
+# ROW_GAIN_BETAS="b1,b2": betas of the length Adam (default 0.99,0.99, 16 seeds; 0.9,0.95 = the 2640 record). ROW_GAIN_COLS: comma list of matrix
 # types whose COLUMNS (input units) get the gain instead (e.g. proj: one gain per MLP neuron on mlp.proj; the type must not
 # also be in ROW_GAIN_SCOPE). ROW_GAIN_KEEP_FRO: types whose gains only redistribute length between rows/columns (after the
 # gain step the matrix is rescaled to the whole-matrix radius pin's target), i.e. separates reshaping from total scale.
-ROW_GAIN_B1, ROW_GAIN_B2 = (float(x) for x in os.environ.get("ROW_GAIN_BETAS", "0.9,0.95").split(","))
+ROW_GAIN_B1, ROW_GAIN_B2 = (float(x) for x in os.environ.get("ROW_GAIN_BETAS", "0.99,0.99").split(","))
 # ROW_GAIN_CLIP=c > 0: clip the length Adam's ratio m_hat/sqrt(v_hat) to [-c, c]. Needed for beta1 > sqrt(beta2), where the
 # ratio is unbounded (it grows like (beta1/sqrt(beta2))^k while a row's length gradient fades) and a row can flip sign.
 ROW_GAIN_CLIP = float(os.environ.get("ROW_GAIN_CLIP", 0))
