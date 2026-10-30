@@ -692,3 +692,14 @@ Better forecasts after step 1000 do not turn into steps: every variant is within
 Reject: a slow gradient EMA in the 1-D Adam hurts, matching the offline result that the slow gradient direction is anti-predictive after 1000.
 
 **Frontier check.** Extra-Merge (arXiv 2605.26484: PCA of recent averaged checkpoints, extrapolate along PC1) is a readout extrapolation, which the readout lab already rejected here (every extrapolation lost to Tail-EMA). Leap+Verify (arXiv 2602.19580: finite-difference weight prediction verified on held-out loss) uses the same linear/quadratic predictors scored above. SODA (Pethick et al., arXiv 2605.11172: uniform averaging anchored at the initialization, pull (x − x₀)/(k+2) in place of weight decay) is the one untested family; it replaces the outer wrapper (EMA-Nesterov) rather than its direction.
+
+**SODA anchor toward the init** (commit `6b4b112`, `SODA`="scope:c:k₀": W′ ← W′ − c·(W′ − W₀)/(t + k₀) after the inner step, W₀ the seed's regenerated init, CWD off on anchored matrices; kept on top of EMA-Nesterov; forks from step 50 of `traj-rec`, control `rec-ctrl` k50, noise SD 0.00058; |W − W₀|/|W₀| at step 50: 0.91 hidden matrices, 0.82 1-D, 2.35 all incl. embed, so the regenerated init matches):
+
+| Variant | Δ val_ema@2690 | Steps |
+|---|---|---|
+| `soda-all` all params, c 1, k₀ 2 (the paper's setting) | +0.01888 ± 0.00032 | −322 |
+| `soda-hid` block matrices, c 1, k₀ 2 | +0.01183 ± 0.00076 | −201 |
+| `soda-aux` 1-D params, c 1, k₀ 2 | +0.00673 ± 0.00047 | −115 |
+| `soda-hidsoft` block matrices, c 1, k₀ 1000 | +0.00177 ± 0.00041 | −30 |
+
+Reject. The loss falls monotonically with the anchor strength (k₀ 1000 still −30 steps), so the best anchor here is none. With this tuned LR schedule and the radius pins, anchoring discounts the early progress (W − W₀ = Σ (j+2)/(n+1)·U_j), which a 2700-step run cannot afford; the paper retunes the LR for SODA, and we would have to retune the whole schedule for a change whose dose response points the wrong way.
