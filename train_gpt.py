@@ -260,6 +260,12 @@ SNRW = os.environ.get("SNRW", "")
 SNRW_C = float(SNRW) if SNRW else 0.0
 SNRW_EVERY = int(os.environ.get("SNRW_EVERY", "10"))
 SNRW_FLOOR = float(os.environ.get("SNRW_FLOOR", "0"))   # w <- max(w, SNRW_FLOOR)
+# TSNR_DIAG="every,k1,k2,..." (diagnostics only): at every `every`-th step, fix the singular pairs of Muon's input (SOAP
+# form) and their within-step BBP SNR, then sum g_i = u_i^T G v_i (each pair's first-order descent) and g_i^2 over the next
+# k steps, snapshots at each k (max k <= every) -> <log>.tsnr/anchor<t>.pt; tsnr.py bins the pairs by SNR.
+_tsnr = [int(x) for x in os.environ.get("TSNR_DIAG", "").split(",") if x]
+TSNR_EVERY, TSNR_KS = (_tsnr[0], _tsnr[1:]) if _tsnr else (0, [])
+assert not TSNR_KS or TSNR_KS[-1] <= TSNR_EVERY
 ENA_G_MULT_AFTER = float(os.environ.get("ENA_G_MULT_AFTER", 1.0))
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
@@ -2123,9 +2129,7 @@ def snrw_refresh(step, gathered):
         else:
             nz["A"].lerp_(A, 0.5)
             nz["B"].lerp_(B, 0.5)
-        nz["ez2"] = nz["A"].diagonal().sum()
-        nz["Ai"], nz["As"] = _sym_pow(nz["A"], -0.5), _sym_pow(nz["A"], 0.5)
-        nz["Bi"], nz["Bs"] = _sym_pow(nz["B"], -0.5), _sym_pow(nz["B"], 0.5)
+        _noise_roots(nz)
         if nz["wn"]:
             stats.append((pname[p], nz["wsum"] / nz["wn"], nz["whalf"] / nz["wn"]))
         nz["wsum"], nz["whalf"], nz["wn"] = 0.0, 0.0, 0
@@ -2140,6 +2144,76 @@ def snrw_refresh(step, gathered):
                                                    for k, v in by.items()), console=True)
 
 
+def _noise_roots(nz):
+    nz["ez2"] = nz["A"].diagonal().sum()
+    nz["Ai"], nz["As"] = _sym_pow(nz["A"], -0.5), _sym_pow(nz["A"], 0.5)
+    nz["Bi"], nz["Bs"] = _sym_pow(nz["B"], -0.5), _sym_pow(nz["B"], 0.5)
+    return nz
+
+
+def direction_snr(Yf, nz):
+    """-> the SVD U, S, Vh of Yf and the BBP SNR of each singular pair (see snr_weighted_update)."""
+    m, n = Yf.shape
+    U, S, Vh = torch.linalg.svd(Yf, full_matrices=False)
+    sq = nz["ez2"].sqrt()
+    a, sw, bh = torch.linalg.svd(nz["Ai"] @ Yf @ nz["Bi"] * sq, full_matrices=False)
+    Bq = sw.square() - (m + n)
+    s2 = torch.where(sw > m ** 0.5 + n ** 0.5, (Bq + (Bq.square() - 4 * m * n).clamp_min(0).sqrt()) / 2, 0.0)
+    Shat = nz["As"] @ ((a * s2.sqrt()) @ bh) @ nz["Bs"] / sq
+    sig = ((U.mT @ Shat) * Vh).sum(-1)
+    noise = ((U.mT @ nz["A"]) * U.mT).sum(-1) * ((Vh @ nz["B"]) * Vh).sum(-1) / nz["ez2"]
+    return U, S, Vh, sig.square() / (noise.clamp_min(1e-30) * (m * n) ** 0.5)
+
+
+@torch.no_grad()
+def tsnr_anchor(step, gathered):
+    """TSNR_DIAG: at an anchor step, fix each owned matrix's singular pairs (u_i, v_i) of Muon's input Y (SOAP form) and
+    their within-step BBP SNR (fresh Kronecker noise model); tsnr_accum then sums g_i(t) = u_i^T G_t v_i (the first-order
+    descent of Muon's step along pair i) and g_i^2 over the next steps."""
+    _, _, c = _snr_noise_factor()
+    for p, (E, caps) in gathered.items():
+        if "soap_state" not in caps:
+            continue
+        Ex = soap_noise(E, caps)
+        nz = _noise_roots(dict(A=c * (Ex @ Ex.mT).sum(0), B=c * (Ex.mT @ Ex).sum(0)))
+        U, S, Vh, snr = direction_snr(caps["soap"], nz)
+        tsnr_state[p] = dict(t0=step, U=U, Vh=Vh, s=S.cpu(), snr=snr.cpu(), g=torch.zeros_like(S),
+                             g2=torch.zeros_like(S), snaps={})
+
+
+@torch.no_grad()
+def tsnr_accum(step):
+    """TSNR_DIAG: add this step's g_i(t) for every open anchor; snapshot the sums at k = TSNR_KS steps after the anchor;
+    write and close an anchor at its last k."""
+    done = []
+    for p, st in tsnr_state.items():
+        k = step - st["t0"]
+        if k < 1:
+            continue
+        g = ((st["U"].mT @ p.grad.float()) * st["Vh"]).sum(-1)
+        st["g"] += g
+        st["g2"] += g.square()
+        if k in TSNR_KS:
+            st["snaps"][k] = (st["g"].cpu().clone(), st["g2"].cpu().clone())
+        if k == TSNR_KS[-1]:
+            done.append(p)
+    recs = [dict(name=pname[p], shape=tuple(p.shape), t0=tsnr_state[p]["t0"], s=tsnr_state[p]["s"],
+                 snr=tsnr_state[p]["snr"], snaps=tsnr_state.pop(p)["snaps"]) for p in done]
+    flag = torch.tensor([len(recs)], device=device)
+    dist.all_reduce(flag)
+    if flag.item():
+        out = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+        dist.gather_object(recs, out, dst=0)
+        if dist.get_rank() == 0:
+            d = Path(logfile.replace(".txt", ".tsnr"))
+            d.mkdir(exist_ok=True)
+            recs = [r for rs in out for r in rs]
+            torch.save(dict(t0=recs[0]["t0"], recs=recs), d / f"anchor{recs[0]['t0']}.pt")
+
+
+tsnr_state = {}
+
+
 def snr_weighted_update(Y, nz):
     """SNRW: Muon's orthogonalized step with soft per-direction weights, sum_i w_i u_i v_i^T over the exact singular pairs
     of Y (the Newton-Schulz input), w_i = SNR_i / (SNR_i + c). SNR_i: the signal along (u_i, v_i) of the BBP-denoised
@@ -2148,18 +2222,11 @@ def snr_weighted_update(Y, nz):
     (so it reduces to the iid BBP SNR for isotropic noise). c = 0: w = 1 (exact polar factor, the SVD control)."""
     Yf = Y.float()
     m, n = Yf.shape
-    U, S, Vh = torch.linalg.svd(Yf, full_matrices=False)
     if SNRW_C == 0:
+        U, S, Vh = torch.linalg.svd(Yf, full_matrices=False)
         w = torch.ones_like(S)
     else:
-        sq = nz["ez2"].sqrt()
-        a, sw, bh = torch.linalg.svd(nz["Ai"] @ Yf @ nz["Bi"] * sq, full_matrices=False)
-        Bq = sw.square() - (m + n)
-        s2 = torch.where(sw > m ** 0.5 + n ** 0.5, (Bq + (Bq.square() - 4 * m * n).clamp_min(0).sqrt()) / 2, 0.0)
-        Shat = nz["As"] @ ((a * s2.sqrt()) @ bh) @ nz["Bs"] / sq
-        sig = ((U.mT @ Shat) * Vh).sum(-1)
-        noise = ((U.mT @ nz["A"]) * U.mT).sum(-1) * ((Vh @ nz["B"]) * Vh).sum(-1) / nz["ez2"]
-        snr = sig.square() / (noise.clamp_min(1e-30) * (m * n) ** 0.5)
+        U, S, Vh, snr = direction_snr(Yf, nz)
         w = (snr / (snr + SNRW_C)).clamp_min(SNRW_FLOOR)
     nz["wsum"] += w.mean().item()
     nz["whalf"] += (w > 0.5).float().mean().item()
@@ -2276,13 +2343,16 @@ for step in range(RESUME_STEP, train_steps + 1):
         newton.disable_capture()
     snr_on = SNR_DIAG > 0 and step > 0 and step % SNR_DIAG == 0
     snrw_on = bool(SNRW) and step % SNRW_EVERY == 0
-    if snr_on or snrw_on:
+    tsnr_on = TSNR_EVERY > 0 and step > 0 and step % TSNR_EVERY == 0
+    if snr_on or snrw_on or tsnr_on:
         snr_local = {p: p.grad.float().clone() for g in optimizer2.param_groups for p in g["params"]}
         optimizer2.snr_capture = True
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
     track_radial()
+    if TSNR_EVERY:
+        tsnr_accum(step)
     optimizers[0].slope_feedback(step)
     if ANATOMY:
         anat_pre_step(step)
@@ -2296,13 +2366,15 @@ for step in range(RESUME_STEP, train_steps + 1):
     H.before_step()
     for opt in optimizers:
         opt.step()
-    if snr_on or snrw_on:
+    if snr_on or snrw_on or tsnr_on:
         optimizer2.snr_capture = False
         snr_gathered = snr_gather(snr_local)
         if snr_on:
             snr_diag(step, snr_gathered)
         if snrw_on:
             snrw_refresh(step, snr_gathered)
+        if tsnr_on:
+            tsnr_anchor(step, snr_gathered)
         del snr_gathered
     if ANATOMY:
         anat_post_step()
