@@ -259,6 +259,7 @@ SNR_DIAG = int(os.environ.get("SNR_DIAG", "0"))
 SNRW = os.environ.get("SNRW", "")
 SNRW_C = float(SNRW) if SNRW else 0.0
 SNRW_EVERY = int(os.environ.get("SNRW_EVERY", "10"))
+SNRW_FLOOR = float(os.environ.get("SNRW_FLOOR", "0"))   # w <- max(w, SNRW_FLOOR)
 ENA_G_MULT_AFTER = float(os.environ.get("ENA_G_MULT_AFTER", 1.0))
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
@@ -1621,7 +1622,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
-             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY")
+             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
@@ -2159,7 +2160,7 @@ def snr_weighted_update(Y, nz):
         sig = ((U.mT @ Shat) * Vh).sum(-1)
         noise = ((U.mT @ nz["A"]) * U.mT).sum(-1) * ((Vh @ nz["B"]) * Vh).sum(-1) / nz["ez2"]
         snr = sig.square() / (noise.clamp_min(1e-30) * (m * n) ** 0.5)
-        w = snr / (snr + SNRW_C)
+        w = (snr / (snr + SNRW_C)).clamp_min(SNRW_FLOOR)
     nz["wsum"] += w.mean().item()
     nz["whalf"] += (w > 0.5).float().mean().item()
     nz["wn"] += 1
