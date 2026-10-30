@@ -67,6 +67,10 @@ Each parameter is updated on one rank and then all-gathered.
    - Blend: U ← (U + γ·(Ŝ − U)), rescaled to ‖U‖_S4.
 5. **Orthogonalize:** O = NS₁₂(U / ‖U‖_S4) · √max(1, rows/cols).
    - NS₁₂ is 12 Newton–Schulz iterations in bf16: X ← 2X − 1.5(XXᵀ)X + 0.5(XXᵀ)²X.
+   - **SNR-weighted variant (env, off by default):** `SNRW`=c replaces NS₁₂ by O = Σᵢ wᵢ uᵢvᵢᵀ · √max(1, rows/cols) over the exact SVD U = Σ σᵢuᵢvᵢᵀ, wᵢ = SNRᵢ/(SNRᵢ + c); c = 0 gives wᵢ = 1 (exact polar factor, the control).
+     - Noise model of U, refreshed every `SNRW_EVERY` (10) steps from the 8 ranks' local-gradient deviations eᵣ = gᵣ − G/8, mapped through this step's SOAP map: Kronecker factors Ā = κΣᵣeᵣeᵣᵀ, B̄ = κΣᵣeᵣᵀeᵣ (EMA 0.5 over refreshes), E‖Z‖² = tr Ā, κ = f(μ)·8/7 with f(μ) = (1−μ²)² + μ⁴(1−μ)/(1+μ).
+     - Whitened U_w = Ā^{−1/2} U B̄^{−1/2} √E‖Z‖² = Σ σ_j a_j b_jᵀ (noise ≈ iid, unit variance). BBP inversion: ŝ_j² = (B_j + √(B_j² − 4mn))/2 with B_j = σ_j² − (m+n) for σ_j > √m + √n, else 0. Signal estimate Ŝ = Ā^{1/2}(Σ ŝ_j a_j b_jᵀ)B̄^{1/2}/√E‖Z‖².
+     - SNRᵢ = (uᵢᵀŜvᵢ)² / [(uᵢᵀĀuᵢ)(vᵢᵀB̄vᵢ)/E‖Z‖² · √(mn)] (1 = the BBP threshold).
 6. **Damp the radial part:**
    - c = ⟨O,W⟩ / ‖W‖²
    - O ← (O − c·W) + s·c·W

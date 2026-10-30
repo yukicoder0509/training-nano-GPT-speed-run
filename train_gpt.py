@@ -252,6 +252,13 @@ SODA = os.environ.get("SODA", "")
 # momentum and its SOAP-preconditioned form) and its noise level from the spread of the 8 ranks' local gradients, to
 # <log>.snr/step<k>.pt; snr_bbp.py turns them into BBP-debiased per-rank SNRs.
 SNR_DIAG = int(os.environ.get("SNR_DIAG", "0"))
+# SNRW=c: Muon's step on every hidden matrix becomes sum_i w_i u_i v_i^T over the exact singular pairs of the Newton-Schulz
+# input, w_i = SNR_i / (SNR_i + c), SNR_i the BBP per-direction SNR from a Kronecker noise model refreshed from the rank
+# spread every SNRW_EVERY steps (snr_weighted_update); c = 0 is the exact-SVD control (w = 1). Active from the first
+# refresh (a fork: from its resume step + 1).
+SNRW = os.environ.get("SNRW", "")
+SNRW_C = float(SNRW) if SNRW else 0.0
+SNRW_EVERY = int(os.environ.get("SNRW_EVERY", "10"))
 ENA_G_MULT_AFTER = float(os.environ.get("ENA_G_MULT_AFTER", 1.0))
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
@@ -852,6 +859,7 @@ class Muon(torch.optim.Optimizer):
         # A new direction idea ("variant") is screened by adding its name here and a self._capture call.
         self.probe_capture, self.probe_dirs = False, {}
         self.snr_capture, self.snr_dirs = False, {}   # SNR_DIAG: the Nesterov momentum, its SOAP form and SOAP state
+        self.snrw = {}   # SNRW: param -> its noise model (snrw_refresh)
         self.probe_dir_names = ["momentum", "soap"] + (["newton"] if newton is not None and NEWTON_MODE != "grad" else []) + ["ns"]
         self.vo = VOVariants(named_params) if VO_VARIANTS else None
         if self.vo is not None:
@@ -948,7 +956,8 @@ class Muon(torch.optim.Optimizer):
                             if self.newton is not None and NEWTON_MODE in ("soap", "right"):
                                 momentum_update = self.newton.apply(momentum_update, p)
                                 self._capture(p, "newton", momentum_update)
-                    update = muon_update(momentum_update)
+                    update = (snr_weighted_update(momentum_update, self.snrw[p]) if p in self.snrw
+                              else muon_update(momentum_update))
                     self._capture(p, "ns", update)
                     if self.probe_capture and vo_dirs is not None:
                         self._capture(p, "vo_ns", update)
@@ -1612,7 +1621,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
-             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA")
+             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
@@ -2021,62 +2030,140 @@ if ROW_TRANSPLANT:
     dist.destroy_process_group()
     sys.exit(0)
 
-@torch.no_grad()
-def snr_diag(step, local):
-    """SNR_DIAG: for each hidden matrix, its owner rank gathers the 8 local-gradient deviations g_r - G/W (G the summed
-    gradient Muon sees) and records, for Y = the Nesterov momentum and its SOAP form, the singular values s of Y, the
-    entrywise noise variance tau2 of Y and the noise variance tau2_dir along each singular pair (u_i, v_i). Noise of Y
-    per unit noise of G: f = (1-mu^2)^2 + mu^4 (1-mu)/(1+mu) (Nesterov blend of an EMA, gradient noise iid in time);
-    the SOAP map is applied to the noise samples with the same state and norm rescale."""
-    assert not SOAP_SINK, "SNR_DIAG assumes the plain SOAP denominator"
-    W, rank = dist.get_world_size(), dist.get_rank()
-    mu = optimizer2.param_groups[0]["mu"]
+def _snr_noise_factor():
+    """Noise variance of Muon's Nesterov input per unit sum_r dev_r^2: f = (1-mu^2)^2 + mu^4 (1-mu)/(1+mu) (Nesterov
+    blend of an EMA, gradient noise iid in time) times W/(W-1) (Var(G) = W Var(g_r), Var(g_r) = sum_r dev_r^2 / (W-1))."""
+    mu, W = optimizer2.param_groups[0]["mu"], dist.get_world_size()
     f = (1 - mu * mu) ** 2 + mu ** 4 * (1 - mu) / (1 + mu)
-    c = f * W / (W - 1)   # Var(G) = W Var(g_r), Var(g_r) = sum_r dev_r^2 / (W - 1)
-    recs = []
+    return mu, f, f * W / (W - 1)
+
+
+@torch.no_grad()
+def snr_gather(local):
+    """Each hidden matrix's owner rank gathers the W local-gradient deviations g_r - G/W (G the summed gradient Muon
+    sees). -> {p: (E (W, m, n), captured Nesterov momentum / SOAP form / SOAP state)} for the params this rank owns."""
+    W, rank = dist.get_world_size(), dist.get_rank()
+    out = {}
     for group in optimizer2.param_groups:
         for i, p in enumerate(group["params"]):
             owner = i % W
             dev = local.pop(p) - p.grad.float() / W
             bufs = [torch.empty_like(dev) for _ in range(W)] if rank == owner else None
             dist.gather(dev, bufs, dst=owner)
-            if rank != owner:
+            if rank == owner:
+                out[p] = (torch.stack(bufs), optimizer2.snr_dirs.pop(p))
+    return out
+
+
+def soap_noise(E, caps):
+    """The SOAP map (same state and norm rescale as the step) applied to the noise samples E."""
+    q_row, q_col, eas, power = caps["soap_state"]
+    denom = eas.clamp_min(1e-16).pow(power)
+    L = (lambda Z: q_row @ ((q_row.mT @ Z) / denom)) if q_col is None else (
+        lambda Z: q_row @ ((q_row.mT @ Z @ q_col) / denom) @ q_col.mT)
+    X = caps["momentum"]
+    return L(E) * (gram_frobenius_norm_estimate(X, eps=1e-8) / gram_frobenius_norm_estimate(L(X), eps=1e-8))
+
+
+def _sym_pow(M, power, ridge=1e-3):
+    """M^power for a PSD M, with a ridge of `ridge` x the mean eigenvalue."""
+    M = M + ridge * M.diagonal().mean() * torch.eye(M.size(0), device=M.device)
+    ev, Q = torch.linalg.eigh(M)
+    return (Q * ev.clamp_min(1e-30).pow(power)) @ Q.mT
+
+
+@torch.no_grad()
+def snr_diag(step, gathered):
+    """SNR_DIAG: for Y = the Nesterov momentum and its SOAP form, the singular values s of Y, the entrywise noise variance
+    tau2 of Y, the noise variance tau2_dir along each singular pair (u_i, v_i), and the singular values s_w of the
+    Kronecker-whitened Yw = Abar^-1/2 Y Bbar^-1/2 sqrt(E|Z|^2) (noise covariance ~ A (x) B with E[Z Z^T] = c sum_r e_r e_r^T,
+    E[Z^T Z] likewise), whose noise is ~iid with unit variance."""
+    assert not SOAP_SINK, "SNR_DIAG assumes the plain SOAP denominator"
+    W, rank = dist.get_world_size(), dist.get_rank()
+    mu, f, c = _snr_noise_factor()
+    recs = []
+    for p, (E, caps) in gathered.items():
+        X = caps["momentum"]
+        rec = dict(name=pname[p], shape=tuple(p.shape))
+        for key in ("momentum", "soap"):
+            if key == "soap" and "soap_state" not in caps:
                 continue
-            caps = optimizer2.snr_dirs.pop(p)
-            E, X = torch.stack(bufs), caps["momentum"]
-            rec = dict(name=pname[p], shape=tuple(p.shape))
-            for key in ("momentum", "soap"):
-                if key == "soap":
-                    if "soap_state" not in caps:
-                        continue
-                    q_row, q_col, eas, power = caps["soap_state"]
-                    denom = eas.clamp_min(1e-16).pow(power)
-                    L = (lambda Z: q_row @ ((q_row.mT @ Z) / denom)) if q_col is None else (
-                        lambda Z: q_row @ ((q_row.mT @ Z @ q_col) / denom) @ q_col.mT)
-                    Ex = L(E) * (gram_frobenius_norm_estimate(X, eps=1e-8) / gram_frobenius_norm_estimate(L(X), eps=1e-8))
-                else:
-                    Ex = E
-                U, S, Vh = torch.linalg.svd(caps[key], full_matrices=False)
-                proj = ((U.mT @ Ex) * Vh).sum(-1)   # (W, k): u_i^T e_r v_i
-                tau2 = c * Ex.square().sum() / X.numel()
-                # Kronecker whitening: noise covariance ~ A (x) B with E[Z Z^T] = c sum_r e_r e_r^T, E[Z^T Z] likewise;
-                # Yw = Abar^-1/2 Y Bbar^-1/2 sqrt(E|Z|^2) has ~iid unit-variance noise (ridge 1e-3 of the mean eigenvalue)
-                def isqrt(M):
-                    M = M + 1e-3 * M.diagonal().mean() * torch.eye(M.size(0), device=M.device)
-                    ev, Q = torch.linalg.eigh(M)
-                    return (Q * ev.clamp_min(1e-30).rsqrt()) @ Q.mT
-                Ai, Bi = isqrt(c * (Ex @ Ex.mT).sum(0)), isqrt(c * (Ex.mT @ Ex).sum(0))
-                Sw = torch.linalg.svdvals(Ai @ caps[key] @ Bi * (tau2 * X.numel()).sqrt())
-                Ew = Ai @ Ex @ Bi * (tau2 * X.numel()).sqrt()
-                rec[key] = dict(s=S.cpu(), tau2=tau2.item(), tau2_dir=(c * proj.square().sum(0)).cpu(), s_w=Sw.cpu(),
-                                tau2_w=(c * Ew.square().sum() / X.numel()).item())
-            recs.append(rec)
+            Ex = soap_noise(E, caps) if key == "soap" else E
+            U, S, Vh = torch.linalg.svd(caps[key], full_matrices=False)
+            proj = ((U.mT @ Ex) * Vh).sum(-1)   # (W, k): u_i^T e_r v_i
+            tau2 = c * Ex.square().sum() / X.numel()
+            Ai, Bi = _sym_pow(c * (Ex @ Ex.mT).sum(0), -0.5), _sym_pow(c * (Ex.mT @ Ex).sum(0), -0.5)
+            Sw = torch.linalg.svdvals(Ai @ caps[key] @ Bi * (tau2 * X.numel()).sqrt())
+            Ew = Ai @ Ex @ Bi * (tau2 * X.numel()).sqrt()
+            rec[key] = dict(s=S.cpu(), tau2=tau2.item(), tau2_dir=(c * proj.square().sum(0)).cpu(), s_w=Sw.cpu(),
+                            tau2_w=(c * Ew.square().sum() / X.numel()).item())
+        recs.append(rec)
     out = [None] * W if rank == 0 else None
     dist.gather_object(recs, out, dst=0)
     if rank == 0:
         d = Path(logfile.replace(".txt", ".snr"))
         d.mkdir(exist_ok=True)
         torch.save(dict(step=step, mu=mu, f=f, W=W, recs=[r for rs in out for r in rs]), d / f"step{step}.pt")
+
+
+@torch.no_grad()
+def snrw_refresh(step, gathered):
+    """SNRW: refresh each owned matrix's noise model of Muon's input Y (the SOAP form): Kronecker factors
+    Abar = E[Z Z^T], Bbar = E[Z^T Z] and E|Z|^2 (EMA 0.5 over refreshes), and their (inverse) square roots.
+    Logs the mean weight w and the share of w > 0.5 by matrix type since the last refresh."""
+    _, _, c = _snr_noise_factor()
+    stats = []
+    for p, (E, caps) in gathered.items():
+        Ex = soap_noise(E, caps) if "soap_state" in caps else E
+        A, B = c * (Ex @ Ex.mT).sum(0), c * (Ex.mT @ Ex).sum(0)
+        nz = optimizer2.snrw.get(p)
+        if nz is None:
+            nz = optimizer2.snrw[p] = dict(A=A, B=B, wsum=0.0, whalf=0.0, wn=0)
+        else:
+            nz["A"].lerp_(A, 0.5)
+            nz["B"].lerp_(B, 0.5)
+        nz["ez2"] = nz["A"].diagonal().sum()
+        nz["Ai"], nz["As"] = _sym_pow(nz["A"], -0.5), _sym_pow(nz["A"], 0.5)
+        nz["Bi"], nz["Bs"] = _sym_pow(nz["B"], -0.5), _sym_pow(nz["B"], 0.5)
+        if nz["wn"]:
+            stats.append((pname[p], nz["wsum"] / nz["wn"], nz["whalf"] / nz["wn"]))
+        nz["wsum"], nz["whalf"], nz["wn"] = 0.0, 0.0, 0
+    if step % (10 * SNRW_EVERY) == 0:
+        out = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+        dist.gather_object(stats, out, dst=0)
+        if dist.get_rank() == 0 and any(out):
+            by = {}
+            for n, wm, wh in (x for o in out for x in o):
+                by.setdefault(n.split(".", 2)[2].rsplit(".", 1)[0], []).append((wm, wh))
+            print0(f"snrw step:{step} " + " ".join(f"{k}:w={sum(a for a, _ in v) / len(v):.3f}/half={sum(b for _, b in v) / len(v):.3f}"
+                                                   for k, v in by.items()), console=True)
+
+
+def snr_weighted_update(Y, nz):
+    """SNRW: Muon's orthogonalized step with soft per-direction weights, sum_i w_i u_i v_i^T over the exact singular pairs
+    of Y (the Newton-Schulz input), w_i = SNR_i / (SNR_i + c). SNR_i: the signal along (u_i, v_i) of the BBP-denoised
+    signal estimate Shat (BBP inversion on the Kronecker-whitened spectrum, bulk directions dropped, unwhitened), over
+    the noise variance along (u_i, v_i), (u_i^T Abar u_i)(v_i^T Bbar v_i)/E|Z|^2, in units of the BBP threshold sqrt(mn)
+    (so it reduces to the iid BBP SNR for isotropic noise). c = 0: w = 1 (exact polar factor, the SVD control)."""
+    Yf = Y.float()
+    m, n = Yf.shape
+    U, S, Vh = torch.linalg.svd(Yf, full_matrices=False)
+    if SNRW_C == 0:
+        w = torch.ones_like(S)
+    else:
+        sq = nz["ez2"].sqrt()
+        a, sw, bh = torch.linalg.svd(nz["Ai"] @ Yf @ nz["Bi"] * sq, full_matrices=False)
+        Bq = sw.square() - (m + n)
+        s2 = torch.where(sw > m ** 0.5 + n ** 0.5, (Bq + (Bq.square() - 4 * m * n).clamp_min(0).sqrt()) / 2, 0.0)
+        Shat = nz["As"] @ ((a * s2.sqrt()) @ bh) @ nz["Bs"] / sq
+        sig = ((U.mT @ Shat) * Vh).sum(-1)
+        noise = ((U.mT @ nz["A"]) * U.mT).sum(-1) * ((Vh @ nz["B"]) * Vh).sum(-1) / nz["ez2"]
+        snr = sig.square() / (noise.clamp_min(1e-30) * (m * n) ** 0.5)
+        w = snr / (snr + SNRW_C)
+    nz["wsum"] += w.mean().item()
+    nz["whalf"] += (w > 0.5).float().mean().item()
+    nz["wn"] += 1
+    return ((U * w) @ Vh * max(1, m / n) ** 0.5).bfloat16()
 
 if SODA:
     _sc, _c, _k0 = SODA.split(":")
@@ -2187,7 +2274,8 @@ for step in range(RESUME_STEP, train_steps + 1):
     if newton_capture:
         newton.disable_capture()
     snr_on = SNR_DIAG > 0 and step > 0 and step % SNR_DIAG == 0
-    if snr_on:
+    snrw_on = bool(SNRW) and step % SNRW_EVERY == 0
+    if snr_on or snrw_on:
         snr_local = {p: p.grad.float().clone() for g in optimizer2.param_groups for p in g["params"]}
         optimizer2.snr_capture = True
     for name, p in model.named_parameters():
@@ -2207,9 +2295,14 @@ for step in range(RESUME_STEP, train_steps + 1):
     H.before_step()
     for opt in optimizers:
         opt.step()
-    if snr_on:
+    if snr_on or snrw_on:
         optimizer2.snr_capture = False
-        snr_diag(step, snr_local)
+        snr_gathered = snr_gather(snr_local)
+        if snr_on:
+            snr_diag(step, snr_gathered)
+        if snrw_on:
+            snrw_refresh(step, snr_gathered)
+        del snr_gathered
     if ANATOMY:
         anat_post_step()
     H.after_step(step, train_loss / inputs.numel())
