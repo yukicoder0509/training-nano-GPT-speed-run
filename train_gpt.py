@@ -243,6 +243,11 @@ ENA_G_SWITCH = int(os.environ.get("ENA_G_SWITCH", 0))
 # grp = bbias (Linear biases in the blocks) | lmbias (lm_head bias) | norm | embed | head | hidden, dir = buf | ema<b>.
 ENA_G_DIR = os.environ.get("ENA_G_DIR", "buf")
 ENA_X = os.environ.get("ENA_X", "")
+# SODA="scope[+scope...]:c:k0" (Pethick et al., arXiv 2605.11172): after each inner step, anchor toward the init,
+# p -= c * (p - p0) / (k + k0), k = the global step; c=1, k0=2 is the paper's uniform primal averaging. p0 is the
+# seed's init (regenerated, so a fork from a checkpoint anchors to its parent's init). The anchor replaces CWD on the
+# matrices in scope. scope = all | hidden (block matrices) | mlpproj | aux (1-D) | embed | head.
+SODA = os.environ.get("SODA", "")
 ENA_G_MULT_AFTER = float(os.environ.get("ENA_G_MULT_AFTER", 1.0))
 ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
 ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
@@ -834,6 +839,7 @@ class Muon(torch.optim.Optimizer):
         self.head_mask = None
         _kind = lambda n: {"attn.q": "q", "attn.k": "k", "attn.v": "v", "attn.proj": "o", "mlp.fc": "fc",
                            "mlp.proj": "proj"}.get(n.split(".", 1)[1].rsplit(".", 1)[0])
+        self.no_cwd = set()   # params anchored by SODA instead
         self.row_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_SCOPE} if ROW_GAIN_LR > 0 or ROW_GAIN_FIXED else set()
         self.step_count = 0
         self.anat = {} if ANATOMY else None   # param -> list of (3, rows) fp16: u/w, RowFloor flag, row-gain step
@@ -970,7 +976,8 @@ class Muon(torch.optim.Optimizer):
                     else:
                         target_radius = target_radius_after_update(p, update, group["lr"])
                     # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
-                    if CWD > 0.0 and p.ndim == 2 and not (gain and ROW_GAIN_NO_CWD):
+                    cwd_on = CWD > 0.0 and p.ndim == 2 and not (gain and ROW_GAIN_NO_CWD) and p not in self.no_cwd
+                    if cwd_on:
                         # (C) Cautious Weight Decay: mask the coords where -lr*update already shrinks |p|
                         # (update*p>0); decay only those (never fight a coord the optimizer wants to grow).
                         cwd_mask = (update.float() * p.float() > 0).to(p.dtype)
@@ -995,7 +1002,7 @@ class Muon(torch.optim.Optimizer):
                                 a_gain = gstep.reshape(-1).expand(p.size(0)).clone()
                     else:
                         rescale_to_radius(p, target_radius)
-                    if CWD > 0.0 and p.ndim == 2 and not (gain and ROW_GAIN_NO_CWD):
+                    if cwd_on:
                         # apply AFTER the radius pin (POST) so the per-coord shape change is preserved.
                         p.mul_(1.0 - (group["lr"] * CWD) * cwd_mask)
                     if self.anat is not None and p.ndim == 2:
@@ -1075,6 +1082,7 @@ class EMA_Nesterov(torch.optim.Optimizer):
         self.current_lookahead_stepsize = 0
         self.gset = set()   # parameters with their own jump (configure_group)
         self.xspec = {}     # extra groups: param -> (mult, dir) (configure_extra)
+        self.soda = {}      # param -> init p0 (float32) (configure_soda)
         self.initialize_buffers()
 
     def configure_group(self, params, mult, start, end, auto, auto_max, ls, log_path=None):
@@ -1089,6 +1097,17 @@ class EMA_Nesterov(torch.optim.Optimizer):
         for params, mult, d in specs:
             for p in params:
                 self.xspec[p] = (mult, d)
+
+    def configure_soda(self, params, c, k0):
+        self.soda = {p: p.detach().float().clone() for p in params}
+        self.soda_c, self.soda_k0 = c, k0
+
+    @torch.no_grad()
+    def soda_anchor(self):
+        """SODA: p -= c (p - p0) / (k + k0), primal averaging anchored at the init."""
+        a = self.soda_c / (self.it + self.soda_k0)
+        for p, p0 in self.soda.items():
+            p.sub_((p.float() - p0).mul_(a).to(p.dtype))
 
     def _dir(self, p, d):
         if d == "buf":
@@ -1265,6 +1284,8 @@ class EMA_Nesterov(torch.optim.Optimizer):
             self.inner_optimizer.step()
 
         self.tune_after_step()
+        if self.soda:
+            self.soda_anchor()
         self.accum_lookahead()
 
         self.lookahead_status = False
@@ -1578,7 +1599,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
-             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X")
+             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
@@ -1987,8 +2008,21 @@ if ROW_TRANSPLANT:
     dist.destroy_process_group()
     sys.exit(0)
 
+if SODA:
+    _sc, _c, _k0 = SODA.split(":")
+    _s_sel = dict(all=lambda n, p: True, hidden=lambda n, p: n.startswith("blocks.") and p.ndim == 2,
+                  mlpproj=lambda n, p: n.endswith("mlp.proj.weight"), aux=lambda n, p: p.ndim < 2,
+                  embed=lambda n, p: n == "embed.weight", head=lambda n, p: n == "proj.weight")
+    _sps = [p for n, p in model.named_parameters() if any(_s_sel[g](n, p) for g in _sc.split("+"))]
+    optimizers[0].configure_soda(_sps, float(_c), float(_k0))   # after the init broadcast, before any checkpoint load
+    optimizer2.no_cwd = set(_sps)
+    print0(f"SODA scope={_sc} c={_c} k0={_k0} params={len(_sps)} numel={sum(p.numel() for p in _sps)}", console=True)
 if RESUME_FROM:
     load_checkpoint(RESUME_FROM)
+if SODA:
+    _d = sum((p.float() - p0).square().sum() for p, p0 in optimizers[0].soda.items()).item() ** 0.5
+    _n = sum(p0.square().sum() for p0 in optimizers[0].soda.values()).item() ** 0.5
+    print0(f"SODA |p - p0| / |p0| = {_d / max(_n, 1e-12):.4f} at start (step {optimizers[0].it})", console=True)
 path_eff = (optim_dynamics.PathEfficiency(model, harness.NANOGPT_RULES, every=50, ks=(50, 200),
                                           out_path=logfile.replace(".txt", ".patheff.jsonl"))
             if PATH_EFF and dist.get_rank() == 0 else None)

@@ -35,6 +35,7 @@ The wrapper keeps a buffer b and the previous weights W_prev for every parameter
   - `ENA_G_LS`=λ: d is the exponentially weighted least-squares velocity of the group's weights (weights λ^age; S0 ← θ + λS0, S1 ← λ(S1 + S0_old), d = (W1·S0 − W0·S1)/(W0·W2 − W1²)) instead of b.
   - `ENA_G_DIR`=ema⟨b'⟩ (default `buf` = b): d is the group's own EMA of the per-step displacement, d ← b'·d + (1−b')·(W′ − W_prev), initialised from b (so a fork starts warm).
 - **Extra jump groups (env, off by default):** `ENA_X`="grp:m:dir,…" with grp = bbias (Linear biases in the blocks) | lmbias (lm_head bias) | norm | embed | head | hidden: that group jumps W ← W + m·β_t·d in the global window, d = b (`buf`) or its own EMA (`ema⟨b'⟩`, as above); m = 0 turns its jump off.
+- **SODA anchor (env, off by default; Pethick et al., arXiv 2605.11172):** `SODA`="scope[+scope]:c:k₀" with scope = all | hidden (block matrices) | mlpproj | aux (1-D) | embed | head. After the inner step and before the buffer update (so b sees it): W′ ← W′ − c·(W′ − W₀)/(t + k₀), W₀ = the init of the run's seed (regenerated, so a fork anchors to its parent's init). c = 1, k₀ = 2 is the paper's uniform primal averaging. Muon's CWD is off on the anchored matrices.
 
 ## 2. Muon: hidden 2-D matrices (q, k, v, attn.proj, mlp.fc, mlp.proj)
 
