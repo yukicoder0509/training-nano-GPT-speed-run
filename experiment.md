@@ -827,3 +827,17 @@ Gain LR at β 0.99/0.95: 0.01 → −0.2 (8), 0.02 → +10.9, 0.04 → +9.1 (8).
 - Not just smaller length steps: at β₁ 0.99, halving the LR loses the whole gain (−0.2), and doubling it costs ~2 steps. The length gradient wants averaging over ~100 steps at the same step size.
 - Lengths have to move (frozen: −38). They want to move on a slow, averaged signal.
 - Next: full-run check of `ROW_GAIN_BETAS=0.99,0.95`, seeds 0–7, paired with `norm25d`.
+
+**Full runs** (personal project; stop 2690, `DENSE_VAL=2600:2690:5`, seeds 0–7; paired with `norm25d` seeds 0–7 = the current default):
+
+| Set | Commit | Finished | Paired Δ val_ema@2690 (SE) | Track 3 rule n=8 at 2635 / 2640 | Earliest pass |
+|---|---|---|---|---|---|
+| `norm25d` (default) | — | 8/8 | — | 0.0033 / 0.0042 | 2640 |
+| `rgb99` β 0.99/0.95 | `f1622d0` | **7/8 (seed 4: NaN at step 1517)** | −0.00043 (23), n=7 | — | (2640, n=7) |
+| `rgb99c` β 0.99/0.95, `ROW_GAIN_CLIP=1` | `f18b1f0` | 8/8 | −0.00002 (31) | 0.0034 / 0.0043 | 2640 |
+| `rgb9999` β 0.99/0.99 | `f18b1f0` | 8/8 | −0.00042 (42) | **0.0045** / 0.0055 | **2635** |
+
+- β 0.99/0.95 is unsafe: β₁ > √β₂ = 0.975 leaves m̂/√v̂ unbounded, and one seed in eight diverged (as all three β₁ 0.998 forks did). `ROW_GAIN_CLIP=1` makes it safe and keeps most of the fork gain (forks: +8.9 ± 0.9 steps vs +10.9 unclipped), but its 8 full runs show no gain (−0.00002 ± 0.00031).
+- β 0.99/0.99 satisfies the bound (0.99 < √0.99), runs all 8 seeds, and gives −0.00042 ± 0.00042 at 2690 and a first pass at 2635 instead of 2640. Forks: +8.7 ± 0.3.
+- The paired full-run differences have SD ≈ 0.0009–0.0012 per seed (trajectories decorrelate long before step 1000), so n = 8 resolves only effects ≳ 0.0008 (≈ 12 steps). The fork estimates (+9–11 steps, SE ≤ 1) are the precise ones; the full runs only rule out a large loss and check stability.
+- Next: `rgb9999` seeds 8–15 for the 16-seed rule (as for the 2640 record).
