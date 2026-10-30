@@ -11,6 +11,8 @@ within-step SNR (--by snr) or by the rank of their singular value (--by rank, to
   fwd     fraction of pairs whose net motion continues the anchor's step (net_i < 0, Muon moves W by -lr u_i v_i^T)
   path%   the bin's share of the total path (motion spent)
   net%    the bin's share of sum_i |net_i| (motion that persisted)
+  random  null: random orthonormal pairs tracked the same way (fwd: net motion continues the anchor step's component
+          along the pair); momentum makes any direction's motion persist for ~20 steps, so compare eff and fwd with it
   meanT   mean t-statistic of g_i over the k steps (< 0: later gradients oppose the anchor's step, i.e. overshoot; the
           weights keep moving along the pairs, so this mixes signal with the optimizer's own feedback)
 """
@@ -60,7 +62,12 @@ def main():
                 if a.k not in r["snaps"]:
                     continue
                 g, g2, net, path = (x.double().numpy() for x in r["snaps"][a.k])
-                k = a.k
+                k, nk = a.k, len(r["snr"])
+                if len(g) == 2 * nk:   # anchor pairs, then the random null pairs
+                    eff_r = np.abs(net[nk:]) / np.maximum(path[nk:], 1e-30)
+                    fwd_r = net[nk:] * r["c_r"].double().numpy() < 0
+                    acc.setdefault((group(r["name"]), ph, "random"), []).append((eff_r.sum(), fwd_r.sum(), nk))
+                    g, g2, net, path = g[:nk], g2[:nk], net[:nk], path[:nk]
                 T = (g / k) / (np.sqrt(np.maximum((g2 - g * g / k) / (k - 1), 1e-300)) / np.sqrt(k))
                 eff = np.abs(net) / np.maximum(path, 1e-30)
                 key = r["snr"].double().numpy() if a.by == "snr" else np.arange(len(g)) / len(g)
@@ -85,6 +92,10 @@ def main():
                 n = max(v[:, 6].sum(), 1)
                 print(f"  {lab:>10} {v[:, 0].mean():7.3f} {v[:, 1].sum() / n:7.3f} {v[:, 2].sum() / n:7.3f} "
                       f"{v[:, 3].mean():7.3f} {v[:, 4].mean():7.3f} {v[:, 5].sum() / n:7.2f}")
+            v = acc.get((grp, ph, "random"))
+            if v:
+                v = np.array(v)
+                print(f"  {'random':>10} {'':>7} {v[:, 0].sum() / v[:, 2].sum():7.3f} {v[:, 1].sum() / v[:, 2].sum():7.3f}")
 
 
 if __name__ == "__main__":

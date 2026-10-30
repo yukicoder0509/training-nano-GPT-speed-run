@@ -262,7 +262,8 @@ SNRW_EVERY = int(os.environ.get("SNRW_EVERY", "10"))
 SNRW_FLOOR = float(os.environ.get("SNRW_FLOOR", "0"))   # w <- max(w, SNRW_FLOOR)
 # TSNR_DIAG="every,k1,k2,..." (diagnostics only): at every `every`-th step, fix the singular pairs of Muon's input (SOAP
 # form) and their within-step BBP SNR, then sum g_i = u_i^T G v_i (each pair's first-order descent) and g_i^2 over the next
-# k steps, snapshots at each k (max k <= every) -> <log>.tsnr/anchor<t>.pt; tsnr.py bins the pairs by SNR.
+# k steps, snapshots at each k (max k <= every) -> <log>.tsnr/anchor<t>.pt; tsnr.py bins the pairs by SNR. The snapshot
+# arrays hold the anchor's pairs then as many random orthonormal pairs (the null).
 _tsnr = [int(x) for x in os.environ.get("TSNR_DIAG", "").split(",") if x]
 TSNR_EVERY, TSNR_KS = (_tsnr[0], _tsnr[1:]) if _tsnr else (0, [])
 assert not TSNR_KS or TSNR_KS[-1] <= TSNR_EVERY
@@ -2177,9 +2178,15 @@ def tsnr_anchor(step, gathered):
         Ex = soap_noise(E, caps)
         nz = _noise_roots(dict(A=c * (Ex @ Ex.mT).sum(0), B=c * (Ex.mT @ Ex).sum(0)))
         U, S, Vh, snr = direction_snr(caps["soap"], nz)
-        tsnr_state[(p, step)] = dict(t0=step, U=U, Vh=Vh, s=S.cpu(), snr=snr.cpu(), g=torch.zeros_like(S),
-                             g2=torch.zeros_like(S), w0=p.detach().float().clone(), prev=p.detach().float().clone(),
-                             path=torch.zeros_like(S), snaps={})
+        # null: random orthonormal pairs tracked the same way; c = the anchor step's component along each
+        gen = torch.Generator(device=U.device).manual_seed(step)   # own stream: the training RNG is untouched
+        Ur = torch.linalg.qr(torch.randn(U.shape, device=U.device, generator=gen))[0]
+        Vhr = torch.linalg.qr(torch.randn(Vh.mT.shape, device=U.device, generator=gen))[0].mT
+        c_r = ((Ur.mT @ (U @ Vh)) * Vhr).sum(-1)
+        tsnr_state[(p, step)] = dict(t0=step, U=torch.cat([U, Ur], 1), Vh=torch.cat([Vh, Vhr], 0), s=S.cpu(),
+                                     snr=snr.cpu(), c_r=c_r.cpu(), g=torch.zeros(2 * len(S), device=U.device),
+                                     g2=torch.zeros(2 * len(S), device=U.device), w0=p.detach().float().clone(),
+                                     prev=p.detach().float().clone(), path=torch.zeros(2 * len(S), device=U.device), snaps={})
 
 
 @torch.no_grad()
@@ -2212,7 +2219,8 @@ def tsnr_after_step(step):
         if k == TSNR_KS[-1]:
             done.append(key)
     recs = [dict(name=pname[key[0]], shape=tuple(key[0].shape), t0=key[1], s=tsnr_state[key]["s"],
-                 snr=tsnr_state[key]["snr"], snaps=tsnr_state.pop(key)["snaps"]) for key in done]
+                 snr=tsnr_state[key]["snr"], c_r=tsnr_state[key]["c_r"], snaps=tsnr_state.pop(key)["snaps"])
+            for key in done]
     flag = torch.tensor([len(recs)], device=device)
     dist.all_reduce(flag)
     if flag.item():
