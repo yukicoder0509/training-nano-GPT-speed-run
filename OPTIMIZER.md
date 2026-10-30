@@ -102,6 +102,7 @@ There is no gradient clipping and no other weight decay.
   - `ROW_GAIN_NO_CWD` (default 1): no CWD on those matrices while their row gains are active, i.e. from step 1000 on q, k, v, o, fc only mlp.proj keeps CWD; with `ROW_GAIN_FIXED=1` every row length stays exactly constant. `ROW_GAIN_NO_CWD=0` is the 2665 record.
   - `ROW_GAIN_LR` = a > 0 (default 0.02): step 8 is purely angular per row (r*_i = ‖W_i‖), then each row norm takes its own Adam step: g_i = ⟨∇W_i, W_i/‖W_i‖⟩ (raw gradient), Adam(β = 0.9, 0.95, bias-corrected), W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i). CWD still follows.
   - `ROW_GAIN_BETAS`="β₁,β₂" (default 0.9,0.95): the betas of that length Adam.
+  - `ROW_GAIN_CLIP` = c > 0 (default 0 = off): m̂_i/√v̂_i is clipped to [−c, c]. For β₁ > √β₂ the ratio is unbounded and a row can flip sign (1 − a·ratio < 0).
   - `ROW_GAIN_COLS` (types, default none; e.g. proj): those matrices get one gain per column (input unit; for mlp.proj, one per MLP neuron) instead of per row: step 8 is purely angular per column and c_j = ‖W_{:,j}‖ takes the Adam step on g_j = ⟨∇W_{:,j}, W_{:,j}/‖W_{:,j}‖⟩. A type is either in `ROW_GAIN_SCOPE` or here.
   - `ROW_GAIN_KEEP_FRO` (types, default none): after the gain step, those matrices are rescaled to the rec-46 whole-matrix pin's target r* (step 8), so the gains only redistribute length between rows (columns) and cannot change the matrix's total scale.
 - SOAP variants (env, defaults = rec-46; scope `SOAP_*_SCOPE` = all | vo):

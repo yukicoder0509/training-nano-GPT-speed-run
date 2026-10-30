@@ -288,6 +288,9 @@ ROW_GAIN_NO_CWD = os.environ.get("ROW_GAIN_NO_CWD", "1") == "1"   # default on (
 # also be in ROW_GAIN_SCOPE). ROW_GAIN_KEEP_FRO: types whose gains only redistribute length between rows/columns (after the
 # gain step the matrix is rescaled to the whole-matrix radius pin's target), i.e. separates reshaping from total scale.
 ROW_GAIN_B1, ROW_GAIN_B2 = (float(x) for x in os.environ.get("ROW_GAIN_BETAS", "0.9,0.95").split(","))
+# ROW_GAIN_CLIP=c > 0: clip the length Adam's ratio m_hat/sqrt(v_hat) to [-c, c]. Needed for beta1 > sqrt(beta2), where the
+# ratio is unbounded (it grows like (beta1/sqrt(beta2))^k while a row's length gradient fades) and a row can flip sign.
+ROW_GAIN_CLIP = float(os.environ.get("ROW_GAIN_CLIP", 0))
 ROW_GAIN_COLS = set(x for x in os.environ.get("ROW_GAIN_COLS", "").split(",") if x)
 ROW_GAIN_KEEP_FRO = set(x for x in os.environ.get("ROW_GAIN_KEEP_FRO", "").split(",") if x)
 assert not ROW_GAIN_COLS & ROW_GAIN_SCOPE
@@ -1053,6 +1056,8 @@ class Muon(torch.optim.Optimizer):
                             state["row_v"].lerp_(g_row.square(), 1 - ROW_GAIN_B2)
                             adam = (state["row_m"] / (1 - ROW_GAIN_B1 ** state["row_t"])) / (
                                 (state["row_v"] / (1 - ROW_GAIN_B2 ** state["row_t"])).sqrt() + 1e-12)
+                            if ROW_GAIN_CLIP > 0:
+                                adam = adam.clamp(-ROW_GAIN_CLIP, ROW_GAIN_CLIP)
                             gstep = ROW_GAIN_LR * group["lr"] / group["initial_lr"] * adam
                             p.mul_((1 - gstep).to(p.dtype))
                             if self.anat is not None and ax == 1:
@@ -1438,7 +1443,7 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR} "
        f"row_gain_scope={sorted(ROW_GAIN_SCOPE)} row_gain_mode={ROW_GAIN_MODE} "
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
-       f"row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} row_gain_cols={sorted(ROW_GAIN_COLS)} keep_fro={sorted(ROW_GAIN_KEEP_FRO)} "
+       f"row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} clip={ROW_GAIN_CLIP} row_gain_cols={sorted(ROW_GAIN_COLS)} keep_fro={sorted(ROW_GAIN_KEEP_FRO)} "
        f"head_gain_lr/start/betas/drift={HEAD_GAIN_LR}/{HEAD_GAIN_START}/{HEAD_GAIN_B1},{HEAD_GAIN_B2}/{HEAD_GAIN_DRIFT} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
@@ -1705,7 +1710,7 @@ pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR",
-             "ROW_GAIN_BETAS", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT")
+             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
