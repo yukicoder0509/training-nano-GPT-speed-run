@@ -751,3 +751,48 @@ k = 100, efficiency / fwd (mean of 3 seeds):
 - Directions that look like noise in one step move persistently over 100 steps, almost as much as the high-SNR ones and far above random directions. Only in attention at the first anchors (100–200) are the lowest-SNR pairs close to chance (fwd 0.57 in the 205-step smoke run). Within-step SNR is not a noise label for Muon's step, which matches the SNRW forks (any down-weighting costs steps).
 - Part of the persistence is structural: in the step-1500 checkpoint, W's own component along the momentum's singular pairs, uᵢᵀWvᵢ, is negative for 95–100% of the pairs (q, v, o, fc, proj of block 3; cos(Y, W) only −0.02 to −0.08), so Muon's step grows W's component along every pair, and the radius pin rescales globally. The diagnostic cannot separate that drift from loss-reducing signal.
 - Consequence for the follow-up ideas: per-direction longer averaging for low-SNR directions has little to average away after the first few hundred steps (their motion is already persistent), and a temporal-SNR weighting would rank nearly all pairs alike. SNR line closed.
+
+## 2026-10-30 — Length learning, round 2: LM head, gain betas, mlp.proj
+
+**Setup** (commit `4dd2b1c`; knobs `HEAD_GAIN_LR`, `HEAD_DIAG`, `ROW_GAIN_BETAS`, `ROW_GAIN_COLS`, `ROW_GAIN_KEEP_FRO`, see OPTIMIZER.md). Forks from step 1000 of `traj-rec` (2640-record settings), seeds 0–2, to 2690; control `rec-ctrl` (noise SD 0.000041); `python fork_compare.py <v> --parent traj-rec --control rec-ctrl --ks 1000`. Steps = −Δ/slope, + = better.
+
+| Variant | Δ val_ema@2690 (SE) | Steps |
+|---|---|---|
+| `hd-ctrl` (HEAD_DIAG only, training unchanged) | −0.00007 (4) | +1.2 |
+| head gains a = 0.002 | +0.00031 (9) | −5.3 |
+| head gains a = 0.005 | +0.00028 (6) | −4.9 |
+| head gains a = 0.01 | +0.00045 (5) | −7.7 |
+| head gains a = 0.02 | +0.00050 (3) | −8.6 |
+| gain betas 0.8, 0.95 | +0.00000 (10) | −0.0 |
+| gain betas 0.95, 0.95 | −0.00021 (7) | **+3.5** |
+| gain betas 0.9, 0.9 | −0.00001 (6) | +0.2 |
+| gain betas 0.9, 0.99 | −0.00001 (5) | +0.1 |
+| gain betas 0.95, 0.99 | −0.00004 (3) | +0.7 |
+| mlp.proj column gains (+ fc row gains, default) | +0.00027 (1) | −4.7 |
+| no fc row gains (q,k,v,o only) | +0.00010 (8) | −1.8 |
+| mlp.proj column gains, no fc row gains | +0.00016 (6) | −2.7 |
+| mlp.proj row gains (q,k,v,o,fc,proj) | +0.00057 (13) | −9.7 |
+| mlp.proj row gains, total norm pinned (`ROW_GAIN_KEEP_FRO=proj`) | +0.00005 (5) | −0.8 |
+
+**LM head** (`HEAD_DIAG`, 16 val sequences; at step 1000: 39% of positions have a pre-cap max logit > 15, cap slope at the target logit 0.56; corr(log row length, log token frequency) = −0.23, i.e. rare tokens do *not* have shorter rows, the head bias carries the prior; predicted vs actual mass per frequency bucket within 3%, except the 1–9-count bucket over-predicted by ~7%).
+- Every head-gain LR loses, 5–9 steps, more at higher a.
+- At step 2690 (3 seeds each):
+
+  | | median row length | max row length | frac(max logit > 15) | cap slope at target |
+  |---|---|---|---|---|
+  | control | 4.16 | 9.7–10.7 | 0.31 | 0.58 |
+  | a = 0.002 | 3.01 | 23–31 | 0.34 | 0.57 |
+  | a = 0.02 | 2.94 | 203–739 | 0.36 | 0.57 |
+
+- Under AdamW the head rows grow 50% from step 1000 to 2690 (2.78 → 4.16) without a radial gradient asking for it: tangential steps lengthen a row (|W+Δ|² = |W|² + |Δ|² for Δ ⊥ W), which lowers the head's effective angular step size η/r over training. Row gains remove that drift (their own radial gradient keeps the median near 2.9–3.0), so the head turns ~1.4× faster late in training. A few rows (never-seen tokens with a consistently negative radial gradient) grow geometrically to lengths of 200–700, which the Adam-normalized gain step cannot slow down.
+- Soft-cap interaction: more positions in the saturated region (0.34–0.37 vs 0.31 at 2690; 0.42–0.47 vs 0.39 at 1500) and a slightly lower cap slope; calibration per frequency bucket unchanged in every run. The rare-token calibration that the idea targets is not visibly off in this model.
+- Not separated here: the loss from the faster effective head LR vs. the loss from learned lengths themselves.
+
+**Gain optimizer betas.** β₁ 0.95 with β₂ 0.95 is +3.5 ± 1.2 steps; all others within ±1. Only one cell stands out, so it needs a neighbour check (β₁ 0.97, β₂ 0.9/0.95) before a full-run test.
+
+**mlp.proj.**
+- Row gains re-measured: −9.7 steps (earlier forks: also negative).
+- With the matrix's total norm pinned to the rec-46 radius target, the same row gains are neutral (−0.8 ± 0.9). The loss comes from the total MLP write scale the row gains let grow (the anatomy runs: MLP outputs crowd out attention), not from redistributing length between residual dimensions.
+- Column gains (one per neuron) hurt too: −4.7 with fc row gains on, −0.9 relative to `nofc` without them. Most of their cost is the redundancy with the fc gains (c_j·s_j² for the same neuron), and they also free the total norm.
+- Decision: mlp.proj keeps the whole-matrix pin. `ROW_GAIN_KEEP_FRO=proj` on its own buys nothing.
+- Side result: fc row gains are worth ~2 steps from a fork at 1000 (`nofc` −1.8).
