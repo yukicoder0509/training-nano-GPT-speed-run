@@ -2058,7 +2058,18 @@ def snr_diag(step, local):
                     Ex = E
                 U, S, Vh = torch.linalg.svd(caps[key], full_matrices=False)
                 proj = ((U.mT @ Ex) * Vh).sum(-1)   # (W, k): u_i^T e_r v_i
-                rec[key] = dict(s=S.cpu(), tau2=(c * Ex.square().sum() / X.numel()).item(), tau2_dir=(c * proj.square().sum(0)).cpu())
+                tau2 = c * Ex.square().sum() / X.numel()
+                # Kronecker whitening: noise covariance ~ A (x) B with E[Z Z^T] = c sum_r e_r e_r^T, E[Z^T Z] likewise;
+                # Yw = Abar^-1/2 Y Bbar^-1/2 sqrt(E|Z|^2) has ~iid unit-variance noise (ridge 1e-3 of the mean eigenvalue)
+                def isqrt(M):
+                    M = M + 1e-3 * M.diagonal().mean() * torch.eye(M.size(0), device=M.device)
+                    ev, Q = torch.linalg.eigh(M)
+                    return (Q * ev.clamp_min(1e-30).rsqrt()) @ Q.mT
+                Ai, Bi = isqrt(c * (Ex @ Ex.mT).sum(0)), isqrt(c * (Ex.mT @ Ex).sum(0))
+                Sw = torch.linalg.svdvals(Ai @ caps[key] @ Bi * (tau2 * X.numel()).sqrt())
+                Ew = Ai @ Ex @ Bi * (tau2 * X.numel()).sqrt()
+                rec[key] = dict(s=S.cpu(), tau2=tau2.item(), tau2_dir=(c * proj.square().sum(0)).cpu(), s_w=Sw.cpu(),
+                                tau2_w=(c * Ew.square().sum() / X.numel()).item())
             recs.append(rec)
     out = [None] * W if rank == 0 else None
     dist.gather_object(recs, out, dst=0)
