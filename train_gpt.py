@@ -2177,7 +2177,7 @@ def tsnr_anchor(step, gathered):
         Ex = soap_noise(E, caps)
         nz = _noise_roots(dict(A=c * (Ex @ Ex.mT).sum(0), B=c * (Ex.mT @ Ex).sum(0)))
         U, S, Vh, snr = direction_snr(caps["soap"], nz)
-        tsnr_state[p] = dict(t0=step, U=U, Vh=Vh, s=S.cpu(), snr=snr.cpu(), g=torch.zeros_like(S),
+        tsnr_state[(p, step)] = dict(t0=step, U=U, Vh=Vh, s=S.cpu(), snr=snr.cpu(), g=torch.zeros_like(S),
                              g2=torch.zeros_like(S), w0=p.detach().float().clone(), prev=p.detach().float().clone(),
                              path=torch.zeros_like(S), snaps={})
 
@@ -2185,7 +2185,7 @@ def tsnr_anchor(step, gathered):
 @torch.no_grad()
 def tsnr_accum(step):
     """TSNR_DIAG, before the step: add this step's g_i(t) for every open anchor."""
-    for p, st in tsnr_state.items():
+    for (p, _), st in tsnr_state.items():
         if step - st["t0"] >= 1:
             g = ((st["U"].mT @ p.grad.float()) * st["Vh"]).sum(-1)
             st["g"] += g
@@ -2198,7 +2198,8 @@ def tsnr_after_step(step):
     path_i += |d_i|. At k = TSNR_KS steps after the anchor, snapshot (sum g, sum g^2, net displacement u_i^T (W - W0) v_i,
     path); write and close the anchor at its last k."""
     done = []
-    for p, st in tsnr_state.items():
+    for key, st in tsnr_state.items():
+        p = key[0]
         k = step - st["t0"]   # steps taken after the anchor's own step (W0 = the weights after it)
         if k < 1:
             continue
@@ -2209,9 +2210,9 @@ def tsnr_after_step(step):
             net = ((st["U"].mT @ (w - st["w0"])) * st["Vh"]).sum(-1)
             st["snaps"][k] = (st["g"].cpu().clone(), st["g2"].cpu().clone(), net.cpu(), st["path"].cpu().clone())
         if k == TSNR_KS[-1]:
-            done.append(p)
-    recs = [dict(name=pname[p], shape=tuple(p.shape), t0=tsnr_state[p]["t0"], s=tsnr_state[p]["s"],
-                 snr=tsnr_state[p]["snr"], snaps=tsnr_state.pop(p)["snaps"]) for p in done]
+            done.append(key)
+    recs = [dict(name=pname[key[0]], shape=tuple(key[0].shape), t0=key[1], s=tsnr_state[key]["s"],
+                 snr=tsnr_state[key]["snr"], snaps=tsnr_state.pop(key)["snaps"]) for key in done]
     flag = torch.tensor([len(recs)], device=device)
     dist.all_reduce(flag)
     if flag.item():
