@@ -809,3 +809,21 @@ k = 100, efficiency / fwd (mean of 3 seeds):
 
 - **Gain betas:** β₁ is what matters. β₁ 0.8–0.9 → ~0, 0.95 → +3.5, 0.97 → +3.8 (all three seeds +3.1 to +4.7). β₂ 0.95 beats 0.9 and 0.99. The gain Adam wants a longer momentum than the 0.9 it was written with. Not yet tested: β₁ ≥ 0.98; a full multi-seed run.
 - **Head gains with the plain-AdamW turning rate:** still −5.4 at both LRs; at a = 0.01 drift matching recovers only ~2 of the ~8 lost steps. So the faster head rotation is not the main cause. The loss comes from the learned lengths themselves: the median row stays near 3.0 instead of growing to 4.16, a few rows run away (max 27–422), and more positions saturate the soft-cap (0.35–0.37 vs 0.31). The head's length is better left to plain AdamW. Head-gain line closed.
+
+**Gain-beta sweep, rounds 3–4** (commit `ddd5f8e`, same parents, control and scoring; Δ val_ema@2690 SE in parentheses, ×1e-5):
+
+| β₁ \ β₂ | 0.9 | 0.95 | 0.97 | 0.99 |
+|---|---|---|---|---|
+| 0.9 | +0.2 (6) | 0 (default) | | +0.1 (5) |
+| 0.95 | +2.2 (1) | +3.5 (7) | | +0.7 (3) |
+| 0.97 | | +3.8 (3) | +4.2 (9) | +4.8 (1) |
+| 0.98 | | +6.2 (3) | | |
+| **0.99** | | **+10.9 (3)** | | +8.7 (2) |
+| 0.995 | | +8.6 (5) | | |
+| 0.998 | | NaN at step 1611, all 3 seeds | | |
+
+Gain LR at β 0.99/0.95: 0.01 → −0.2 (8), 0.02 → +10.9, 0.04 → +9.1 (8). Lengths frozen (`ROW_GAIN_FIXED=1`, no CWD): −38.0 (9).
+- Optimum β₁ = 0.99, β₂ = 0.95 (+10.9 ± 0.5 steps; seeds +11.4 / +11.4 / +9.7). Past it the gain drops (0.995) and then the run diverges (0.998: with the slow first moment and a fast second moment, m̂/√v̂ grows far past 1 when the recent gradient shrinks, and the multiplicative length step runs away).
+- Not just smaller length steps: at β₁ 0.99, halving the LR loses the whole gain (−0.2), and doubling it costs ~2 steps. The length gradient wants averaging over ~100 steps at the same step size.
+- Lengths have to move (frozen: −38). They want to move on a slow, averaged signal.
+- Next: full-run check of `ROW_GAIN_BETAS=0.99,0.95`, seeds 0–7, paired with `norm25d`.
