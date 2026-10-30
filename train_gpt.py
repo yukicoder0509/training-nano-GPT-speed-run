@@ -303,6 +303,12 @@ HEAD_GAIN_LR = float(os.environ.get("HEAD_GAIN_LR", 0))
 HEAD_GAIN_START = int(os.environ.get("HEAD_GAIN_START", 1000))
 HEAD_GAIN_B1, HEAD_GAIN_B2 = (float(x) for x in os.environ.get("HEAD_GAIN_BETAS", f"{ROW_GAIN_B1},{ROW_GAIN_B2}").split(","))
 HEAD_DIAG = os.environ.get("HEAD_DIAG", "0") == "1"
+# HEAD_WD / EMBED_WD: AdamW decoupled weight decay on lm_head / the embedding (default 0 = rec-46), W *= 1 - lr_t * wd.
+# NADAM: comma list of Adam groups that use a Nesterov numerator, beta1*m + (1-beta1)*g instead of m (embed, head: the
+# AdamW groups, bias-corrected as NAdamW; aux: all 1-D groups). Default none.
+HEAD_WD = float(os.environ.get("HEAD_WD", 0))
+EMBED_WD = float(os.environ.get("EMBED_WD", 0))
+NADAM = set(x for x in os.environ.get("NADAM", "").split(",") if x)
 # HEAD_GAIN_DRIFT=1 (with HEAD_GAIN_LR): keep the head's angular step size as without the gains. Plain AdamW lengthens rows
 # through its tangential steps, which slows their rotation; each row's tangential step is scaled by r_i / rtil_i, rtil_i the
 # length the tangential steps alone would have given it (from its length at HEAD_GAIN_START).
@@ -1117,6 +1123,8 @@ class Adam(torch.optim.Optimizer):
                 exp_avg.lerp_(grad, 1 - beta1)
                 exp_avg_sq.lerp_(grad.float().square(), 1 - beta2)
                 num = exp_avg.float()
+                if group.get("nesterov"):
+                    num = beta1 * num + (1 - beta1) * grad.float()
                 if group.get("msm"):
                     # multi-scale momentum (AdEMAMix-style): + alpha_t * slow EMA of the gradient
                     alpha, beta3, warm = group["msm"]
@@ -1127,6 +1135,36 @@ class Adam(torch.optim.Optimizer):
                     num = num + alpha * min(1.0, state["step"] / max(warm, 1)) * state["exp_avg_slow"]
                 adam_dir = num / (exp_avg_sq.sqrt() + eps)
                 p.add_(adam_dir.to(p.dtype), alpha=-group["lr"])
+
+
+class NAdamW(torch.optim.Optimizer):
+    """torch AdamW (bias-corrected, decoupled weight decay) with an optional per-group Nesterov numerator (NADAM):
+    m_hat = beta1 * m_t / (1 - beta1^(t+1)) + (1 - beta1) * g_t / (1 - beta1^t). Same state keys as torch AdamW, so a
+    checkpoint of either loads into the other."""
+    def __init__(self, params, lr, betas, eps, weight_decay):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, nesterov=False))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            (b1, b2), eps, lr, wd = group["betas"], group["eps"], group["lr"], group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g, st = p.grad.float(), self.state[p]
+                if len(st) == 0:
+                    st["step"] = torch.tensor(0.0)
+                    st["exp_avg"], st["exp_avg_sq"] = torch.zeros_like(p), torch.zeros_like(p)
+                t = float(st["step"]) + 1
+                st["step"] = torch.tensor(t)
+                if wd:
+                    p.mul_(1 - lr * wd)
+                m, v = st["exp_avg"], st["exp_avg_sq"]
+                m.lerp_(g.to(m.dtype), 1 - b1)
+                v.lerp_(g.square().to(v.dtype), 1 - b2)
+                mh = (b1 * m.float() / (1 - b1 ** (t + 1)) + (1 - b1) * g / (1 - b1 ** t) if group["nesterov"]
+                      else m.float() / (1 - b1 ** t))
+                p.add_((mh / ((v.float() / (1 - b2 ** t)).sqrt() + eps)).to(p.dtype), alpha=-lr)
 
 
 class EMA_Nesterov(torch.optim.Optimizer):
@@ -1445,6 +1483,7 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
        f"row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} clip={ROW_GAIN_CLIP} row_gain_cols={sorted(ROW_GAIN_COLS)} keep_fro={sorted(ROW_GAIN_KEEP_FRO)} "
        f"head_gain_lr/start/betas/drift={HEAD_GAIN_LR}/{HEAD_GAIN_START}/{HEAD_GAIN_B1},{HEAD_GAIN_B2}/{HEAD_GAIN_DRIFT} "
+       f"head_wd={HEAD_WD} embed_wd={EMBED_WD} nadam={sorted(NADAM)} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
        f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN} dir={ENA_G_DIR} extra={ENA_X}")
@@ -1579,9 +1618,14 @@ with torch.no_grad():
         block.norm2.gains.data.copy_((1.0 + _CGI_ALPHA * s).to(block.norm2.gains.dtype))
 
 # create the optimizer(s)
-optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
-                    dict(params=[model.proj.weight], lr=1/320)],
-                   betas=(0.8, 0.99), eps=1e-10, weight_decay=0, fused=True)
+if NADAM & {"embed", "head"}:
+    optimizer1 = NAdamW([dict(params=[model.embed.weight], lr=0.3, weight_decay=EMBED_WD, nesterov="embed" in NADAM),
+                         dict(params=[model.proj.weight], lr=1/320, weight_decay=HEAD_WD, nesterov="head" in NADAM)],
+                        lr=0.3, betas=(0.8, 0.99), eps=1e-10, weight_decay=0)
+else:
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3, weight_decay=EMBED_WD),
+                        dict(params=[model.proj.weight], lr=1/320, weight_decay=HEAD_WD)],
+                       betas=(0.8, 0.99), eps=1e-10, weight_decay=0, fused=True)
 gain_aux_params = [p for n, p in model.named_parameters() if p.ndim < 2 and n.endswith(".gains")]
 attn_proj_bias_params = [p for n, p in model.named_parameters() if n.endswith(".attn.proj.bias")]
 other_aux_params = [p for n, p in model.named_parameters()
@@ -1597,6 +1641,8 @@ optimizer3 = Adam([
         dict(params=attn_proj_bias_params, lr=0.01 * AUX_LR_MULT, betas=(AUX_BETA1, 0.9965)),
     ],
     lr=0.01, betas=(0.8, 0.99), eps=1e-10)
+for group in optimizer3.param_groups:
+    group["nesterov"] = "aux" in NADAM
 # Skylight-001: NorMuon-lite (per-row variance) + u/w-floor + lr=0.0375.
 newton = NewtonPreconditioner(model) if NEWTON_MUON else None
 optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
@@ -1710,7 +1756,7 @@ pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR",
-             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT")
+             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT", "HEAD_WD", "EMBED_WD", "NADAM")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
