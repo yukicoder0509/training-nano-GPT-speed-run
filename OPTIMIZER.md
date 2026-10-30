@@ -132,6 +132,7 @@ There is no gradient clipping and no other weight decay.
   - β = (0.8, 0.99), ε = 1e-10, no weight decay, standard bias correction.
   - η₀ is 0.3 for the embedding and 1/320 for lm_head.
   - Head row gains (`HEAD_GAIN_LR` = a > 0, default 0 = off; from step `HEAD_GAIN_START`, default 1000, since lm_head is zero-initialized): with r_i = ‖W_i‖ and g_i = ⟨∇W_i, W_i/r_i⟩ taken before the AdamW step, each row is rescaled back to r_i after it (direction-only step per vocabulary row), then W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i), Adam on g_i with betas `HEAD_GAIN_BETAS` (default = `ROW_GAIN_BETAS`), bias-corrected. Applied inside EMA-Nesterov's step, before the lookahead accumulation.
+    - `HEAD_GAIN_DRIFT=1`: before the rescale, row i's tangential part D⊥_i of the AdamW step is scaled by r_i/r̃_i, where r̃_i ← √(r̃_i² + ‖D⊥_i‖²) from r̃_i = r_i at the start: the length plain AdamW's tangential steps alone would give the row. The row then turns at the same angle per step as without the gains.
 - **1-D parameters (norm gains and biases):** Adam without bias correction, η₀ = 0.01·a.
   - m ← β₁·m + (1−β₁)·g, with β₁ = 0.8
   - v ← β₂·v + (1−β₂)·g²

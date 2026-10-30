@@ -300,6 +300,10 @@ HEAD_GAIN_LR = float(os.environ.get("HEAD_GAIN_LR", 0))
 HEAD_GAIN_START = int(os.environ.get("HEAD_GAIN_START", 1000))
 HEAD_GAIN_B1, HEAD_GAIN_B2 = (float(x) for x in os.environ.get("HEAD_GAIN_BETAS", f"{ROW_GAIN_B1},{ROW_GAIN_B2}").split(","))
 HEAD_DIAG = os.environ.get("HEAD_DIAG", "0") == "1"
+# HEAD_GAIN_DRIFT=1 (with HEAD_GAIN_LR): keep the head's angular step size as without the gains. Plain AdamW lengthens rows
+# through its tangential steps, which slows their rotation; each row's tangential step is scaled by r_i / rtil_i, rtil_i the
+# length the tangential steps alone would have given it (from its length at HEAD_GAIN_START).
+HEAD_GAIN_DRIFT = os.environ.get("HEAD_GAIN_DRIFT", "0") == "1"
 # 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
@@ -1165,14 +1169,25 @@ class EMA_Nesterov(torch.optim.Optimizer):
             return None
         p = group["params"][0]
         r = p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
-        return p, r, (p.grad.float() * p.float()).sum(dim=1, keepdim=True) / r   # g_i = <grad_i, W_i/|W_i|>
+        w0 = p.float().clone() if HEAD_GAIN_DRIFT else None
+        return p, r, (p.grad.float() * p.float()).sum(dim=1, keepdim=True) / r, w0   # g_i = <grad_i, W_i/|W_i|>
 
     @torch.no_grad()
-    def head_gain_after(self, p, r, g):
+    def head_gain_after(self, p, r, g, w0):
         """The head's step becomes direction-only per row, then each row length takes its own Adam step."""
         opt, group, lr, start, (b1, b2) = self.head_gain
-        p.mul_((r / p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)).to(p.dtype))
         st = opt.state[p]
+        if w0 is not None:
+            # HEAD_GAIN_DRIFT: rtil_i is the length row i would have from the tangential steps alone (plain AdamW lengthens
+            # a row by |W+D|^2 = |W|^2 + |D_perp|^2); the tangential step is scaled by r_i / rtil_i, so the row turns by the
+            # angle |D_perp| / rtil_i it would turn without the gains.
+            d = p.float() - w0
+            d_perp = d - (d * w0).sum(dim=1, keepdim=True) / r.square() * w0
+            if "hg_rtil" not in st:
+                st["hg_rtil"] = r.clone()
+            st["hg_rtil"] = (st["hg_rtil"].square() + d_perp.square().sum(dim=1, keepdim=True)).sqrt()
+            p.copy_((w0 + d_perp * (r / st["hg_rtil"])).to(p.dtype))
+        p.mul_((r / p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)).to(p.dtype))
         if "hg_m" not in st:
             st["hg_m"], st["hg_v"], st["hg_t"] = torch.zeros_like(g), torch.zeros_like(g), 0
         st["hg_t"] += 1
@@ -1424,7 +1439,7 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"row_gain_scope={sorted(ROW_GAIN_SCOPE)} row_gain_mode={ROW_GAIN_MODE} "
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
        f"row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} row_gain_cols={sorted(ROW_GAIN_COLS)} keep_fro={sorted(ROW_GAIN_KEEP_FRO)} "
-       f"head_gain_lr/start/betas={HEAD_GAIN_LR}/{HEAD_GAIN_START}/{HEAD_GAIN_B1},{HEAD_GAIN_B2} "
+       f"head_gain_lr/start/betas/drift={HEAD_GAIN_LR}/{HEAD_GAIN_START}/{HEAD_GAIN_B1},{HEAD_GAIN_B2}/{HEAD_GAIN_DRIFT} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
        f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN} dir={ENA_G_DIR} extra={ENA_X}")
@@ -1690,7 +1705,7 @@ pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR",
-             "ROW_GAIN_BETAS", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS")
+             "ROW_GAIN_BETAS", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
