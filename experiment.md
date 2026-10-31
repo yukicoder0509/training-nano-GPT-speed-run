@@ -879,3 +879,20 @@ Track 3 rule (3.28 − mean)·√n:
 - **Weak positives (1.5–2.5 SE, need more seeds before use):** row-gain start 500, row-gain LR 0.04, embedding WD 0.001, Nesterov on embed/head. Each +3 to +4 steps.
 - **Losses:** strong decay on the head (0.3: −35) or the embedding (0.003: −14). Mild head decay (0.1) is neutral.
 - MARS not started: several knobs help, so the user decides next.
+
+**1-D Adam β₁ sweep and stacking** (commit `b80f984`, `GAIN_BETA1` = β₁ of the norm-gain group alone; forks from step 50 of `b99`, control `b99-ctrl`; noise SD per fork 0.000244 ≈ 4 steps):
+
+| Variant | Δ val_ema@2690 (SE) | Steps | Seeds (steps) |
+|---|---|---|---|
+| `AUX_BETA1=0.9` (all 1-D groups) | −0.00028 (11) | +4.8 | +8.0 / +4.7 / +1.7 |
+| `AUX_BETA1=0.95` | −0.00062 (20) | +10.8 | +9.9 / +5.0 / +17.3 |
+| `AUX_BETA1=0.97` | −0.00081 (33) | +14.1 | +10.6 / +6.4 / +25.4 |
+| `AUX_BETA1=0.99` | −0.00093 (27) | +16.1 | +21.7 / +6.9 / +19.6 |
+| `GAIN_BETA1=0.95` (norm gains only) | −0.00039 (8) | +6.8 | +8.9 / +4.2 / +7.4 |
+| stack: `ROW_GAIN_START=500 ROW_GAIN_LR=0.04 EMBED_WD=0.001 NADAM=embed,head` | −0.00023 (7) | +3.9 | +4.8 / +1.6 / +5.5 |
+| **stack + `AUX_BETA1=0.95`** | **−0.00135 (16)** | **+23.3** | +26.6 / +18.0 / +25.2 |
+
+- β₁ of the 1-D Adam keeps improving up to 0.99 (+16), flattening above 0.97. For the gains (β₂ 0.99) 0.99 is near the bound β₁ < √β₂ = 0.995. The biases have β₂ 0.997–0.9965, bound 0.998.
+- The norm gains carry about 60% of the β₁ 0.95 gain (+6.8 of +10.8); the biases the rest.
+- The four weak positives do not add up on their own: together +3.9, about the size of each one alone.
+- With β₁ 0.95 they do: +23.3 ± 2.8, more than the separate sums (10.8 + 3.9), 3 of 3 seeds. Which part of the stack interacts with β₁ is not yet resolved.
