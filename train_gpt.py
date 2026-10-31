@@ -312,6 +312,14 @@ NADAM = set(x for x in os.environ.get("NADAM", "").split(",") if x)
 # KNOB_START: keep the 1-D Adam beta1 (AUX_BETA1, GAIN_BETA1), HEAD_WD / EMBED_WD and NADAM at their defaults until this
 # step, then switch them on (default 0 = from the start). A fork from a step-50 checkpoint sees exactly KNOB_START=50.
 KNOB_START = int(os.environ.get("KNOB_START", 0))
+# MARS (MARS-approx, Yuan et al. 2024): feed the optimizer c_t = g_t + gamma * beta/(1-beta) * (g_t - g_{t-1}) instead of
+# g_t, with g_{t-1} the previous step's gradient (previous batch: one forward-backward per step). MARS: comma list of
+# muon (hidden matrices; beta = the Muon mu), embed, head (beta = AdamW beta1), aux (1-D groups; their beta1). Default none.
+# MARS_GAMMA: gamma (default 0.025, the paper's). MARS_CLIP=1: rescale c_t to unit norm per tensor if its norm is > 1.
+# g_{t-1} is not checkpointed: the first step of a run or fork is uncorrected.
+MARS = set(x for x in os.environ.get("MARS", "").split(",") if x)
+MARS_GAMMA = float(os.environ.get("MARS_GAMMA", 0.025))
+MARS_CLIP = os.environ.get("MARS_CLIP", "0") == "1"
 # HEAD_GAIN_DRIFT=1 (with HEAD_GAIN_LR): keep the head's angular step size as without the gains. Plain AdamW lengthens rows
 # through its tangential steps, which slows their rotation; each row's tangential step is scaled by r_i / rtil_i, rtil_i the
 # length the tangential steps alone would have given it (from its length at HEAD_GAIN_START).
@@ -1487,7 +1495,7 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
        f"row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} clip={ROW_GAIN_CLIP} row_gain_cols={sorted(ROW_GAIN_COLS)} keep_fro={sorted(ROW_GAIN_KEEP_FRO)} "
        f"head_gain_lr/start/betas/drift={HEAD_GAIN_LR}/{HEAD_GAIN_START}/{HEAD_GAIN_B1},{HEAD_GAIN_B2}/{HEAD_GAIN_DRIFT} "
-       f"head_wd={HEAD_WD} embed_wd={EMBED_WD} nadam={sorted(NADAM)} knob_start={KNOB_START} "
+       f"head_wd={HEAD_WD} embed_wd={EMBED_WD} nadam={sorted(NADAM)} knob_start={KNOB_START} mars={sorted(MARS)}/{MARS_GAMMA}/{MARS_CLIP} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
        f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN} dir={ENA_G_DIR} extra={ENA_X}")
@@ -1731,6 +1739,33 @@ def _muon_mu_at_step(step, train_steps):
     else:
         return _MU_MAX
 
+_mars_prev = {}
+def _mars_groups():
+    if "muon" in MARS:
+        for g in optimizer2.param_groups:
+            yield g["params"], g["mu"]
+    for i, k in ((0, "embed"), (1, "head")):
+        if k in MARS:
+            yield optimizer1.param_groups[i]["params"], optimizer1.param_groups[i]["betas"][0]
+    if "aux" in MARS:
+        for g in optimizer3.param_groups:
+            yield g["params"], g["betas"][0]
+
+@torch.no_grad()
+def mars_correct():
+    """MARS: p.grad <- g + gamma * beta/(1-beta) * (g - g_prev), after the all-reduce and set_hparams (beta = this step's)."""
+    for params, beta in _mars_groups():
+        for p in params:
+            g = p.grad.float()
+            prev = _mars_prev.get(p)
+            _mars_prev[p] = g.clone()
+            if prev is None:
+                continue
+            c = g + MARS_GAMMA * beta / (1 - beta) * (g - prev)
+            if MARS_CLIP:
+                c = c / c.norm().clamp(min=1.0)
+            p.grad.copy_(c)
+
 def set_hparams(step):
     progress = step / FINAL_SCHEDULE_STEPS
     # progress >= 1 is allowed when t_end (FINAL_SCHEDULE_STEPS) < train end: LR is clamped to 0
@@ -1769,7 +1804,7 @@ pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "GAIN_BETA1", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR",
-             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT", "HEAD_WD", "EMBED_WD", "NADAM", "KNOB_START")
+             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT", "HEAD_WD", "EMBED_WD", "NADAM", "KNOB_START", "MARS", "MARS_GAMMA", "MARS_CLIP")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
@@ -2556,6 +2591,8 @@ for step in range(RESUME_STEP, train_steps + 1):
         anat_pre_step(step)
     # set optimization hyperparameters and take a step
     set_hparams(step)
+    if MARS:
+        mars_correct()
     if traj is not None:
         _ena = optimizers[0]
         traj.after_grad(step, lr_aux=optimizer3.param_groups[0]["lr"], lr_scale=_ena.get_lr_lambda(),
