@@ -959,3 +959,22 @@ Val-loss gap to the control over training (×1e-4, 3-seed mean, negative = ahead
   - the 1-D Adam Nesterov numerator;
   - `KNOB_START` toggling;
   - `set_hparams`, which changes only lr and mu.
+
+## 2026-10-31 — 1-D Adam β₁ from step 1000; MARS
+
+**Setup.** Parents `b99` seeds 0–2, commit `ebca27b`, control `b99-ctrl`. Fork noise SD: 0.000087 from step 1000, 0.000244 from step 50.
+
+| Variant | Fork | Δ val_ema@2690 (SE) | Steps | Seeds (steps) | Same knob forked from step 50 |
+|---|---|---|---|---|---|
+| `AUX_BETA1=0.97` | 1000 | −0.00047 (7) | +8.1 | +7.0 / +10.6 / +6.6 | +14.1 |
+| `AUX_BETA1=0.99` | 1000 | −0.00023 (3) | +3.9 | +3.8 / +4.9 / +3.1 | +16.1 |
+| `MARS=muon` (γ 0.025) | 50 | +0.00073 (32) | −12.6 | −10.1 / −23.2 / −4.6 | |
+| `MARS=muon MARS_GAMMA=0.01` | 50 | −0.00038 (9) | +6.6 | +8.5 / +3.6 / +7.6 | |
+| `MARS=embed,head,aux` (γ 0.025) | 50 | +0.00012 (21) | −2.0 | −3.6 / −7.4 / +5.1 | |
+
+- **β₁ by phase.**
+  - For 0.97, about half the step-50 gain is still there when it starts at step 1000 (+8 of +14).
+  - For 0.99, most of the gain is earlier: only +4 of +16 when it starts at step 1000.
+  - So steps 50–1000 favour the higher β₁ (0.99), and the late phase favours about 0.97, not 0.99. A schedule fits this: low until step ~50, then high, possibly lowered again later. It still needs full runs, because forks miss the first 50 steps.
+- **MARS on Muon depends on γ.** At the paper's 0.025 (0.48× the gradient difference at μ 0.95) it loses 13 steps. At 0.01 (0.19×) it gains +6.6, all seeds positive. A smaller γ (about 0.005) is untested.
+- **MARS on the Adam groups** is neutral.
