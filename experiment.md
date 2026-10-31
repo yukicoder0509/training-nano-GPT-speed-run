@@ -928,9 +928,15 @@ Val-loss gap to the control over training (×1e-4, 3-seed mean, negative = ahead
 
 - Paired with the new default (`rgb9999`): **+0.00477 ± 0.00098** at 2690 (≈ −80 steps). 8 of 8 seeds are worse. No step passes; mean 3.27991 at 2690.
 - Gap per seed over training (×1e-4): about −250 to −520 at step 125, −6 to −190 at 250, near 0 by 1000. From 1250 it turns positive and keeps growing to +10…+89 at 2690.
-- **The forks do not carry over to runs from scratch.** At the same seed the controls agree: full minus fork is −4 / −26 / −42 at 2690. For the stack, the full run is already worse than the fork by +38 / +43 / −5 at step 1000 and +49 / +60 / +31 at 2690.
+- **The forks do not carry over to runs from scratch.** The fork protocol itself is sound: each control fork matches its own parent full run at 2690 (val_ema +0.0003 / +0.0003 / −0.0004). But two full runs at the same seed from separate launches differ by up to 0.0045 (`b99` parents vs `rgb9999`, same settings), so comparing one full run with one fork at the same seed is too noisy to be useful. The 8-seed paired result (+0.0048 ± 0.0010) is the evidence.
 - So the first 50 steps under the stack, which every fork from step 50 skips, are where it goes wrong. Possible causes, not yet tested:
   - the 1-D Adam has no bias correction, so with β₁ 0.97 its first steps are about 0.3× of those at 0.8;
   - the first Nesterov step on the embedding is about 1.4× the Adam step at lr 0.3;
   - embedding WD is active from initialization.
 - Lesson for the protocol: forks from step 50 cannot score knobs that change the first 50 steps. The earlier β₁ forks (+16 at 0.99) need a check from scratch too.
+
+**`KNOB_START=50`: the same stack with its knobs off until step 50** (`sa97k50`, seeds 0–3, commit `0306bee`, stop 2690). β₁, `NADAM` and `EMBED_WD` stay at their defaults until step 50, which is what a fork from step 50 sees. Row-gain start 500 and LR 0.04 are not affected (they only act after step 500).
+
+- Paired with `rgb9999`: **−0.00053 ± 0.00066** at 2690 (n = 4; seeds −0.00045 / −0.00009 / +0.00077 / −0.00236). Passes from 2640 with n = 4.
+- Against the stack with the knobs on from step 0 (`sa97`, +0.00477 ± 0.00098), that is 0.0053 better, about 4.5 SE. **So the damage happens in the first 50 steps.** Which of β₁ 0.97, Nesterov on the embedding, or embedding WD causes it has not been tested.
+- The fork estimate (−0.0015, +27 steps) is neither confirmed nor ruled out: it is 1.5 SE from the 4-seed mean. Telling −0.0005 from −0.0015 needs about 12–16 seeds.
