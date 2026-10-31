@@ -141,7 +141,7 @@ There is no gradient clipping and no other weight decay.
   - v ← β₂·v + (1−β₂)·g²
   - W ← W − η·m / (√v + 1e-10)
   - β₂ is 0.99 for gains, 0.9965 for the attn.proj bias, and 0.997 for everything else.
-  - Ablation knobs (env), defaults = rec-46: `GAIN_BETA2` (gains' β₂, 0.99), `AUX_BETA1` (β₁ for all 1-D params, 0.8), `AUX_LR_MULT` = a (1.0). a scales the PowerCool constant too, so η_t = a·η_t^(base).
+  - Ablation knobs (env), defaults = rec-46: `GAIN_BETA2` (gains' β₂, 0.99), `AUX_BETA1` (β₁ for all 1-D params, 0.8), `GAIN_BETA1` (β₁ for the norm gains only, default `AUX_BETA1`), `AUX_LR_MULT` = a (1.0). a scales the PowerCool constant too, so η_t = a·η_t^(base).
   - Multi-scale momentum (off by default): `MSM`="α,β₃[,T]" adds a slow gradient EMA, m_s ← β₃·m_s + (1−β₃)·g, and the step becomes W ← W − η·(m + α_t·m_s) / (√v + 1e-10), α_t = α·min(1, n/T) with n the steps since the knob became active (T default 500). `MSM_GROUPS` = `gains` (default) | `bias` (the other two groups) | `all`.
 
 ## 4. Evaluation only: Tail-EMA (training is unaffected)

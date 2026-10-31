@@ -317,6 +317,7 @@ HEAD_GAIN_DRIFT = os.environ.get("HEAD_GAIN_DRIFT", "0") == "1"
 # the PowerCool constant, i.e. the whole LR curve.
 GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
 AUX_BETA1 = float(os.environ.get("AUX_BETA1", 0.8))
+GAIN_BETA1 = float(os.environ.get("GAIN_BETA1", AUX_BETA1))   # beta1 of the norm-gain group only (default AUX_BETA1)
 AUX_LR_MULT = float(os.environ.get("AUX_LR_MULT", 1.0))
 
 
@@ -1636,7 +1637,7 @@ other_aux_params = [p for n, p in model.named_parameters()
 # NOTE: we do NOT use torch.optim.AdamW here because AdamW applies (1-beta^t) bias
 # correction, which CenterShrinkAdam does not -- they are not equivalent.
 optimizer3 = Adam([
-        dict(params=gain_aux_params, lr=0.01 * AUX_LR_MULT, betas=(AUX_BETA1, GAIN_BETA2)),
+        dict(params=gain_aux_params, lr=0.01 * AUX_LR_MULT, betas=(GAIN_BETA1, GAIN_BETA2)),
         dict(params=other_aux_params, lr=0.01 * AUX_LR_MULT, betas=(AUX_BETA1, 0.997)),
         dict(params=attn_proj_bias_params, lr=0.01 * AUX_LR_MULT, betas=(AUX_BETA1, 0.9965)),
     ],
@@ -1754,7 +1755,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
+_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "GAIN_BETA1", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR",
              "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT", "HEAD_WD", "EMBED_WD", "NADAM")
 
