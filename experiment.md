@@ -896,3 +896,41 @@ Track 3 rule (3.28 − mean)·√n:
 - The norm gains carry about 60% of the β₁ 0.95 gain (+6.8 of +10.8); the biases the rest.
 - The four weak positives do not add up on their own: together +3.9, about the size of each one alone.
 - With β₁ 0.95 they do: +23.3 ± 2.8, more than the separate sums (10.8 + 3.9), 3 of 3 seeds. Which part of the stack interacts with β₁ is not yet resolved.
+
+**Stack × β₁ and leave-one-out** (forks from step 50 of `b99`, commit `b80f984`, control `b99-ctrl`):
+
+| Variant | Δ val_ema@2690 (SE) | Steps | Seeds (steps) |
+|---|---|---|---|
+| stack + `AUX_BETA1=0.95` | −0.00135 (16) | +23.3 | +26.6 / +18.0 / +25.2 |
+| stack + `AUX_BETA1=0.97` | −0.00153 (23) | +26.6 | +18.9 / +27.7 / +33.0 |
+| stack + `AUX_BETA1=0.99` | −0.00158 (18) | +27.4 | +29.5 / +21.3 / +31.3 |
+| stack + 0.95 − row-gain start 500 | −0.00123 (14) | +21.3 | +23.0 / +16.6 / +24.3 |
+| stack + 0.95 − row-gain LR 0.04 | −0.00158 (36) | +27.4 | +18.8 / +23.5 / +40.0 |
+| stack + 0.95 − embedding WD 0.001 | −0.00107 (20) | +18.6 | +15.2 / +15.1 / +25.5 |
+| stack + 0.95 − Nesterov embed/head | −0.00065 (6) | +11.1 | +9.7 / +13.3 / +10.4 |
+
+Val-loss gap to the control over training (×1e-4, 3-seed mean, negative = ahead):
+
+| Variant | 250 | 500 | 1000 | 1250 | 1500 | 2000 | 2500 | 2690 |
+|---|---|---|---|---|---|---|---|---|
+| stack (β₁ 0.8) | +21 | −22 | −25 | +2 | +9 | +10 | +4 | +1 |
+| stack + 0.95 | −25 | −35 | −56 | −22 | −12 | −5 | −6 | −10 |
+| − Nesterov | −79 | −18 | −21 | +14 | +33 | +26 | +7 | −3 |
+| − embedding WD | −37 | −43 | −58 | −18 | −15 | −1 | −4 | −8 |
+| − row-gain LR 0.04 | −80 | −37 | −77 | −46 | −39 | −21 | −15 | −15 |
+| `EMBED_WD=0.001` alone | +46 | +7 | +26 | +27 | +37 | +19 | +3 | −2 |
+
+- In forks, the gain beyond the sum of the parts comes from Nesterov on embed/head together with higher β₁: about +12 steps, against +3.5 for Nesterov alone. Embedding WD adds about 5 and row-gain start 500 about 2. Row-gain LR 0.04 costs about 4 (1.3 SE).
+- Embedding WD alone is behind for most of the run (up to 3.7e-3 at step 1500) and only catches up at the end. Without Nesterov or without the higher β₁, the stack also falls behind after step 1000. With both, it stays ahead throughout. Why the pair holds up mid-run is not tested.
+- β₁ 0.97 and 0.99 are on a plateau (+27).
+
+**Full runs: stack + `AUX_BETA1=0.97` fails** (`sa97`, seeds 0–7, commit `b80f984`, stop 2690). `python fork_compare.py --full sa97 --full-controls rgb9999`:
+
+- Paired with the new default (`rgb9999`): **+0.00477 ± 0.00098** at 2690 (≈ −80 steps). 8 of 8 seeds are worse. No step passes; mean 3.27991 at 2690.
+- Gap per seed over training (×1e-4): about −250 to −520 at step 125, −6 to −190 at 250, near 0 by 1000. From 1250 it turns positive and keeps growing to +10…+89 at 2690.
+- **The forks do not carry over to runs from scratch.** At the same seed the controls agree: full minus fork is −4 / −26 / −42 at 2690. For the stack, the full run is already worse than the fork by +38 / +43 / −5 at step 1000 and +49 / +60 / +31 at 2690.
+- So the first 50 steps under the stack, which every fork from step 50 skips, are where it goes wrong. Possible causes, not yet tested:
+  - the 1-D Adam has no bias correction, so with β₁ 0.97 its first steps are about 0.3× of those at 0.8;
+  - the first Nesterov step on the embedding is about 1.4× the Adam step at lr 0.3;
+  - embedding WD is active from initialization.
+- Lesson for the protocol: forks from step 50 cannot score knobs that change the first 50 steps. The earlier β₁ forks (+16 at 0.99) need a check from scratch too.
