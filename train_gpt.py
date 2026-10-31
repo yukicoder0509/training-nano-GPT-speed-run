@@ -309,6 +309,9 @@ HEAD_DIAG = os.environ.get("HEAD_DIAG", "0") == "1"
 HEAD_WD = float(os.environ.get("HEAD_WD", 0))
 EMBED_WD = float(os.environ.get("EMBED_WD", 0))
 NADAM = set(x for x in os.environ.get("NADAM", "").split(",") if x)
+# KNOB_START: keep the 1-D Adam beta1 (AUX_BETA1, GAIN_BETA1), HEAD_WD / EMBED_WD and NADAM at their defaults until this
+# step, then switch them on (default 0 = from the start). A fork from a step-50 checkpoint sees exactly KNOB_START=50.
+KNOB_START = int(os.environ.get("KNOB_START", 0))
 # HEAD_GAIN_DRIFT=1 (with HEAD_GAIN_LR): keep the head's angular step size as without the gains. Plain AdamW lengthens rows
 # through its tangential steps, which slows their rotation; each row's tangential step is scaled by r_i / rtil_i, rtil_i the
 # length the tangential steps alone would have given it (from its length at HEAD_GAIN_START).
@@ -1484,7 +1487,7 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
        f"row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} clip={ROW_GAIN_CLIP} row_gain_cols={sorted(ROW_GAIN_COLS)} keep_fro={sorted(ROW_GAIN_KEEP_FRO)} "
        f"head_gain_lr/start/betas/drift={HEAD_GAIN_LR}/{HEAD_GAIN_START}/{HEAD_GAIN_B1},{HEAD_GAIN_B2}/{HEAD_GAIN_DRIFT} "
-       f"head_wd={HEAD_WD} embed_wd={EMBED_WD} nadam={sorted(NADAM)} "
+       f"head_wd={HEAD_WD} embed_wd={EMBED_WD} nadam={sorted(NADAM)} knob_start={KNOB_START} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
        f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN} dir={ENA_G_DIR} extra={ENA_X}")
@@ -1644,6 +1647,15 @@ optimizer3 = Adam([
     lr=0.01, betas=(0.8, 0.99), eps=1e-10)
 for group in optimizer3.param_groups:
     group["nesterov"] = "aux" in NADAM
+_knob_on = {id(g): {k: g[k] for k in ("betas", "nesterov", "weight_decay") if k in g}
+            for opt in (optimizer1, optimizer3) for g in opt.param_groups}
+def set_knobs(on):
+    for opt in (optimizer1, optimizer3):
+        for g in opt.param_groups:
+            for k, v in _knob_on[id(g)].items():
+                g[k] = v if on else dict(betas=(0.8, g["betas"][1]), nesterov=False, weight_decay=0)[k]
+if KNOB_START:
+    set_knobs(False)
 # Skylight-001: NorMuon-lite (per-row variance) + u/w-floor + lr=0.0375.
 newton = NewtonPreconditioner(model) if NEWTON_MUON else None
 optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
@@ -1757,7 +1769,7 @@ pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "GAIN_BETA1", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR",
-             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT", "HEAD_WD", "EMBED_WD", "NADAM")
+             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT", "HEAD_WD", "EMBED_WD", "NADAM", "KNOB_START")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
@@ -2503,6 +2515,9 @@ for step in range(RESUME_STEP, train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    if KNOB_START and step == max(KNOB_START, RESUME_STEP):
+        set_knobs(True)
+        print0(f"KNOB_START: knobs on at step {step}", console=True)
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
