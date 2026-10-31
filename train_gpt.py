@@ -1161,14 +1161,14 @@ class NAdamW(torch.optim.Optimizer):
                     st["exp_avg"], st["exp_avg_sq"] = torch.zeros_like(p), torch.zeros_like(p)
                 t = float(st["step"]) + 1
                 st["step"] = torch.tensor(t)
-                if wd:
-                    p.mul_(1 - lr * wd)
                 m, v = st["exp_avg"], st["exp_avg_sq"]
                 m.lerp_(g.to(m.dtype), 1 - b1)
                 v.lerp_(g.square().to(v.dtype), 1 - b2)
                 mh = (b1 * m.float() / (1 - b1 ** (t + 1)) + (1 - b1) * g / (1 - b1 ** t) if group["nesterov"]
                       else m.float() / (1 - b1 ** t))
-                p.add_((mh / ((v.float() / (1 - b2 ** t)).sqrt() + eps)).to(p.dtype), alpha=-lr)
+                # decay and step in fp32, rounded once (as fused AdamW): on the bf16 embedding a separate
+                # p.mul_(1 - lr*wd) rounds back to p (lr*wd = 3e-4 < half a bf16 ulp) and the decay is lost
+                p.copy_(p.float() * (1 - lr * wd) - lr * mh / ((v.float() / (1 - b2 ** t)).sqrt() + eps))
 
 
 class EMA_Nesterov(torch.optim.Optimizer):

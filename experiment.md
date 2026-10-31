@@ -920,7 +920,7 @@ Val-loss gap to the control over training (×1e-4, 3-seed mean, negative = ahead
 | − row-gain LR 0.04 | −80 | −37 | −77 | −46 | −39 | −21 | −15 | −15 |
 | `EMBED_WD=0.001` alone | +46 | +7 | +26 | +27 | +37 | +19 | +3 | −2 |
 
-- In forks, the gain beyond the sum of the parts comes from Nesterov on embed/head together with higher β₁: about +12 steps, against +3.5 for Nesterov alone. Embedding WD adds about 5 and row-gain start 500 about 2. Row-gain LR 0.04 costs about 4 (1.3 SE).
+- **[Wrong, see the bf16 correction below.]** In forks, the gain beyond the sum of the parts comes from Nesterov on embed/head together with higher β₁: about +12 steps, against +3.5 for Nesterov alone. Embedding WD adds about 5 and row-gain start 500 about 2. Row-gain LR 0.04 costs about 4 (1.3 SE).
 - Embedding WD alone is behind for most of the run (up to 3.7e-3 at step 1500) and only catches up at the end. Without Nesterov or without the higher β₁, the stack also falls behind after step 1000. With both, it stays ahead throughout. Why the pair holds up mid-run is not tested.
 - β₁ 0.97 and 0.99 are on a plateau (+27).
 
@@ -940,3 +940,22 @@ Val-loss gap to the control over training (×1e-4, 3-seed mean, negative = ahead
 - Paired with `rgb9999`: **−0.00053 ± 0.00066** at 2690 (n = 4; seeds −0.00045 / −0.00009 / +0.00077 / −0.00236). Passes from 2640 with n = 4.
 - Against the stack with the knobs on from step 0 (`sa97`, +0.00477 ± 0.00098), that is 0.0053 better, about 4.5 SE. **So the damage happens in the first 50 steps.** Which of β₁ 0.97, Nesterov on the embedding, or embedding WD causes it has not been tested.
 - The fork estimate (−0.0015, +27 steps) is neither confirmed nor ruled out: it is 1.5 SE from the 4-seed mean. Telling −0.0005 from −0.0015 needs about 12–16 seeds.
+
+**Correction: `EMBED_WD` was a no-op whenever `NADAM` included embed or head** (bug in `NAdamW`, fixed in the next commit).
+
+- The embedding is bf16. `NAdamW` decayed it with a separate `p.mul_(1 - lr·wd)`. At lr·wd = 0.3 × 0.001 = 3e-4, below half a bf16 ulp, every element rounds back to itself.
+- Fused torch AdamW, which is used when `NADAM` has neither embed nor head, does the decay and the step in fp32 and rounds once, so the decay acts. A CPU/GPU test with 300 steps on a bf16 4096×64 matrix: the norm ratio for `NAdamW` wd 0 vs 0.001 was 5.07006 / 5.07006; for fused AdamW, 5.07022 / 4.84440. After the fix `NAdamW` matches fused AdamW (2588.17 vs 2588.25 with wd).
+- **Runs whose embedding WD did nothing:** `stack`, `stack-aux95/97/99`, `loo-start`, `loo-lr`, and the full runs `sa97` and `sa97k50`.
+- **Runs where it acted:** `ewd001` and `loo-nadam`, both on fused AdamW.
+- **What this changes:**
+  - **Embedding WD inside the stack:** effectively off. `loo-ewd` and `stack-aux95` are the same configuration, so their 4.7-step gap is fork noise, not a contribution from WD.
+  - **`loo-nadam`:** this fork switched Nesterov off *and* switched effective WD on. Its mid-run deficit (+33e-4 at step 1500) has the same shape as `ewd001` alone (+37e-4), so WD is the likely cause. The claimed Nesterov × β₁ interaction is not supported.
+  - **Additivity:** with WD off, stack + β₁ 0.95 = row-gain start 500 + row-gain LR 0.04 + Nesterov embed/head + β₁ 0.95. The separate forks sum to 3.7 + 2.9 + 3.5 + 10.8 = 20.9 steps, against +23.3 measured, so the parts roughly add. What remains unexplained is the stack at β₁ 0.8 (+3.9, below the 10.1 sum).
+  - **The early damage in `sa97`:** not from WD. It comes from β₁ 0.97 or Nesterov on the embedding in the first 50 steps (untested which).
+- **Fork protocol check:** each control fork matches its parent at 2690 to within 0.0004 val_ema, so resuming is sound. The other code paths checked are correct:
+  - the logged config of `sa97`, `sa97k50` and the stack forks;
+  - the `NAdamW` Nesterov step against the hand formula (2e-7);
+  - `NAdamW` without Nesterov against AdamW in fp32 (1e-6);
+  - the 1-D Adam Nesterov numerator;
+  - `KNOB_START` toggling;
+  - `set_hparams`, which changes only lr and mu.
