@@ -856,3 +856,26 @@ Track 3 rule (3.28 − mean)·√n:
 - Earliest step passing with both n = 8 and n = 16: **2635** (default: 2640). 2630 fails both (0.0035 / 0.0039).
 - Paired with the default, n = 16: −0.00051 ± 0.00030 at 2690 (≈ +7.6 steps, 1.7 SE; 9 of 16 seeds lower), −0.00054 ± 0.00030 at 2640. Mean val_ema@2640 3.27834 vs 3.27888.
 - Consistent with the fork estimate (+8.7 ± 0.3 steps).
+
+## 2026-10-31 — Forks at the new default (β 0.99/0.99): row-gain LR/start, 1-D Adam β₁, head/embedding WD, Nesterov in the Adam groups
+
+**Setup.** Parents `b99` seeds 0–2 (commit `701649f` = the new default, `CKPT_STEPS=50,1000`, stop 2690). Controls `b99-ctrl` (one fork per seed and checkpoint). Variants at commits `701649f` (row-gain LR/start, `AUX_BETA1`) and `1c17f95` (`HEAD_WD`, `EMBED_WD`, `NADAM`; the defaults unchanged). `python fork_compare.py <v> --parent b99 --control b99-ctrl --ks 1000|50`. Control-fork noise: SD 0.000087 from 1000, **0.000244 from 50** (≈ 4 steps per fork, so a 3-seed mean from 50 has SE ≈ 2.5 steps).
+
+| Variant | Fork | Δ val_ema@2690 (SE) | Steps | Seeds (steps) |
+|---|---|---|---|---|
+| `ROW_GAIN_LR=0.03` | 1000 | −0.00008 (4) | +1.3 | +2.8 / +0.6 / +0.5 |
+| `ROW_GAIN_LR=0.04` | 1000 | −0.00017 (7) | +2.9 | +3.1 / +4.9 / +0.7 |
+| `ROW_GAIN_START=500` | 50 | −0.00021 (16) | +3.7 | +8.5 / +3.1 / −0.6 |
+| `AUX_BETA1=0.9` (1-D Adam β₁, default 0.8) | 50 | −0.00028 (11) | +4.8 | +8.0 / +4.7 / +1.7 |
+| **`AUX_BETA1=0.95`** | 50 | **−0.00062 (20)** | **+10.8** | +9.9 / +5.0 / +17.3 |
+| `HEAD_WD=0.1` | 50 | −0.00007 (6) | +1.2 | +3.1 / +1.0 / −0.4 |
+| `HEAD_WD=0.3` | 50 | +0.00201 (12) | −34.8 | |
+| `EMBED_WD=0.001` | 50 | −0.00021 (10) | +3.6 | +7.0 / +1.6 / +2.4 |
+| `EMBED_WD=0.003` | 50 | +0.00083 (20) | −14.3 | |
+| `NADAM=embed,head` | 50 | −0.00020 (8) | +3.5 | +5.1 / +4.7 / +0.6 |
+| `NADAM=aux` | 50 | +0.00059 (20) | −10.1 | |
+
+- **1-D Adam β₁ (norm gains and biases): the clear result.** 0.8 → 0.9 → 0.95 gives +4.8 → +10.8 steps, all seeds positive. Nesterov on the same groups, which weights the current gradient more, loses 10 steps. Same lesson as the row gains: the scalar "length-like" parameters want a longer first-moment average than the stack gives them. Bound check: β₁ < √β₂ holds up to 0.995 (gains, β₂ 0.99) and 0.998 (biases).
+- **Weak positives (1.5–2.5 SE, need more seeds before use):** row-gain start 500, row-gain LR 0.04, embedding WD 0.001, Nesterov on embed/head. Each +3 to +4 steps.
+- **Losses:** strong decay on the head (0.3: −35) or the embedding (0.003: −14). Mild head decay (0.1) is neutral.
+- MARS not started: several knobs help, so the user decides next.
