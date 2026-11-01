@@ -978,3 +978,28 @@ Val-loss gap to the control over training (×1e-4, 3-seed mean, negative = ahead
   - So steps 50–1000 favour the higher β₁ (0.99), and the late phase favours about 0.97, not 0.99. A schedule fits this: low until step ~50, then high, possibly lowered again later. It still needs full runs, because forks miss the first 50 steps.
 - **MARS on Muon depends on γ.** At the paper's 0.025 (0.48× the gradient difference at μ 0.95) it loses 13 steps. At 0.01 (0.19×) it gains +6.6, all seeds positive. A smaller γ (about 0.005) is untested.
 - **MARS on the Adam groups** is neutral.
+
+## 2026-11-01 — β₁ tied to the Muon momentum ramp; MARS γ 0.005
+
+**MARS on Muon at γ 0.005** (forks from step 50 of `b99`, commit `e984067`): −0.00006 ± 0.00007, **+1.1 steps** (−0.7 / +0.9 / +3.2). Across γ: 0.005 gives +1.1, 0.01 gives +6.6, 0.025 gives −12.6.
+
+**`AUX_BETA1_TIE`** (full runs, commit `e984067`, stop 2690, paired with `rgb9999`). The Muon μ goes 0.85 → 0.95 over steps 0–300; its cooldown starts at 2700, so it is not reached here.
+- Three runs (`tie06-s2`, `tie02-s2`, `tie02-s3`) failed before training started: W&B init timed out on a DNS lookup. They were not resubmitted.
+
+| c | β₁ at step 0 → after step 300 | n | Δ val_ema@2690 | Seeds |
+|---|---|---|---|---|
+| 0.6 | 0.91 → 0.97 | 3 | +0.00148 ± 0.00065 | +0.00091 / +0.00279 / +0.00075 |
+| 0.2 | 0.97 → 0.99 | 2 | +0.00473 ± 0.00086 | +0.00387 / +0.00559 |
+
+Val-loss gap over training (×1e-4, mean over the seeds that finished):
+
+| Run | 125 | 250 | 500 | 1000 | 1500 | 2000 | 2500 | 2690 |
+|---|---|---|---|---|---|---|---|---|
+| tie c = 0.6 | −270 | −113 | −12 | −15 | −2 | +5 | +14 | +15 |
+| tie c = 0.2 | −395 | −73 | +30 | +3 | +11 | +25 | +41 | +46 |
+| `sa97` (stack, β₁ 0.97 from step 0) | −387 | −106 | −17 | −29 | +19 | +41 | +48 | +47 |
+| `sa97k50` (stack, knobs on at step 50) | −213 | −56 | −44 | −53 | −9 | +4 | +2 | −2 |
+
+- **Both values of c lose.** They show the `sa97` pattern: far ahead early, behind at the end.
+- **c = 0.2 (no Nesterov, no row-gain changes) reproduces `sa97`'s final loss almost exactly** (+46 vs +47). The early damage in `sa97` therefore came from β₁ 0.97 in the first steps, not from Nesterov on the embedding.
+- **Even β₁ 0.91 at step 0 (c = 0.6) costs about +15.** Any c ≤ 0.6 starts above 0.91, because μ(0) = 0.85. So under the tie, the early phase wants β₁ near 0.8 and c near 4/3. That gives 0.8 at step 0 and 0.933 after step 300: the Adam average spans 0.75× as many steps as Muon's.
