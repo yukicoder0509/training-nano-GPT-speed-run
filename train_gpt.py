@@ -320,6 +320,9 @@ KNOB_START = int(os.environ.get("KNOB_START", 0))
 MARS = set(x for x in os.environ.get("MARS", "").split(",") if x)
 MARS_GAMMA = float(os.environ.get("MARS_GAMMA", 0.025))
 MARS_CLIP = os.environ.get("MARS_CLIP", "0") == "1"
+# AUX_BETA1_TIE=c > 0: tie the 1-D Adam beta1 (gains and biases) to the Muon momentum ramp, 1 - beta1(t) = c * (1 - mu(t)):
+# the Adam first moment averages over 1/c times as many steps as Muon's. Overrides AUX_BETA1 / GAIN_BETA1. Default 0 = off.
+AUX_BETA1_TIE = float(os.environ.get("AUX_BETA1_TIE", 0))
 # HEAD_GAIN_DRIFT=1 (with HEAD_GAIN_LR): keep the head's angular step size as without the gains. Plain AdamW lengthens rows
 # through its tangential steps, which slows their rotation; each row's tangential step is scaled by r_i / rtil_i, rtil_i the
 # length the tangential steps alone would have given it (from its length at HEAD_GAIN_START).
@@ -1495,7 +1498,7 @@ print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants
        f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
        f"row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} clip={ROW_GAIN_CLIP} row_gain_cols={sorted(ROW_GAIN_COLS)} keep_fro={sorted(ROW_GAIN_KEEP_FRO)} "
        f"head_gain_lr/start/betas/drift={HEAD_GAIN_LR}/{HEAD_GAIN_START}/{HEAD_GAIN_B1},{HEAD_GAIN_B2}/{HEAD_GAIN_DRIFT} "
-       f"head_wd={HEAD_WD} embed_wd={EMBED_WD} nadam={sorted(NADAM)} knob_start={KNOB_START} mars={sorted(MARS)}/{MARS_GAMMA}/{MARS_CLIP} "
+       f"head_wd={HEAD_WD} embed_wd={EMBED_WD} nadam={sorted(NADAM)} knob_start={KNOB_START} mars={sorted(MARS)}/{MARS_GAMMA}/{MARS_CLIP} aux_beta1_tie={AUX_BETA1_TIE} "
        f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
        f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
        f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN} dir={ENA_G_DIR} extra={ENA_X}")
@@ -1777,6 +1780,9 @@ def set_hparams(step):
             group["lr"] = _lr(step, group["initial_lr"], group["power_c"], FINAL_LR_POWER)
     for group in optimizer2.param_groups:
         group["mu"] = mu
+    if AUX_BETA1_TIE:
+        for group in optimizer3.param_groups:
+            group["betas"] = (1 - AUX_BETA1_TIE * (1 - mu), group["betas"][1])
 
 
 
@@ -1804,7 +1810,7 @@ pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "GAIN_BETA1", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
              "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR",
-             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT", "HEAD_WD", "EMBED_WD", "NADAM", "KNOB_START", "MARS", "MARS_GAMMA", "MARS_CLIP")
+             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT", "HEAD_WD", "EMBED_WD", "NADAM", "KNOB_START", "MARS", "MARS_GAMMA", "MARS_CLIP", "AUX_BETA1_TIE")
 
 def save_checkpoint(step):
     assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
