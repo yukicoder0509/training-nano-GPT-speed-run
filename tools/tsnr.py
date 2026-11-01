@@ -27,7 +27,7 @@ import re
 import numpy as np
 import torch
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the repo root (this file is in tools/)
 SNR_BINS = [("<0.01", -1, 0.01), ("0.01-0.1", 0.01, 0.1), ("0.1-0.3", 0.1, 0.3), ("0.3-1", 0.3, 1), (">1", 1, np.inf)]
 RANK_BINS = [("top 1%", 0, 0.01), ("1-10%", 0.01, 0.1), ("10-50%", 0.1, 0.5), ("50-100%", 0.5, 1.01)]
 PHASES = [(0, 700), (700, 1400), (1400, 2000), (2000, 2701)]

@@ -32,7 +32,7 @@ Estimators (velocity = per-step displacement, forecast = velocity * H unless not
   fit-all       the same over EMAs + ls/quad/holt/pca/-gema/-adam features
 
 Example
-  python river_fit.py /work/$USER/nanogpt-ckpt/traj-rec-s0-seed0/traj --groups norm,bias --H 10,50,200
+  python tools/river_fit.py /work/$USER/nanogpt-ckpt/traj-rec-s0-seed0/traj --groups norm,bias --H 10,50,200
 """
 
 from __future__ import annotations

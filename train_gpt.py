@@ -3,7 +3,7 @@ train_gpt.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt) (track 3).
 
-The research version of the record: the training math is the record's (hardcoded below; OPTIMIZER.md writes it out),
+The research version of the record: the training math is the record's (hardcoded below; docs/OPTIMIZER.md writes it out),
 plus logging, checkpoints / forks and diagnostics. A few record hyperparameters stay tunable through the environment
 (ROW_GAIN_*, ENA_G_MULT, TAILEMA_*); every other knob of the earlier experiments was removed (git history before this
 version has them). train_gpt_record.py is the same training without any of the logging or diagnostics.
@@ -33,6 +33,7 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
 import harness
 import optim_dynamics
 
@@ -117,11 +118,11 @@ PATH_EFF = os.environ.get("PATH_EFF", "0") == "1"
 TRAJ_REC = os.environ.get("TRAJ_REC", "0") == "1"
 # SNR_DIAG=N (diagnostics only): every N steps, per hidden matrix, the singular values of Muon's input (the Nesterov
 # momentum and its SOAP-preconditioned form) and its noise level from the spread of the 8 ranks' local gradients, to
-# <log>.snr/step<k>.pt; snr_bbp.py turns them into BBP-debiased per-rank SNRs.
+# <log>.snr/step<k>.pt; tools/snr_bbp.py turns them into BBP-debiased per-rank SNRs.
 SNR_DIAG = int(os.environ.get("SNR_DIAG", "0"))
 # TSNR_DIAG="every,k1,k2,..." (diagnostics only): at every `every`-th step, fix the singular pairs of Muon's input (SOAP
 # form) and their within-step BBP SNR, then sum g_i = u_i^T G v_i (each pair's first-order descent) and g_i^2 over the next
-# k steps, snapshots at each k (max k <= every) -> <log>.tsnr/anchor<t>.pt; tsnr.py bins the pairs by SNR. The snapshot
+# k steps, snapshots at each k (max k <= every) -> <log>.tsnr/anchor<t>.pt; tools/tsnr.py bins the pairs by SNR. The snapshot
 # arrays hold the anchor's pairs then as many random orthonormal pairs (the null).
 _tsnr = [int(x) for x in os.environ.get("TSNR_DIAG", "").split(",") if x]
 TSNR_EVERY, TSNR_KS = (_tsnr[0], _tsnr[1:]) if _tsnr else (0, [])

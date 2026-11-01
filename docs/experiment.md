@@ -498,7 +498,7 @@ Track 3 rule (3.28 − mean)·√n ≥ 0.004, n = 8 (`fork_compare.py --full can
 
 ## Anatomy of the row-gain effect (2026-10-29)
 
-**Setup.** Commit `bccead1` (transplants `15a1118`). Forks from `ckpt-rec46` seeds 0–1 at step 1000 (`anat-Gon2000`: at 2000), all with `TAILEMA_START=2100 TAILEMA_TAU=200`, stop 2690, `ANATOMY=1 VAL_EVERY=50 SNAP_STEPS=1500,2000,2690`. Analysis: `python anatomy.py --control anat-C --variants anat-G,anat-G0,anat-Goff2000,anat-Gon2000,anat-Gproj --seeds 0,1` and `--transplant tp-CG` / `tp-CGproj` / `tp-CC2`.
+**Setup.** Commit `bccead1` (transplants `15a1118`). Forks from `ckpt-rec46` seeds 0–1 at step 1000 (`anat-Gon2000`: at 2000), all with `TAILEMA_START=2100 TAILEMA_TAU=200`, stop 2690, `ANATOMY=1 VAL_EVERY=50 SNAP_STEPS=1500,2000,2690`. Analysis: `python tools/anatomy.py --control anat-C --variants anat-G,anat-G0,anat-Goff2000,anat-Gon2000,anat-Gproj --seeds 0,1` and `--transplant tp-CG` / `tp-CGproj` / `tp-CC2`.
 
 | fork | setting | Δ val_ema@2690 vs C, s0 / s1 |
 |---|---|---|
@@ -558,7 +558,7 @@ Commit `bb1bc0b`, record settings + `ROW_GAIN_NO_CWD=1`, `STOP_STEP=2690`, seeds
 
 **Question.** Is there a consistent drift ("river") under the step-to-step bounce that a better estimator could exploit? Path efficiency per parameter group, eff_K = ‖θ_t − θ_{t−K}‖ / Σ_{j<K} ‖Δθ‖, K = 50 and 200, snapshot every 50 steps, Δθ = the whole iteration's change (lookahead shift and weight decay included). Reference: a random walk with the same step sizes has eff ∝ 1/√K, so eff200/eff50 = 0.5 (1 = straight path); drift_K = chord / √Σ‖Δθ‖² is 1 for a random walk, < 1 when steps cancel, > 1 when they persist.
 
-**Setup.** Commit `c3b79bd`, `PATH_EFF=1` (`optim_dynamics.PathEfficiency`), full runs to 2700: `patheff-s0`, `patheff-s1` (current defaults: row gains + `ROW_GAIN_NO_CWD=1`) and `patheff-rec46-s0` (rec-46). Summary: `python path_eff.py patheff-s0 patheff-s1 patheff-rec46-s0` (medians over windows per phase).
+**Setup.** Commit `c3b79bd`, `PATH_EFF=1` (`optim_dynamics.PathEfficiency`), full runs to 2700: `patheff-s0`, `patheff-s1` (current defaults: row gains + `ROW_GAIN_NO_CWD=1`) and `patheff-rec46-s0` (rec-46). Summary: `python tools/path_eff.py patheff-s0 patheff-s1 patheff-rec46-s0` (medians over windows per phase).
 
 | group | phase | eff50 | eff200 | eff200/eff50 | drift50 | drift200 |
 |---|---|---|---|---|---|---|
@@ -581,7 +581,7 @@ Commit `bb1bc0b`, record settings + `ROW_GAIN_NO_CWD=1`, `STOP_STEP=2690`, seeds
 
 ## Per-group jump on the norm gains, early stage (2026-10-29)
 
-**Setup.** Current best setting (row gains + `ROW_GAIN_NO_CWD=1`). Parents `ckpt-best` seeds 0–2 (commit `1389e1f`, `CKPT_STEPS=50,1000`, `PATH_EFF=1`, stop 2690). Forks from step 50 with `ENA_GROUP=norm` (all RMSNorm gains), `PATH_EFF=1`; round 1 at `1389e1f`, round 2 at `96d2a54` (adds `ENA_G_SWITCH`). Control `ena-ctrl` (`ENA_G_MULT=1`, the same math, logs the slope). Scoring `python fork_compare.py <variants> --parent ckpt-best --control ena-ctrl --ks 50`. **Fork noise from step 50: SD 0.00029** (4× the noise from step 1000).
+**Setup.** Current best setting (row gains + `ROW_GAIN_NO_CWD=1`). Parents `ckpt-best` seeds 0–2 (commit `1389e1f`, `CKPT_STEPS=50,1000`, `PATH_EFF=1`, stop 2690). Forks from step 50 with `ENA_GROUP=norm` (all RMSNorm gains), `PATH_EFF=1`; round 1 at `1389e1f`, round 2 at `96d2a54` (adds `ENA_G_SWITCH`). Control `ena-ctrl` (`ENA_G_MULT=1`, the same math, logs the slope). Scoring `python tools/fork_compare.py <variants> --parent ckpt-best --control ena-ctrl --ks 50`. **Fork noise from step 50: SD 0.00029** (4× the noise from step 1000).
 
 | fork | norm-gain jump | Δ val_ema@2690 | steps |
 |---|---|---|---|
@@ -668,7 +668,7 @@ Commit `10ef1aa`; forks from step 50 of `ckpt-best`, seeds 0–2, `ENA_GROUP=nor
 - Fast + slow mixes (AdEMAMix-style ema0.9 + ema0.999, equal-weight mix) and the slow-Adam gradient direction are worse than the slow EMA alone; −Adam(0.99, 0.999) is anti-predictive after 1000.
 - Learned linear combinations of EMAs (fit-ema / fit-all, fitted online on past targets) win only at H = 10 (cos 0.3–0.47 vs ≤ 0.15) by predicting the short-term reversal of recent steps (mean reversion), not a drift.
 
-**Fork tests of the better directions** (commit `9e604aa`, `ENA_G_DIR` / `ENA_X`; forks from step 1000 of `traj-rec`, seeds 0–2, control `rec-ctrl` k1000, noise SD 0.000041; `python fork_compare.py <v> --parent traj-rec --control rec-ctrl --ks 1000`):
+**Fork tests of the better directions** (commit `9e604aa`, `ENA_G_DIR` / `ENA_X`; forks from step 1000 of `traj-rec`, seeds 0–2, control `rec-ctrl` k1000, noise SD 0.000041; `python tools/fork_compare.py <v> --parent traj-rec --control rec-ctrl --ks 1000`):
 
 | Variant | Δ val_ema@2690 | Steps |
 |---|---|---|
@@ -722,7 +722,7 @@ Reject. The loss falls monotonically with the anchor strength (k₀ 1000 still �
 
   Above the BBP threshold at all (SNR > 1) mid-training: q, k, v, o 3–6%, fc, proj 26–30%. The momentum before SOAP: q, k 5–9%, v, o 5–13%, fc, proj 26–36% with SNR > 4. Reading: many noise directions throughout training, not only late, so the SNR-weighted step looked worth a test.
 
-**SNR-weighted Muon step** (commits `c5b92c5`, `8c3d714`; `SNRW`=c, `SNRW_FLOOR`; O = Σ wᵢuᵢvᵢᵀ over the exact SVD of the NS input, wᵢ = max(SNRᵢ/(SNRᵢ+c), floor), SNRᵢ from a Kronecker noise model refreshed every 10 steps, see OPTIMIZER.md §2.5; forks from step 1500 of `snr`, control `snr-ctrl`, noise SD 0.000007; `python fork_compare.py <v> --parent snr --control snr-ctrl --ks 1500`):
+**SNR-weighted Muon step** (commits `c5b92c5`, `8c3d714`; `SNRW`=c, `SNRW_FLOOR`; O = Σ wᵢuᵢvᵢᵀ over the exact SVD of the NS input, wᵢ = max(SNRᵢ/(SNRᵢ+c), floor), SNRᵢ from a Kronecker noise model refreshed every 10 steps, see OPTIMIZER.md §2.5; forks from step 1500 of `snr`, control `snr-ctrl`, noise SD 0.000007; `python tools/fork_compare.py <v> --parent snr --control snr-ctrl --ks 1500`):
 
 | Variant | Δ val_ema@2690 | Steps | mean w at 2000 (fc / q / o) |
 |---|---|---|---|
@@ -735,7 +735,7 @@ Reject. The loss falls monotonically with the anchor strength (k₀ 1000 still �
 
 Reject. The loss falls monotonically with how much the low-SNR directions are down-weighted: dropping them costs 560–860 steps, halving them 4 steps, 0.8× nothing. Correction (from the TSNR diagnostic below): the per-pair SNR in Y's own basis is not monotone in the singular value. The noise model puts most of the noise variance along Y's top singular pairs, which therefore get SNR ≈ 0 (at steps 100–200 the top pairs of fc have SNR ≤ 0.04 while the median pair has 0.3), so the weighting suppressed the top momentum directions as well, not only the bulk. Exact SVD in place of NS₁₂ is neutral. The directions that are undetectable in one step's momentum still carry progress: their signal is consistent across steps and adds up in the weights while their noise random-walks, which a per-step SNR cannot see. Muon's equal weighting is right here (with SOAP in front of it).
 
-**Temporal persistence of Muon's step directions** (commits `2d50386` … `1db3e6d`, `TSNR_DIAG=100,10,25,50,100`, record settings, seeds 0–2 `tsnr-s<seed>`, val_ema@2690 3.27472 / 3.27717 / 3.27555; `python tsnr.py tsnr-s0 tsnr-s1 tsnr-s2 --k 100 --by snr|rank`). Every 100 steps fix the singular pairs (uᵢ, vᵢ) of Muon's input (SOAP form) and their within-step BBP SNR, then follow the weights for k steps along each pair: dᵢ(t) = uᵢᵀΔW_t vᵢ (jumps included), efficiency |Σdᵢ| / Σ|dᵢ|, and fwd = the net motion continues the anchor step's sign. Null: random orthonormal pairs tracked the same way (momentum makes any direction persist for ~20 steps, so 1/√k is not the null). The first version scored the later gradient along each pair (uᵢᵀG_t vᵢ); it is negative along nearly every pair (the optimizer overshoots along the directions it moves in), so it mixes signal with feedback and is not used.
+**Temporal persistence of Muon's step directions** (commits `2d50386` … `1db3e6d`, `TSNR_DIAG=100,10,25,50,100`, record settings, seeds 0–2 `tsnr-s<seed>`, val_ema@2690 3.27472 / 3.27717 / 3.27555; `python tools/tsnr.py tsnr-s0 tsnr-s1 tsnr-s2 --k 100 --by snr|rank`). Every 100 steps fix the singular pairs (uᵢ, vᵢ) of Muon's input (SOAP form) and their within-step BBP SNR, then follow the weights for k steps along each pair: dᵢ(t) = uᵢᵀΔW_t vᵢ (jumps included), efficiency |Σdᵢ| / Σ|dᵢ|, and fwd = the net motion continues the anchor step's sign. Null: random orthonormal pairs tracked the same way (momentum makes any direction persist for ~20 steps, so 1/√k is not the null). The first version scored the later gradient along each pair (uᵢᵀG_t vᵢ); it is negative along nearly every pair (the optimizer overshoots along the directions it moves in), so it mixes signal with feedback and is not used.
 
 k = 100, efficiency / fwd (mean of 3 seeds):
 
@@ -754,7 +754,7 @@ k = 100, efficiency / fwd (mean of 3 seeds):
 
 ## 2026-10-30 — Length learning, round 2: LM head, gain betas, mlp.proj
 
-**Setup** (commit `4dd2b1c`; knobs `HEAD_GAIN_LR`, `HEAD_DIAG`, `ROW_GAIN_BETAS`, `ROW_GAIN_COLS`, `ROW_GAIN_KEEP_FRO`, see OPTIMIZER.md). Forks from step 1000 of `traj-rec` (2640-record settings), seeds 0–2, to 2690; control `rec-ctrl` (noise SD 0.000041); `python fork_compare.py <v> --parent traj-rec --control rec-ctrl --ks 1000`. Steps = −Δ/slope, + = better.
+**Setup** (commit `4dd2b1c`; knobs `HEAD_GAIN_LR`, `HEAD_DIAG`, `ROW_GAIN_BETAS`, `ROW_GAIN_COLS`, `ROW_GAIN_KEEP_FRO`, see OPTIMIZER.md). Forks from step 1000 of `traj-rec` (2640-record settings), seeds 0–2, to 2690; control `rec-ctrl` (noise SD 0.000041); `python tools/fork_compare.py <v> --parent traj-rec --control rec-ctrl --ks 1000`. Steps = −Δ/slope, + = better.
 
 | Variant | Δ val_ema@2690 (SE) | Steps |
 |---|---|---|
@@ -859,7 +859,7 @@ Track 3 rule (3.28 − mean)·√n:
 
 ## 2026-10-31 — Forks at the new default (β 0.99/0.99): row-gain LR/start, 1-D Adam β₁, head/embedding WD, Nesterov in the Adam groups
 
-**Setup.** Parents `b99` seeds 0–2 (commit `701649f` = the new default, `CKPT_STEPS=50,1000`, stop 2690). Controls `b99-ctrl` (one fork per seed and checkpoint). Variants at commits `701649f` (row-gain LR/start, `AUX_BETA1`) and `1c17f95` (`HEAD_WD`, `EMBED_WD`, `NADAM`; the defaults unchanged). `python fork_compare.py <v> --parent b99 --control b99-ctrl --ks 1000|50`. Control-fork noise: SD 0.000087 from 1000, **0.000244 from 50** (≈ 4 steps per fork, so a 3-seed mean from 50 has SE ≈ 2.5 steps).
+**Setup.** Parents `b99` seeds 0–2 (commit `701649f` = the new default, `CKPT_STEPS=50,1000`, stop 2690). Controls `b99-ctrl` (one fork per seed and checkpoint). Variants at commits `701649f` (row-gain LR/start, `AUX_BETA1`) and `1c17f95` (`HEAD_WD`, `EMBED_WD`, `NADAM`; the defaults unchanged). `python tools/fork_compare.py <v> --parent b99 --control b99-ctrl --ks 1000|50`. Control-fork noise: SD 0.000087 from 1000, **0.000244 from 50** (≈ 4 steps per fork, so a 3-seed mean from 50 has SE ≈ 2.5 steps).
 
 | Variant | Fork | Δ val_ema@2690 (SE) | Steps | Seeds (steps) |
 |---|---|---|---|---|
@@ -924,7 +924,7 @@ Val-loss gap to the control over training (×1e-4, 3-seed mean, negative = ahead
 - Embedding WD alone is behind for most of the run (up to 3.7e-3 at step 1500) and only catches up at the end. Without Nesterov or without the higher β₁, the stack also falls behind after step 1000. With both, it stays ahead throughout. Why the pair holds up mid-run is not tested.
 - β₁ 0.97 and 0.99 are on a plateau (+27).
 
-**Full runs: stack + `AUX_BETA1=0.97` fails** (`sa97`, seeds 0–7, commit `b80f984`, stop 2690). `python fork_compare.py --full sa97 --full-controls rgb9999`:
+**Full runs: stack + `AUX_BETA1=0.97` fails** (`sa97`, seeds 0–7, commit `b80f984`, stop 2690). `python tools/fork_compare.py --full sa97 --full-controls rgb9999`:
 
 - Paired with the new default (`rgb9999`): **+0.00477 ± 0.00098** at 2690 (≈ −80 steps). 8 of 8 seeds are worse. No step passes; mean 3.27991 at 2690.
 - Gap per seed over training (×1e-4): about −250 to −520 at step 125, −6 to −190 at 250, near 0 by 1000. From 1250 it turns positive and keeps growing to +10…+89 at 2690.

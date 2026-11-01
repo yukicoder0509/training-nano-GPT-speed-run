@@ -15,7 +15,7 @@ eff_K = ‖θ_t − θ_{t−K}‖ / Σ_{j<K} ‖Δθ_{t−K+j}‖, for K = 50 an
   - 0.5: a random walk (eff ∝ 1/√K).
   - Below 0.5: the steps cancel, i.e. the parameters bounce around a point.
 
-Code: `optim_dynamics.PathEfficiency`, switched on with `PATH_EFF=1`. Tables: `python path_eff.py --table <run>`.
+Code: `optim_dynamics.PathEfficiency`, switched on with `PATH_EFF=1`. Tables: `python tools/path_eff.py --table <run>`.
 
 ## 2. rec-46 baseline: where the drift is
 
@@ -138,7 +138,7 @@ From 2000 on, the norm row is the same as rec-46's. Every other group is within 
 ## 7. Reproduce
 
 ```
-python path_eff.py --table patheff-rec46-s0 patheff-rec2640-s0
-python fork_compare.py ena-off ena-x2 ena-x25 ena-x3 ena-x4 ena-x2early ena-x2late --parent ckpt-best --control ena-ctrl --ks 50
-python fork_compare.py --full norm25d
+python tools/path_eff.py --table patheff-rec46-s0 patheff-rec2640-s0
+python tools/fork_compare.py ena-off ena-x2 ena-x25 ena-x3 ena-x4 ena-x2early ena-x2late --parent ckpt-best --control ena-ctrl --ks 50
+python tools/fork_compare.py --full norm25d
 ```

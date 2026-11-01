@@ -10,7 +10,7 @@ readout, which is the number scored against 3.28.
     torchrun --standalone --nproc_per_node=8 train_gpt_record.py --seed 0
 
 Data: data/fineweb10B/fineweb_{train,val}_*.bin relative to the working directory (the upstream cached FineWeb10B
-shards). OPTIMIZER.md writes out the math of one training step.
+shards). docs/OPTIMIZER.md writes out the math of one training step.
 """
 
 import argparse

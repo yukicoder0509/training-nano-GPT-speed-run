@@ -26,9 +26,9 @@ rule (3.28 - mean) * sqrt(n) >= 0.004 at every dense validation step, the earlie
 seed-paired difference from the control runs (the mean over control prefixes that have that seed).
 
 Example
-  python fork_compare.py --full cand-rg20 --full-controls ckpt-rec46,aux-control,ctrl-rec46
-  python fork_compare.py fork-vgate fork-vohead --parent ckpt-rec46 --control fork-ctrl
-  python fork_compare.py --readouts lab --ks 2000
+  python tools/fork_compare.py --full cand-rg20 --full-controls ckpt-rec46,aux-control,ctrl-rec46
+  python tools/fork_compare.py fork-vgate fork-vohead --parent ckpt-rec46 --control fork-ctrl
+  python tools/fork_compare.py --readouts lab --ks 2000
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ import os
 import re
 import statistics as st
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the repo root (this file is in tools/)
 VAL = re.compile(r"step:(\d+)/\d+ val_loss:([\d.]+) val_ema_loss:([\d.]+)")
 
 

@@ -14,8 +14,8 @@ Per parameter group and training phase (windows grouped by their end step), the 
 "eff50 / eff200 (eff200/eff50)".
 
 Example
-  python path_eff.py patheff-s0 patheff-s1 patheff-rec46-s0
-  python path_eff.py --table patheff-rec46-s0 patheff-rec2640-s0
+  python tools/path_eff.py patheff-s0 patheff-s1 patheff-rec46-s0
+  python tools/path_eff.py --table patheff-rec46-s0 patheff-rec2640-s0
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import os
 import re
 import statistics as st
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the repo root (this file is in tools/)
 PHASES = [(0, 500), (500, 1000), (1000, 1500), (1500, 2000), (2000, 2400), (2400, 2701)]
 ORDER = ["attn_q", "attn_k", "attn_v", "attn_o", "mlp_up", "mlp_down", "embed", "lm_head", "lm_head_bias", "norm", "bias"]
 

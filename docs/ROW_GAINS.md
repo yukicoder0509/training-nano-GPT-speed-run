@@ -137,11 +137,11 @@ Forks resume from the `ckpt-rec46` checkpoints at step 1000 unless noted. Fork c
 Reproduce the analysis:
 
 ```
-python fork_compare.py abl-noproj-lr0.02 abl-rg15-matrix abl-rg15-qk abl-rg15-vo --parent ckpt-rec46 --control fork-ctrl
-python fork_compare.py --full cand-rg20 --full-controls ckpt-rec46,aux-control,ctrl-rec46
-python anatomy.py --control anat-C --variants anat-G,anat-G0nc,anat-Gnc,anat-Goff2000,anat-Gon2000,anat-Gproj --seeds 0,1
-python anatomy.py --transplant tp-CG --seeds 0,1
-python anatomy.py --transplant tp-CC2 --seeds 0
+python tools/fork_compare.py abl-noproj-lr0.02 abl-rg15-matrix abl-rg15-qk abl-rg15-vo --parent ckpt-rec46 --control fork-ctrl
+python tools/fork_compare.py --full cand-rg20 --full-controls ckpt-rec46,aux-control,ctrl-rec46
+python tools/anatomy.py --control anat-C --variants anat-G,anat-G0nc,anat-Gnc,anat-Goff2000,anat-Gon2000,anat-Gproj --seeds 0,1
+python tools/anatomy.py --transplant tp-CG --seeds 0,1
+python tools/anatomy.py --transplant tp-CC2 --seeds 0
 ```
 
 Open lead (not part of the claims yet): dropping weight decay on the gained matrices (`ROW_GAIN_NO_CWD=1`). The C4 forks gave ≈ −0.00017. Full runs `nocwd-s0`–`nocwd-s7` vs `cand-rg20` on the same seeds: paired −0.00048 ± 0.00041 at 2690 (6 of 8 lower, median −0.00035), i.e. about 7 ± 6 steps, not resolved. With n = 8 they pass the Track 3 rule at 2660 (0.00445), where `cand-rg20` needed n = 16.

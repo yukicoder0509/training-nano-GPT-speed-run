@@ -25,9 +25,9 @@ Runs are named by any of: the Slurm log name or a prefix of it (rec-46, aux-cont
 the log uuid, or a path to a .dyn.jsonl / .out file. `--list` shows what is available.
 
 Examples
-  python analyze_dynamics.py rec-09 rec-29 rec-44 rec-46                    # by block type
-  python analyze_dynamics.py rec-46 --by layer --types norm attn_v attn_o   # where is the bounce?
-  python analyze_dynamics.py rec-46 aux-control aux-gain --metrics rho align_b --series --types norm
+  python tools/analyze_dynamics.py rec-09 rec-29 rec-44 rec-46                    # by block type
+  python tools/analyze_dynamics.py rec-46 --by layer --types norm attn_v attn_o   # where is the bounce?
+  python tools/analyze_dynamics.py rec-46 aux-control aux-gain --metrics rho align_b --series --types norm
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ import re
 import statistics
 import sys
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the repo root (this file is in tools/)
 SEARCH_DIRS = ["logs", "logs_v18", "experiment-logs"]
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 METRICS = ["grad_cos_prev", "align_b", "rho", "step_ratio", "upd_rel"]

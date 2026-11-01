@@ -33,8 +33,8 @@ with A's lengths, L(B<-A) - L(B) (loss change; compare with the gap L(B) - L(A) 
 Also the mean row cosine between A and B and the SD of their log row-length ratio, per type.
 
 Example
-  python anatomy.py --control anat-C --variants anat-G,anat-G0,anat-Goff2000,anat-Gon2000,anat-Gproj --seeds 0,1
-  python anatomy.py --transplant tp-CG --seeds 0,1
+  python tools/anatomy.py --control anat-C --variants anat-G,anat-G0,anat-Goff2000,anat-Gon2000,anat-Gproj --seeds 0,1
+  python tools/anatomy.py --transplant tp-CG --seeds 0,1
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ import re
 
 import torch
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the repo root (this file is in tools/)
 CKPT = f"/work/{os.environ.get('USER', 'user')}/nanogpt-ckpt"
 KINDS = ["q", "k", "v", "o", "fc", "proj"]
 KIND = {"attn.q": "q", "attn.k": "k", "attn.v": "v", "attn.proj": "o", "mlp.fc": "fc", "mlp.proj": "proj"}

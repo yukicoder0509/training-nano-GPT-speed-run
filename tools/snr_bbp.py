@@ -15,7 +15,7 @@ The fraction of singular values with SNR > --thr is the share of Muon's orthogon
 to 1) spent on signal directions.
 
 Example
-  python snr_bbp.py snr-s0 snr-s1 snr-s2 --thr 4 --plot /path/snr.png
+  python tools/snr_bbp.py snr-s0 snr-s1 snr-s2 --thr 4 --plot /path/snr.png
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import re
 import numpy as np
 import torch
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the repo root (this file is in tools/)
 TYPES = ["q", "k", "v", "o", "fc", "proj"]
 
 
