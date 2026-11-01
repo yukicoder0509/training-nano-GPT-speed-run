@@ -1,41 +1,20 @@
 """
-train_gpt_cwd_SOTA.py
+train_gpt.py
 
-This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
+This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt) (track 3).
 
-SOTA optimizer for a PR. It is the clean SOAP-Muon base from PR #321 (the 2750/2755
-"aux-b2 + SOAP-f1 clean" record) with THREE additional levers stacked on top, each on a
-different axis chosen to survive the radius pin (which re-pins global Frobenius magnitude
-every step, so only directional / shape / readout changes persist):
+The research version of the record: the training math is the record's (hardcoded below; OPTIMIZER.md writes it out),
+plus logging, checkpoints / forks and diagnostics. A few record hyperparameters stay tunable through the environment
+(ROW_GAIN_*, ENA_G_MULT, TAILEMA_*); every other knob of the earlier experiments was removed (git history before this
+version has them). train_gpt_record.py is the same training without any of the logging or diagnostics.
 
-  (A) Tail-EMA eval readout (PR #325): an eval-time-only weight blend. Over the cooldown
-      tail [2400, 2900] maintain a slow EMA  ema += (w - ema) / TAU  (TAU=150) of every
-      parameter except the token embedding; at validation, evaluate the partial blend
-      w_eval = (1-L)*w + L*ema  (L=0.6). Training is untouched; only the weights used for
-      the val forward change. The partial (not full) blend cancels the late cross-valley
-      oscillation while still tracking the descending floor.
-
-  (B) RowFloor (per-output-row u/w-floor): replace the SCALAR u/w-floor with a per-row
-      floor on the orthogonalized update -- each output row whose update norm is below
-      TARGET_UW * ||row|| is lifted to that target (RHO=1.0, no Frobenius renorm). A
-      per-row SHAPE change, so it survives the radius pin.
-
-  (C) Cautious Weight Decay (CWD=0.025, POST-pin; Cautious Optimizers arXiv:2411.16085):
-      anisotropic per-coordinate decay  p *= 1 - lr*CWD*mask  with mask = 1[update*p > 0]
-      (only the coords the optimizer step already shrinks; never fights coords it wants to
-      grow), applied AFTER rescale_to_radius so the per-coord SHAPE change is not
-      re-normalized away.
-
-The clean PR #321 base retains:
-  - SOAP preconditioning on all hidden matrices (all_hidden, freq=1)
-  - u/w-floor hyperball constraint (TARGET_UW=0.3825); here per-row (RowFloor)
-  - radial scaling + rescale-to-radius (the radius pin)
-  - EMA-Nesterov outer wrapper
-  - PowerCool LR schedule, mu schedule, val schedule
-  - aux-Adam beta2 split, depth-scaled mlp.fc init
-
-All hyperparameters are hardcoded; only --seed is a command-line argument. Set CWD=0.0,
-ROWFLOOR=False and TAILEMA_TAU=0 below to recover the clean PR #321 base.
+Optimizer:
+  - SOAP-preconditioned Muon on the hidden matrices, with an attn.proj trust gate, radial damping, a per-row u/w floor
+    (RowFloor) and the radius pin; from step 1000 the q/k/v/attn.proj/mlp.fc rows get learned lengths (row gains,
+    the Muon step becomes angular per row) and their cautious weight decay stops; CWD elsewhere.
+  - AdamW on the embedding and LM head; bias-correction-free Adam on the norm gains and biases.
+  - EMA-Nesterov lookahead over all parameters, 2.5x on the norm gains.
+  - Tail-EMA readout for validation.
 """
 
 import os
@@ -100,7 +79,7 @@ LOG_DIR = Path("logs")
 # Checkpoint / fork. CKPT_STEPS="1000,1500,2000" saves the full training state at the top of those steps (after their
 # validation) to CKPT_DIR/step<k>/: common.pt (replicated state, rank 0) + muon_rank<r>.pt (each rank's Muon shard).
 # RESUME_FROM=<CKPT_DIR>/step<k> starts the loop at step k from that state; env knobs set for the resumed run take
-# effect from step k on (a fork). Not covered: the Newton-Muon K/covariance and the VO_VARIANTS shadow states.
+# effect from step k on (a fork).
 CKPT_STEPS = {int(x) for x in os.environ.get("CKPT_STEPS", "").split(",") if x}
 CKPT_DIR = os.environ.get("CKPT_DIR", f"/work/{os.environ.get('USER', 'user')}/nanogpt-ckpt/"
                                       f"{os.environ.get('WANDB_RUN_NAME', 'run')}-seed{args.seed}")
@@ -110,7 +89,6 @@ RESUME_STEP = json.load(open(f"{RESUME_FROM}/meta.json"))["step"] if RESUME_FROM
 # "start:tau" pairs, non-embedding params like Tail-EMA) and the last RRE iterates, then at STOP_STEP scores a grid of
 # late-trajectory readouts on the val set AND on a held-out set (the last train shard, past the probe/GNS batches),
 # so a readout picked on val can be confirmed on data it was not picked on. Training is unchanged.
-# (The update-velocity readout of #38 was removed: every setting was worse than Tail-EMA alone on 3 seeds.)
 READOUT_LAB = os.environ.get("READOUT_LAB", "0") == "1"
 LAB_REF_STEPS = [int(x) for x in os.environ.get("LAB_REF_STEPS", "2000,2200,2375").split(",") if x]
 LAB_EMAS = [tuple(int(v) for v in x.split(":")) for x in
@@ -128,6 +106,8 @@ VAL_EVERY = int(os.environ.get("VAL_EVERY", 125))
 # ROW_TRANSPLANT="<dirA>;<dirB>;<steps>" (eval only, no training): loads snap<k>.pt of two runs and scores row-length
 # transplants (directions of one run, row or matrix lengths of the other) on val and held-out data.
 ANATOMY = os.environ.get("ANATOMY", "0") == "1"
+SNAP_STEPS = {int(x) for x in os.environ.get("SNAP_STEPS", "").split(",") if x}
+ROW_TRANSPLANT = os.environ.get("ROW_TRANSPLANT", "")
 # PATH_EFF=1 (diagnostics only, rank 0): path efficiency ||theta_t - theta_{t-K}|| / sum of the K per-step update norms
 # per parameter group, from a weight snapshot every 50 steps, K = 50 and 200 -> <log>.patheff.jsonl
 # (optim_dynamics.PathEfficiency).
@@ -135,131 +115,10 @@ PATH_EFF = os.environ.get("PATH_EFF", "0") == "1"
 # TRAJ_REC=1 (diagnostics only, rank 0): every step, theta / lookahead jump / gradient of the norm gains and biases
 # (float32, optim_dynamics.TrajRecorder) -> TRAJ_DIR (default CKPT_DIR/traj), for offline river forecasting.
 TRAJ_REC = os.environ.get("TRAJ_REC", "0") == "1"
-# MSM="alpha,beta3[,warm]": multi-scale momentum on the 1-D Adam (AdEMAMix-style), numerator m + alpha_t * m_slow with
-# m_slow an EMA (beta3) of the gradient and alpha_t = alpha * min(1, steps / warm) (warm default 500, counted from the
-# first step the knob is active, so also from a fork). MSM_GROUPS = gains | bias | all (default gains).
-MSM = os.environ.get("MSM", "")
-MSM_GROUPS = os.environ.get("MSM_GROUPS", "gains")
-SNAP_STEPS = {int(x) for x in os.environ.get("SNAP_STEPS", "").split(",") if x}
-ROW_TRANSPLANT = os.environ.get("ROW_TRANSPLANT", "")
-RADIAL_OUTWARD_SCALE = 0.5
-RADIAL_INWARD_SCALE = 1.0
-HEAD_DIM = 128
-
-# --- The three SOTA levers stacked on the clean PR #321 base (all hardcoded). ---
-# (B) RowFloor: per-output-row u/w-floor on the orthogonalized update (replaces the scalar
-#     floor for 2-D Muon params). RHO=1.0, no Frobenius renorm (magnitude is then re-pinned
-#     by rescale_to_radius, so only the per-row SHAPE survives). ROWFLOOR=False -> scalar floor.
-ROWFLOOR = True
-ROWFLOOR_RHO = 1.0
-# (C) Cautious Weight Decay: anisotropic per-coordinate decay on the 2-D Muon params, applied
-#     AFTER the radius pin (POST). mask = 1[update*p > 0]. CWD=0.0 -> off.
-CWD = 0.025
-# (A) Tail-EMA eval readout: slow weight EMA over [START,END] (token embed excluded), eval the
-#     partial blend (1-LAMBDA)*w + LAMBDA*ema. TAILEMA_TAU=0 -> off (eval raw weights only).
-TAILEMA_TAU = float(os.environ.get("TAILEMA_TAU", 200.0))
-TAILEMA_START = int(os.environ.get("TAILEMA_START", 2100))
-TAILEMA_END = 2900
-TAILEMA_LAMBDA = float(os.environ.get("TAILEMA_LAMBDA", 0.6))
-# (D) Newton-Muon (record #15, PR #281, arXiv:2604.01472): right-precondition every hidden matrix's
-#     SOAP-whitened update by K = (Sigma + DAMPING*tr(Sigma)/d*I)^-1, Sigma = EMA of the layer-input
-#     covariance x x^T (collected in Linear.forward on refresh steps only). K is refreshed every REFRESH
-#     steps (K = I before the first refresh). mlp.proj (in=3072) uses a 4-block-diagonal K of 768^2
-#     blocks. NEWTON_MODE="soap": U <- SOAP(U) K, before the attn.proj trust gate and Newton-Schulz.
-#     NEWTON_MODE="grad": g <- g K before momentum (as in #15), so momentum, SOAP's statistics and the
-#     trust gate all see the preconditioned gradient.
-#     NEWTON_MODE="right": one-sided SOAP (output/row side only) then U <- SOAP_L(U) K, i.e. K replaces
-#     SOAP's input-side (column) whitening instead of stacking on it.
-NEWTON_MUON = os.environ.get("NEWTON_MUON", "0") == "1"
-NEWTON_MODE = os.environ.get("NEWTON_MODE", "soap")
-assert NEWTON_MODE in ("soap", "grad", "right")
-SOAP_ONE_SIDED = NEWTON_MUON and NEWTON_MODE == "right"
-NEWTON_REFRESH = 64
-NEWTON_COV_EMA = 0.05
-NEWTON_DAMPING = float(os.environ.get("NEWTON_DAMPING", 0.2))   # larger -> K closer to a scaled identity
-# Per-type Muon lr multipliers (q/k/v, attn.proj, mlp.fc+mlp.proj); #15 used 0.8 : 1 : 1.2. The PowerCool
-# constant is scaled by the same factor so every type starts decaying at the same step.
-MUON_LR_MULT = dict(zip(("qkv", "attn_proj", "mlp"),
-                        (float(x) for x in os.environ.get("MUON_LR_MULT", "1,1,1").split(","))))
-NEWTON_BLOCK = 768
-# attn.v + attn.proj (V/O) ablation knobs, on top of MUON_LR_MULT; defaults are rec-46. VO_LR_MULT scales their
-# Muon lr (and PowerCool constant); VO_FLOOR_MULT scales their RowFloor target u/w.
-VO_LR_MULT = float(os.environ.get("VO_LR_MULT", 1.0))
-VO_FLOOR_MULT = float(os.environ.get("VO_FLOOR_MULT", 1.0))
-# Screening only: compute V/O SOAP variant directions (class VOVariants) and record them on probe steps for
-# harness.ProbeQuadratic. They are never applied, so training is unchanged; costs extra compute every step.
-VO_VARIANTS = os.environ.get("VO_VARIANTS", "0") == "1"
-# Applied V/O SOAP changes (defaults = rec-46): V_GATE=1 puts the attn.proj trust gate on attn.v too;
-# VO_DENOM_POWER is the SOAP denominator power for attn.v / attn.proj (rec-46: SOAP_DENOM_POWER = 0.5);
-# VO_HEAD=1 uses per-head (block-diagonal) SOAP statistics on V's output side and O's input side.
-V_GATE = os.environ.get("V_GATE", "0") == "1"
-VO_DENOM_POWER = float(os.environ.get("VO_DENOM_POWER", 0.5))
-VO_HEAD = os.environ.get("VO_HEAD", "0") == "1"
-# Per-row norm control (Muown #23 ideas; defaults = rec-46). ROW_PIN=1 replaces the whole-matrix radius pin by a
-# per-row pin (each row keeps its own first-order radial change). ROW_GAIN_LR=a > 0 makes the Muon step purely
-# angular per row and moves each row norm with its own bias-corrected Adam(0.9, 0.95) on g_i = <grad_i, W_i/|W_i|>:
-# |W_i| *= 1 - a * (lr/lr0) * adam_i.
-# SOAP variants (defaults = rec-46). SOAP_SINK = "cur" | "ema": replace the elementwise Adam denominator in the
-# eigenbasis by a rank-1 Sinkhorn balancing (SinkSOAP #26) of the current projected energy P^2 ("cur") or of the EMA
-# second moment V ("ema", a factored V). SOAP_KL=1: KL-SOAP (#19/#25) coupled covariance estimate for the bases,
-# L ~ E[G R^-1 G^T]/n, R ~ E[G^T L^-1 G]/m, with R^-1, L^-1 from running eigenvalue estimates in the current basis.
-# SOAP_SINK_SCOPE / SOAP_KL_SCOPE: "all" or "vo" (attn.v + attn.proj only).
-SOAP_SINK = os.environ.get("SOAP_SINK", "")
-SOAP_KL = os.environ.get("SOAP_KL", "0") == "1"
-SOAP_SINK_SCOPE = os.environ.get("SOAP_SINK_SCOPE", "all")
-SOAP_KL_SCOPE = os.environ.get("SOAP_KL_SCOPE", "all")
-ENA_REST = int(os.environ.get("ENA_REST", 0))   # EMA-Nesterov lookahead end step (0 = rec-46: train_steps - 950 = 1950)
-# Per-group EMA-Nesterov jump (defaults = no change). ENA_GROUP = norm | embed | head | bias | hidden picks one parameter
-# group whose jump W <- W + beta_g * d is set separately (all other parameters keep the global jump):
-#   ENA_G_MULT     beta_g = ENA_G_MULT * (global beta_t = 0.3 * lr_t / lr_0), default 1
-#   ENA_G_START/END  the group's window, active for START < it + 1 and it < END (default: the global 300 / 1950)
-#   ENA_G_AUTO=k   self-tuning: s_t = <g_t, d> (gradient at the jumped-to point along the jump), sbar <- 0.9 sbar +
-#                  0.1 sign(s_t), ENA_G_MULT <- clip(ENA_G_MULT * exp(-k * sbar), 0, ENA_G_MAX) on every active step
-#   ENA_G_LS=lam   d = exponentially weighted least-squares velocity of the group's weights (weights lam^age; two
-#                  extra copies of the group) instead of the EMA of displacements
-# s_t, sbar, ENA_G_MULT, beta_g and |d| are logged per active step to <log>.ena.jsonl.
-ENA_GROUP = os.environ.get("ENA_GROUP", "norm")   # default: the 2640 record (norm gains, 2.5x)
-ENA_G_MULT = float(os.environ.get("ENA_G_MULT", 2.5))
-ENA_G_START = int(os.environ.get("ENA_G_START", 300))
-ENA_G_END = int(os.environ.get("ENA_G_END", 0))   # 0 = the global end
-ENA_G_AUTO = float(os.environ.get("ENA_G_AUTO", 0.0))
-ENA_G_MAX = float(os.environ.get("ENA_G_MAX", 3.0))
-# ENA_G_SIGNAL picks what ENA_G_AUTO reacts to (all from quantities already computed, no extra passes):
-#   slope    sign(s_t) smoothed, sbar <- 0.9 sbar + 0.1 sign(s_t)                       (one batch at a time)
-#   slope_z  z-score of s over many batches: z = mean_s / sqrt(var_s / 50) from EMAs (0.98) of s and s^2;
-#            ENA_G_MULT <- ENA_G_MULT * exp(-k * clip(z / 2, -1, 1))
-#   update_z the same z-score of c_t = <u_t, d>, u_t = the inner optimizer's own step on the group (after the jump):
-#            c > 0 the optimizer keeps moving along the jump (grow), c < 0 it moves back (overshoot, shrink);
-#            ENA_G_MULT <- ENA_G_MULT * exp(+k * clip(z / 2, -1, 1))
-# ENA_G_MIN: lower clip of ENA_G_MULT (default 0; a multiplicative rule cannot climb back from ~0).
-ENA_G_SIGNAL = os.environ.get("ENA_G_SIGNAL", "slope")
-ENA_G_MIN = float(os.environ.get("ENA_G_MIN", 0.0))
-ENA_G_LS = float(os.environ.get("ENA_G_LS", 0.0))
-# ENA_G_SWITCH=t1 with ENA_G_MULT_AFTER=m2: the multiplier is ENA_G_MULT before step t1 and m2 from t1 on (not with AUTO).
-ENA_G_SWITCH = int(os.environ.get("ENA_G_SWITCH", 0))
-# ENA_G_DIR = buf (default: the shared EMA-0.99 lookahead buffer) | ema<b>, e.g. ema0.995: the group jumps along its own
-# EMA (beta b) of the per-step displacement instead (initialised from the buffer, so a fork starts warm).
-# ENA_X = "grp:mult:dir,..." extra groups with their own jump, beta = mult * global beta_t in the global window;
-# grp = bbias (Linear biases in the blocks) | lmbias (lm_head bias) | norm | embed | head | hidden, dir = buf | ema<b>.
-ENA_G_DIR = os.environ.get("ENA_G_DIR", "buf")
-ENA_X = os.environ.get("ENA_X", "")
-# SODA="scope[+scope...]:c:k0" (Pethick et al., arXiv 2605.11172): after each inner step, anchor toward the init,
-# p -= c * (p - p0) / (k + k0), k = the global step; c=1, k0=2 is the paper's uniform primal averaging. p0 is the
-# seed's init (regenerated, so a fork from a checkpoint anchors to its parent's init). The anchor replaces CWD on the
-# matrices in scope. scope = all | hidden (block matrices) | mlpproj | aux (1-D) | embed | head.
-SODA = os.environ.get("SODA", "")
 # SNR_DIAG=N (diagnostics only): every N steps, per hidden matrix, the singular values of Muon's input (the Nesterov
 # momentum and its SOAP-preconditioned form) and its noise level from the spread of the 8 ranks' local gradients, to
 # <log>.snr/step<k>.pt; snr_bbp.py turns them into BBP-debiased per-rank SNRs.
 SNR_DIAG = int(os.environ.get("SNR_DIAG", "0"))
-# SNRW=c: Muon's step on every hidden matrix becomes sum_i w_i u_i v_i^T over the exact singular pairs of the Newton-Schulz
-# input, w_i = SNR_i / (SNR_i + c), SNR_i the BBP per-direction SNR from a Kronecker noise model refreshed from the rank
-# spread every SNRW_EVERY steps (snr_weighted_update); c = 0 is the exact-SVD control (w = 1). Active from the first
-# refresh (a fork: from its resume step + 1).
-SNRW = os.environ.get("SNRW", "")
-SNRW_C = float(SNRW) if SNRW else 0.0
-SNRW_EVERY = int(os.environ.get("SNRW_EVERY", "10"))
-SNRW_FLOOR = float(os.environ.get("SNRW_FLOOR", "0"))   # w <- max(w, SNRW_FLOOR)
 # TSNR_DIAG="every,k1,k2,..." (diagnostics only): at every `every`-th step, fix the singular pairs of Muon's input (SOAP
 # form) and their within-step BBP SNR, then sum g_i = u_i^T G v_i (each pair's first-order descent) and g_i^2 over the next
 # k steps, snapshots at each k (max k <= every) -> <log>.tsnr/anchor<t>.pt; tsnr.py bins the pairs by SNR. The snapshot
@@ -267,73 +126,34 @@ SNRW_FLOOR = float(os.environ.get("SNRW_FLOOR", "0"))   # w <- max(w, SNRW_FLOOR
 _tsnr = [int(x) for x in os.environ.get("TSNR_DIAG", "").split(",") if x]
 TSNR_EVERY, TSNR_KS = (_tsnr[0], _tsnr[1:]) if _tsnr else (0, [])
 assert not TSNR_KS or TSNR_KS[-1] <= TSNR_EVERY
-ENA_G_MULT_AFTER = float(os.environ.get("ENA_G_MULT_AFTER", 1.0))
-ROW_PIN = os.environ.get("ROW_PIN", "0") == "1"
-ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
-# ROW_GAIN_SCOPE: comma list of matrix types it applies to (q,k,v,o,fc,proj; default all but proj). ROW_GAIN_MODE=matrix: one
-# gain per matrix (pure angular step for the whole matrix, then W *= 1 - a*(lr/lr0)*adam(<grad, W/|W|>)) instead of
-# one per row - separates "rows of a matrix can differ in norm" from "matrices can change scale".
-ROW_GAIN_SCOPE = set(os.environ.get("ROW_GAIN_SCOPE", "q,k,v,o,fc").split(","))
-ROW_GAIN_MODE = os.environ.get("ROW_GAIN_MODE", "row")
-ROW_GAIN_START = int(os.environ.get("ROW_GAIN_START", 1000))   # Muon step at which the row gains switch on
-ROW_GAIN_END = int(os.environ.get("ROW_GAIN_END", 0))   # Muon step at which they switch off again (0 = never)
-# ROW_GAIN_FIXED=1: the direction-only step per row without the Adam length step (row lengths move only by CWD), i.e.
-# separates "drop the radial part of the Muon update" from "learn the row lengths".
-ROW_GAIN_FIXED = os.environ.get("ROW_GAIN_FIXED", "0") == "1"
-# ROW_GAIN_NO_CWD=1: no cautious weight decay on the matrices while their row gains are active (with ROW_GAIN_FIXED=1:
-# row lengths stay exactly constant).
-ROW_GAIN_NO_CWD = os.environ.get("ROW_GAIN_NO_CWD", "1") == "1"   # default on (nocwd, 8 seeds); 0 = the 2665 record
-# ROW_GAIN_BETAS="b1,b2": betas of the length Adam (default 0.99,0.99, 16 seeds; 0.9,0.95 = the 2640 record). ROW_GAIN_COLS: comma list of matrix
-# types whose COLUMNS (input units) get the gain instead (e.g. proj: one gain per MLP neuron on mlp.proj; the type must not
-# also be in ROW_GAIN_SCOPE). ROW_GAIN_KEEP_FRO: types whose gains only redistribute length between rows/columns (after the
-# gain step the matrix is rescaled to the whole-matrix radius pin's target), i.e. separates reshaping from total scale.
-ROW_GAIN_B1, ROW_GAIN_B2 = (float(x) for x in os.environ.get("ROW_GAIN_BETAS", "0.99,0.99").split(","))
-# ROW_GAIN_CLIP=c > 0: clip the length Adam's ratio m_hat/sqrt(v_hat) to [-c, c]. Needed for beta1 > sqrt(beta2), where the
-# ratio is unbounded (it grows like (beta1/sqrt(beta2))^k while a row's length gradient fades) and a row can flip sign.
-ROW_GAIN_CLIP = float(os.environ.get("ROW_GAIN_CLIP", 0))
-ROW_GAIN_COLS = set(x for x in os.environ.get("ROW_GAIN_COLS", "").split(",") if x)
-ROW_GAIN_KEEP_FRO = set(x for x in os.environ.get("ROW_GAIN_KEEP_FRO", "").split(",") if x)
-assert not ROW_GAIN_COLS & ROW_GAIN_SCOPE
-# HEAD_GAIN_LR=a > 0: row gains on the LM head (one per vocabulary token). The head's AdamW step becomes direction-only
-# per row (rows rescaled back to their lengths), and each row length moves by its own Adam (HEAD_GAIN_BETAS, default =
-# ROW_GAIN_BETAS) on g_i = <grad_i, W_i/|W_i|>: |W_i| *= 1 - a * (lr/lr0) * adam_i, from HEAD_GAIN_START (the head is
-# zero-initialized, so not from step 0). HEAD_DIAG=1 (diagnostics only): at validation steps, head row-length stats, the
-# soft-cap regime of the pre-cap logits and the prior calibration per token-frequency bucket, to the log ("head step:").
-HEAD_GAIN_LR = float(os.environ.get("HEAD_GAIN_LR", 0))
-HEAD_GAIN_START = int(os.environ.get("HEAD_GAIN_START", 1000))
-HEAD_GAIN_B1, HEAD_GAIN_B2 = (float(x) for x in os.environ.get("HEAD_GAIN_BETAS", f"{ROW_GAIN_B1},{ROW_GAIN_B2}").split(","))
+# HEAD_DIAG=1 (diagnostics only): at validation steps, LM-head row-length stats, the soft-cap regime of the pre-cap
+# logits and the prior calibration per token-frequency bucket, to the log ("head step:").
 HEAD_DIAG = os.environ.get("HEAD_DIAG", "0") == "1"
-# HEAD_WD / EMBED_WD: AdamW decoupled weight decay on lm_head / the embedding (default 0 = rec-46), W *= 1 - lr_t * wd.
-# NADAM: comma list of Adam groups that use a Nesterov numerator, beta1*m + (1-beta1)*g instead of m (embed, head: the
-# AdamW groups, bias-corrected as NAdamW; aux: all 1-D groups). Default none.
-HEAD_WD = float(os.environ.get("HEAD_WD", 0))
-EMBED_WD = float(os.environ.get("EMBED_WD", 0))
-NADAM = set(x for x in os.environ.get("NADAM", "").split(",") if x)
-# KNOB_START: keep the 1-D Adam beta1 (AUX_BETA1, GAIN_BETA1), HEAD_WD / EMBED_WD and NADAM at their defaults until this
-# step, then switch them on (default 0 = from the start). A fork from a step-50 checkpoint sees exactly KNOB_START=50.
-KNOB_START = int(os.environ.get("KNOB_START", 0))
-# MARS (MARS-approx, Yuan et al. 2024): feed the optimizer c_t = g_t + gamma * beta/(1-beta) * (g_t - g_{t-1}) instead of
-# g_t, with g_{t-1} the previous step's gradient (previous batch: one forward-backward per step). MARS: comma list of
-# muon (hidden matrices; beta = the Muon mu), embed, head (beta = AdamW beta1), aux (1-D groups; their beta1). Default none.
-# MARS_GAMMA: gamma (default 0.025, the paper's). MARS_CLIP=1: rescale c_t to unit norm per tensor if its norm is > 1.
-# g_{t-1} is not checkpointed: the first step of a run or fork is uncorrected.
-MARS = set(x for x in os.environ.get("MARS", "").split(",") if x)
-MARS_GAMMA = float(os.environ.get("MARS_GAMMA", 0.025))
-MARS_CLIP = os.environ.get("MARS_CLIP", "0") == "1"
-# AUX_BETA1_TIE=c > 0: tie the 1-D Adam beta1 (gains and biases) to the Muon momentum ramp, 1 - beta1(t) = c * (1 - mu(t)):
-# the Adam first moment averages over 1/c times as many steps as Muon's. Overrides AUX_BETA1 / GAIN_BETA1. Default 0 = off.
-AUX_BETA1_TIE = float(os.environ.get("AUX_BETA1_TIE", 0))
-# HEAD_GAIN_DRIFT=1 (with HEAD_GAIN_LR): keep the head's angular step size as without the gains. Plain AdamW lengthens rows
-# through its tangential steps, which slows their rotation; each row's tangential step is scaled by r_i / rtil_i, rtil_i the
-# length the tangential steps alone would have given it (from its length at HEAD_GAIN_START).
-HEAD_GAIN_DRIFT = os.environ.get("HEAD_GAIN_DRIFT", "0") == "1"
-# 1-D Adam (norm gains and biases) ablation knobs; defaults are rec-46. AUX_LR_MULT scales both eta0 and
-# the PowerCool constant, i.e. the whole LR curve.
-GAIN_BETA2 = float(os.environ.get("GAIN_BETA2", 0.99))
-AUX_BETA1 = float(os.environ.get("AUX_BETA1", 0.8))
-GAIN_BETA1 = float(os.environ.get("GAIN_BETA1", AUX_BETA1))   # beta1 of the norm-gain group only (default AUX_BETA1)
-AUX_LR_MULT = float(os.environ.get("AUX_LR_MULT", 1.0))
+RADIAL_OUTWARD_SCALE = 0.5
+RADIAL_INWARD_SCALE = 1.0
+HEAD_DIM = 128
 
+# RowFloor: per-output-row u/w-floor on the orthogonalized update. RHO=1.0, no Frobenius renorm (magnitude is then
+# re-pinned by rescale_to_radius, so only the per-row SHAPE survives).
+ROWFLOOR_RHO = 1.0
+# Cautious Weight Decay: per-coordinate decay on the 2-D Muon params, applied AFTER the radius pin.
+# mask = 1[update*p > 0]. Off on the matrices whose row gains are active.
+CWD = 0.025
+# Tail-EMA eval readout: slow weight EMA over [START, END] (token embed excluded), eval the partial blend
+# (1-LAMBDA)*w + LAMBDA*ema. TAILEMA_TAU=0 -> off (eval raw weights only).
+TAILEMA_TAU = float(os.environ.get("TAILEMA_TAU", 200.0))
+TAILEMA_START = int(os.environ.get("TAILEMA_START", 2100))
+TAILEMA_END = 2900
+TAILEMA_LAMBDA = float(os.environ.get("TAILEMA_LAMBDA", 0.6))
+# EMA-Nesterov lookahead: the norm gains jump ENA_G_MULT times the global jump, in the global window [300, 1950).
+ENA_G_MULT = float(os.environ.get("ENA_G_MULT", 2.5))
+# Row gains: from Muon step ROW_GAIN_START, the Muon step on the q/k/v/attn.proj/mlp.fc matrices is purely angular per
+# row and each row length moves by its own bias-corrected Adam (ROW_GAIN_BETAS) on g_i = <grad_i, W_i/|W_i|>:
+# |W_i| *= 1 - ROW_GAIN_LR * (lr/lr0) * adam_i. ROW_GAIN_LR=0 turns them off.
+ROW_GAIN_LR = float(os.environ.get("ROW_GAIN_LR", 0.02))
+ROW_GAIN_START = int(os.environ.get("ROW_GAIN_START", 1000))
+ROW_GAIN_B1, ROW_GAIN_B2 = (float(x) for x in os.environ.get("ROW_GAIN_BETAS", "0.99,0.99").split(","))
+ROW_GAIN_SCOPE = {"q", "k", "v", "o", "fc"}
 
 ########################################
 #              Dataloader              #
@@ -390,18 +210,8 @@ class RMSNorm(nn.Module):
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=True)
-        # Newton-Muon input statistics, set only on refresh steps: (nb, d, d) accumulator + count.
-        # Collected in forward (not a hook) because forward hooks added after model.compile never fire.
-        self.newton_accum = None
-        self.newton_count = None
 
     def forward(self, x):
-        if self.newton_accum is not None:
-            xf = x.detach().flatten(0, -2).float()
-            n, nb, d = xf.size(0), self.newton_accum.size(0), self.newton_accum.size(-1)
-            xf = xf.reshape(n, nb, d).permute(1, 2, 0)
-            self.newton_accum.add_(torch.bmm(xf, xf.mT), alpha=1 / n)
-            self.newton_count.add_(1)
         return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
 
 class Rotary(nn.Module):
@@ -528,9 +338,6 @@ def should_soap_param(name: str) -> bool:
         or name.endswith(".attn.k.weight")
         or name.endswith(".attn.v.weight")
     )
-    is_q = name.endswith(".attn.q.weight")
-    is_k = name.endswith(".attn.k.weight")
-    is_v = name.endswith(".attn.v.weight")
     return is_mlp_fc or is_mlp_proj or is_attn_proj or is_qkv  # SOAP on all hidden 2D matrices
 
 def is_attn_proj_param(name: str) -> bool:
@@ -623,14 +430,11 @@ def soap_eigenbasis(mat: Tensor) -> Tensor:
     return torch.flip(q, [1])
 
 def soap_basis_qr(row_gg, col_gg, q_row, q_col, exp_avg_sq):
-    # col_gg is None for one-sided (row-only) SOAP
     row_eig = torch.diag(q_row.T @ row_gg @ q_row)
     row_sort = torch.argsort(row_eig, descending=True)
     q_row = q_row[:, row_sort]
     exp_avg_sq = exp_avg_sq.index_select(0, row_sort)
     q_row, _ = torch.linalg.qr(row_gg @ q_row)
-    if col_gg is None:
-        return q_row, q_col, exp_avg_sq
 
     col_eig = torch.diag(q_col.T @ col_gg @ q_col)
     col_sort = torch.argsort(col_eig, descending=True)
@@ -639,249 +443,30 @@ def soap_basis_qr(row_gg, col_gg, q_row, q_col, exp_avg_sq):
     q_col, _ = torch.linalg.qr(col_gg @ q_col)
     return q_row, q_col, exp_avg_sq
 
-def sinkhorn_sqrt_scalings(B, steps=10):
-    """Row/col scalings r, c with r_i B_ij c_j having uniform marginals (SinkSOAP); returns sqrt(r)[:, None], sqrt(c)."""
-    m, n = B.shape
-    B = B + B.mean() * 1e-6
-    c = torch.ones(n, device=B.device, dtype=B.dtype)
-    for _ in range(steps):
-        r = (1.0 / m) / (B @ c)
-        c = (1.0 / n) / (B.T @ r)
-    return r.sqrt()[:, None], c.sqrt()[None, :]
-
-def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8, denom_power=SOAP_DENOM_POWER, sink=""):
+def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8, denom_power=SOAP_DENOM_POWER):
     update_f = update.float()
     if state["q_row"] is None:
         return update
     q_row, q_col = state["q_row"], state["q_col"]
-    projected = q_row.T @ update_f if q_col is None else q_row.T @ update_f @ q_col
+    projected = q_row.T @ update_f @ q_col
     state["exp_avg_sq"].mul_(beta2).add_(projected.square(), alpha=1 - beta2)
-    if sink and q_col is not None:
-        sr, sc = sinkhorn_sqrt_scalings(state["exp_avg_sq"] if sink == "ema" else projected.square())
-        precond = q_row @ (projected * sr * sc) @ q_col.T
-    else:
-        denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(denom_power)
-        precond = q_row @ (projected / denom) if q_col is None else q_row @ (projected / denom) @ q_col.T
+    denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(denom_power)
+    precond = q_row @ (projected / denom) @ q_col.T
     precond.mul_(gram_frobenius_norm_estimate(update_f, eps=eps) / gram_frobenius_norm_estimate(precond, eps=eps))
     return precond.to(update.dtype)
 
-def kl_soap_targets(grad_f, state, beta):
-    """KL-SOAP coupled covariance targets: G R^-1 G^T / n and G^T L^-1 G / m, with L^-1, R^-1 diagonal in the current
-    bases (running eigenvalue estimates). Returns None until a basis exists."""
-    q_row, q_col = state["q_row"], state["q_col"]
-    if q_row is None or q_col is None:
-        return None
-    m, n = grad_f.shape
-    if "kl_eig_row" not in state:
-        state["kl_eig_row"] = torch.ones(m, device=grad_f.device)
-        state["kl_eig_col"] = torch.ones(n, device=grad_f.device)
-    inv_row = state["kl_eig_row"].clamp_min(state["kl_eig_row"].max() * 1e-8).rsqrt()
-    inv_col = state["kl_eig_col"].clamp_min(state["kl_eig_col"].max() * 1e-8).rsqrt()
-    rw = (q_col.T @ grad_f.T) * inv_col[:, None]
-    lw = (q_row.T @ grad_f) * inv_row[:, None]
-    proj = q_row.T @ grad_f @ q_col
-    fresh = "kl_started" not in state
-    for key, d in (("kl_eig_row", (proj * inv_col[None, :]).square().mean(dim=1)),
-                   ("kl_eig_col", (proj * inv_row[:, None]).square().mean(dim=0))):
-        state[key] = d if fresh else state[key].lerp_(d, 1 - beta)
-    state["kl_started"] = True
-    return rw.T @ rw / n, lw.T @ lw / m, fresh
-
-def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, precondition_frequency=SOAP_PRECONDITION_FREQUENCY,
-                               row_mask=None, col_mask=None, kl=False):
-    # row_mask / col_mask: elementwise masks on the new statistics (per-head block-diagonal SOAP, VO_HEAD)
+def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, precondition_frequency=SOAP_PRECONDITION_FREQUENCY):
     grad_f = grad.float()
-    klt = kl_soap_targets(grad_f, state, shampoo_beta) if kl else None
-    if klt is not None:  # the first KL step replaces the plain statistics (different scale) instead of mixing in
-        row_new, col_new, fresh = klt
-        for key, new in (("row_gg", row_new), ("col_gg", col_new)):
-            state[key].copy_(new) if fresh else state[key].lerp_(new, 1 - shampoo_beta)
-    else:
-        row_new = grad_f @ grad_f.T
-        state["row_gg"].lerp_(row_new if row_mask is None else row_new * row_mask, 1 - shampoo_beta)
-        if state["col_gg"] is not None:
-            col_new = grad_f.T @ grad_f
-            state["col_gg"].lerp_(col_new if col_mask is None else col_new * col_mask, 1 - shampoo_beta)
+    state["row_gg"].lerp_(grad_f @ grad_f.T, 1 - shampoo_beta)
+    state["col_gg"].lerp_(grad_f.T @ grad_f, 1 - shampoo_beta)
     if state["q_row"] is None:
         state["q_row"] = soap_eigenbasis(state["row_gg"])
-        state["q_col"] = None if state["col_gg"] is None else soap_eigenbasis(state["col_gg"])
+        state["q_col"] = soap_eigenbasis(state["col_gg"])
     elif state["soap_step"] > 0 and state["soap_step"] % precondition_frequency == 0:
         state["q_row"], state["q_col"], state["exp_avg_sq"] = soap_basis_qr(
             state["row_gg"], state["col_gg"], state["q_row"], state["q_col"], state["exp_avg_sq"]
         )
     state["soap_step"] += 1
-
-class VOVariants:
-    """V/O SOAP variant directions for screening (VO_VARIANTS=1); never applied to the weights.
-
-    Kept up to date every step for the attn.v / attn.proj params this rank owns; on probe steps Muon records each
-    variant, after the same attn.proj trust gate and Newton-Schulz as the real path, as a candidate direction:
-      vo_ns      the real direction, restricted to V/O (the baseline the others are compared with)
-      vo_head    per-head SOAP: V's output side and O's input side use block-diagonal (heads x HEAD_DIM) statistics
-      vo_shared  one basis for V's output side and O's input side (the same space), from the sum of the two
-                 trace-normalized statistics g_V g_V^T / |g_V|^2 + g_O^T g_O / |g_O|^2
-      vo_p25     the real SOAP state with denominator V^(1/4) instead of V^(1/2) (partial whitening)
-      vo_gate    the attn.proj trust gate also applied on attn.v (O = the real direction)
-    The shadow states (vo_head, vo_shared) run the same SOAP recurrences as the real one, from step 0.
-    """
-    names = ["vo_ns", "vo_head", "vo_shared", "vo_p25", "vo_gate"]
-
-    def __init__(self, named_params):
-        self.kind, self.partner, self.state = {}, {}, {}
-        pairs = {}
-        for n, p in named_params:
-            if n.endswith(".attn.v.weight") or n.endswith(".attn.proj.weight"):
-                k = "v" if n.endswith(".attn.v.weight") else "o"
-                self.kind[p] = k
-                pairs.setdefault(n.split(".attn.")[0], {})[k] = p
-        for pr in pairs.values():
-            self.partner[pr["v"]], self.partner[pr["o"]] = pr["o"], pr["v"]
-        self.mask = None
-
-    @staticmethod
-    def _new_state(p):
-        return dict(exp_avg_sq=torch.zeros_like(p, dtype=torch.float32),
-                    row_gg=torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device),
-                    col_gg=torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device),
-                    q_row=None, q_col=None, soap_step=0)
-
-    @staticmethod
-    def _update_stats(st, row_new, col_new):  # soap_update_preconditioner with given statistics
-        st["row_gg"].lerp_(row_new, 1 - SOAP_BETA2)
-        st["col_gg"].lerp_(col_new, 1 - SOAP_BETA2)
-        if st["q_row"] is None:
-            st["q_row"], st["q_col"] = soap_eigenbasis(st["row_gg"]), soap_eigenbasis(st["col_gg"])
-        elif st["soap_step"] > 0 and st["soap_step"] % SOAP_PRECONDITION_FREQUENCY == 0:
-            st["q_row"], st["q_col"], st["exp_avg_sq"] = soap_basis_qr(
-                st["row_gg"], st["col_gg"], st["q_row"], st["q_col"], st["exp_avg_sq"])
-        st["soap_step"] += 1
-
-    def step(self, p, grad, mom, soap_out, real_state, step_count, capture):
-        """Advance the shadow states; on capture steps return {name: pre-Newton-Schulz direction} (vo_ns excluded)."""
-        kind = self.kind[p]
-        if p not in self.state:
-            self.state[p] = dict(head=self._new_state(p), shared=self._new_state(p))
-        if self.mask is None:
-            h = p.size(0) // HEAD_DIM
-            self.mask = torch.block_diag(*[torch.ones(HEAD_DIM, HEAD_DIM, device=p.device)] * h)
-        sts = self.state[p]
-        dirs = {}
-        if capture:
-            dirs["vo_head"] = soap_precondition_momentum(mom, sts["head"])
-            dirs["vo_shared"] = soap_precondition_momentum(mom, sts["shared"])
-            if real_state["q_row"] is None:
-                dirs["vo_p25"] = mom
-            else:
-                q_row, q_col, m = real_state["q_row"], real_state["q_col"], mom.float()
-                proj = q_row.T @ m @ q_col
-                pre = q_row @ (proj / real_state["exp_avg_sq"].clamp_min(1e-16).pow(0.25)) @ q_col.T
-                pre.mul_(gram_frobenius_norm_estimate(m) / gram_frobenius_norm_estimate(pre))
-                dirs["vo_p25"] = pre.to(mom.dtype)
-            if kind == "o":  # O keeps the real trust gate, applied to each variant
-                for k, d in dirs.items():
-                    dirs[k] = norm_preserving_blend(mom, d, bounded_trust_gate(trust_gate(mom, d, grad), step_count))
-            else:
-                dirs["vo_gate"] = norm_preserving_blend(
-                    mom, soap_out, bounded_trust_gate(trust_gate(mom, soap_out, grad), step_count))
-        else:  # keep the shadow second moments advancing exactly as they would on capture steps
-            soap_precondition_momentum(mom, sts["head"])
-            soap_precondition_momentum(mom, sts["shared"])
-        g = grad.float()
-        gp = self.partner[p].grad.float()
-        gg_row, gg_col = g @ g.T, g.T @ g
-        if kind == "v":  # heads live on V's output side (rows)
-            self._update_stats(sts["head"], gg_row * self.mask, gg_col)
-            pg = gp.T @ gp  # O's input side = V's output space
-            self._update_stats(sts["shared"], gg_row / gg_row.trace().clamp_min(1e-30)
-                               + pg / pg.trace().clamp_min(1e-30), gg_col)
-        else:  # heads live on O's input side (columns)
-            self._update_stats(sts["head"], gg_row, gg_col * self.mask)
-            pg = gp @ gp.T  # V's output side
-            self._update_stats(sts["shared"], gg_row, gg_col / gg_col.trace().clamp_min(1e-30)
-                               + pg / pg.trace().clamp_min(1e-30))
-        return dirs
-
-
-class NewtonPreconditioner:
-    """Newton-Muon right preconditioner, one K per layer-input space (q/k/v share theirs)."""
-    def __init__(self, model):
-        dev, d = next(model.parameters()).device, NEWTON_BLOCK
-        self.stats, self.of_param = [], {}
-        for block in model.blocks:
-            a, m = block.attn, block.mlp
-            for src, users in ((a.q, (a.q, a.k, a.v)), (a.proj, (a.proj,)), (m.fc, (m.fc,)), (m.proj, (m.proj,))):
-                nb = src.weight.size(1) // d
-                st = dict(module=src, n=nb,
-                          accum=torch.zeros(nb, d, d, device=dev), count=torch.zeros((), device=dev))
-                self.stats.append(st)
-                for u in users:
-                    self.of_param[u.weight] = st
-        n = sum(st["n"] for st in self.stats)
-        eye = torch.eye(d, device=dev).repeat(n, 1, 1)
-        self.cov = 0.001 * eye
-        self.K = eye.clone()
-        self.counts = torch.zeros(n, device=dev)
-        i = 0
-        for st in self.stats:
-            st["inv"] = self.K[i:i + st["n"]]
-            st["slice"] = slice(i, i + st["n"])
-            i += st["n"]
-        self.has_inv = False
-
-    def is_refresh_step(self, step):
-        return (step + 1) % NEWTON_REFRESH == 0
-
-    def enable_capture(self):
-        for st in self.stats:
-            st["module"].newton_accum, st["module"].newton_count = st["accum"], st["count"]
-
-    def disable_capture(self):
-        for st in self.stats:
-            st["module"].newton_accum = st["module"].newton_count = None
-
-    @torch.no_grad()
-    def refresh(self):
-        # all ranks: Sigma <- lerp(Sigma, mean_batch x x^T, COV_EMA); K = (Sigma + damping)^-1
-        batch = torch.cat([st["accum"] for st in self.stats])
-        for st in self.stats:
-            self.counts[st["slice"]] = st["count"]
-        dist.all_reduce(batch, op=dist.ReduceOp.SUM)
-        dist.all_reduce(self.counts, op=dist.ReduceOp.SUM)
-        batch.div_(self.counts.clamp_min(1).view(-1, 1, 1))
-        self.cov.lerp_(batch, (self.counts > 0).float().mul(NEWTON_COV_EMA).view(-1, 1, 1))
-        d = self.cov.size(-1)
-        damped = self.cov.clone()
-        diag = damped.diagonal(dim1=-2, dim2=-1)
-        diag.add_((diag.sum(-1) / d * NEWTON_DAMPING + 1e-8).unsqueeze(-1))
-        L, info = torch.linalg.cholesky_ex(damped, upper=False, check_errors=False)
-        torch.cholesky_inverse(L, upper=False, out=self.K)
-        if info.any():
-            self.K[info != 0] = torch.eye(d, device=self.K.device)
-        # diagnostics: capture counts and how far K is from a scaled identity
-        Kn = self.K / self.K.diagonal(dim1=-2, dim2=-1).mean(-1).view(-1, 1, 1)
-        off = (Kn - torch.eye(d, device=Kn.device)).norm(dim=(-2, -1)) / d**0.5
-        self.last_diag = dict(count_min=self.counts.min().item(), count_max=self.counts.max().item(),
-                              K_offident=off.mean().item(), cholesky_fail=int((info != 0).sum().item()))
-        for st in self.stats:
-            st["accum"].zero_()
-            st["count"].zero_()
-        self.has_inv = True
-
-    def apply(self, update, p, rescale=True, eps=1e-8):
-        # U K (block-diagonal K for wide inputs), optionally rescaled to keep U's Schatten-4 norm
-        if not self.has_inv:
-            return update
-        inv = self.of_param[p]["inv"]
-        u = update.float()
-        nb, d = inv.size(0), inv.size(-1)
-        out = torch.bmm(u.view(u.size(0), nb, d).permute(1, 0, 2), inv).permute(1, 0, 2).reshape_as(u)
-        if rescale:
-            out.mul_(gram_frobenius_norm_estimate(u, eps=eps) / gram_frobenius_norm_estimate(out, eps=eps))
-        return out.to(update.dtype)
-
-def dirs_or_real(pre_ns, real, names):
-    """Variant directions after Newton-Schulz; a variant without its own direction here is the real one."""
-    return {k: (muon_update(pre_ns[k]) if k in pre_ns else real) for k in names}
 
 def muon_update(update):
     # Newton-Schulz orthogonalization + aspect-ratio scale.
@@ -891,22 +476,14 @@ def muon_update(update):
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, named_params, lr=0.02, weight_decay=0, mu=0.95, newton=None):
+    def __init__(self, named_params, lr=0.02, weight_decay=0, mu=0.95):
         assert isinstance(named_params, list) and len(named_params) >= 1
-        self.newton = newton
         self.soap_params = {p for n, p in named_params if should_soap_param(n)}
         self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_param(n)}
         self.attn_proj_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
-        self.v_params = {p for n, p in named_params if n.endswith(".attn.v.weight")}
-        self.gated_params = self.attn_proj_soap_params | (self.v_params if V_GATE else set())
-        self.vo_params = self.v_params | {p for n, p in named_params if is_attn_proj_param(n)}
-        self.head_mask = None
         _kind = lambda n: {"attn.q": "q", "attn.k": "k", "attn.v": "v", "attn.proj": "o", "mlp.fc": "fc",
                            "mlp.proj": "proj"}.get(n.split(".", 1)[1].rsplit(".", 1)[0])
-        self.no_cwd = set()   # params anchored by SODA instead
-        self.row_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_SCOPE | ROW_GAIN_COLS} if ROW_GAIN_LR > 0 or ROW_GAIN_FIXED else set()
-        self.col_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_COLS} & self.row_gain_params
-        self.keep_fro_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_KEEP_FRO}
+        self.row_gain_params = {p for n, p in named_params if _kind(n) in ROW_GAIN_SCOPE} if ROW_GAIN_LR > 0 else set()
         self.step_count = 0
         self.anat = {} if ANATOMY else None   # param -> list of (3, rows) fp16: u/w, RowFloor flag, row-gain step
         # Probe diagnostics (harness.ProbeQuadratic): on probe steps the harness sets probe_capture and this optimizer
@@ -914,31 +491,10 @@ class Muon(torch.optim.Optimizer):
         # A new direction idea ("variant") is screened by adding its name here and a self._capture call.
         self.probe_capture, self.probe_dirs = False, {}
         self.snr_capture, self.snr_dirs = False, {}   # SNR_DIAG: the Nesterov momentum, its SOAP form and SOAP state
-        self.snrw = {}   # SNRW: param -> its noise model (snrw_refresh)
-        self.probe_dir_names = ["momentum", "soap"] + (["newton"] if newton is not None and NEWTON_MODE != "grad" else []) + ["ns"]
-        self.vo = VOVariants(named_params) if VO_VARIANTS else None
-        if self.vo is not None:
-            self.probe_dir_names += VOVariants.names
+        self.probe_dir_names = ["momentum", "soap", "ns"]
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
-        if all(m == 1.0 for m in MUON_LR_MULT.values()) and VO_LR_MULT == 1.0 and VO_FLOOR_MULT == 1.0:
-            params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
-        else:
-            by_type = {}
-            for n, p in named_params:
-                kind = "attn_proj" if is_attn_proj_param(n) else "qkv" if is_attn_param(n) else "mlp"
-                is_vo = is_attn_proj_param(n) or n.endswith(".attn.v.weight")
-                key = (MUON_LR_MULT[kind] * (VO_LR_MULT if is_vo else 1.0), VO_FLOOR_MULT if is_vo else 1.0)
-                by_type.setdefault(key, []).append(p)
-            params = [dict(params=sorted(ps, key=lambda x: x.size(), reverse=True),
-                           lr=lr * lr_mult, lr_mult=lr_mult, floor_mult=floor_mult)
-                      for (lr_mult, floor_mult), ps in by_type.items()]
+        params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
         super().__init__(params, defaults)
-
-    def in_scope(self, p, scope):
-        return scope == "all" or (scope == "vo" and p in self.vo_params)
-
-    def sink_of(self, p):
-        return SOAP_SINK if SOAP_SINK and self.in_scope(p, SOAP_SINK_SCOPE) else ""
 
     def _capture(self, p, name, u):
         if self.probe_capture:
@@ -948,17 +504,12 @@ class Muon(torch.optim.Optimizer):
             d[name] = u.detach().float().clone()
             st = self.state[p]
             if name == "soap" and st["q_row"] is not None:
-                power = VO_DENOM_POWER if p in self.attn_soap_params and p in self.vo_params else SOAP_DENOM_POWER
-                d["soap_state"] = (st["q_row"].clone(), None if st["q_col"] is None else st["q_col"].clone(),
-                                   st["exp_avg_sq"].clone(), power)
+                d["soap_state"] = (st["q_row"].clone(), st["q_col"].clone(), st["exp_avg_sq"].clone(), SOAP_DENOM_POWER)
 
     @torch.no_grad()
     def step(self):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
-        if self.newton is not None and self.newton.is_refresh_step(self.step_count):
-            self.newton.refresh()
-            print0(f"newton refresh step:{self.step_count} " + " ".join(f"{k}:{v:.4g}" for k, v in self.newton.last_diag.items()), console=True)
         for group in self.param_groups:
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
@@ -971,137 +522,84 @@ class Muon(torch.optim.Optimizer):
                         if p in self.soap_params:
                             state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
                             state["row_gg"] = torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device)
-                            state["col_gg"] = (None if SOAP_ONE_SIDED else
-                                               torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device))
+                            state["col_gg"] = torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device)
                             state["q_row"] = None
                             state["q_col"] = None
                             state["soap_step"] = 0
                     grad = p.grad
-                    if self.newton is not None and NEWTON_MODE == "grad":
-                        grad = self.newton.apply(grad, p, rescale=False)
                     state["momentum"].lerp_(grad, 1 - group["mu"])
                     momentum_update = grad.lerp(state["momentum"], group["mu"])
                     self._capture(p, "momentum", momentum_update)
-                    is_attn_soap = p in self.attn_soap_params
-                    vo_dirs = None
                     use_soap = p in self.soap_params
                     if use_soap:
-                        if is_attn_soap:
-                            soap_update = soap_precondition_momentum(
-                                momentum_update, state,
-                                denom_power=VO_DENOM_POWER if p in self.vo_params else SOAP_DENOM_POWER,
-                                sink=self.sink_of(p))
+                        if p in self.attn_soap_params:
+                            soap_update = soap_precondition_momentum(momentum_update, state)
                             self._capture(p, "soap", soap_update)
-                            if self.newton is not None and NEWTON_MODE in ("soap", "right"):
-                                soap_update = self.newton.apply(soap_update, p)
-                                self._capture(p, "newton", soap_update)
-                            if p in self.gated_params:
+                            if p in self.attn_proj_soap_params:
+                                # trust gate: blend raw momentum and SOAP by how far SOAP can be trusted
                                 gate = bounded_trust_gate(
                                     trust_gate(momentum_update, soap_update, grad),
                                     self.step_count
                                 )
                             else:
                                 gate = torch.ones((), dtype=torch.float32, device=p.device)
-                            vo_dirs = (self.vo.step(p, grad, momentum_update, soap_update, state, self.step_count,
-                                                    self.probe_capture) if self.vo is not None and p in self.vo.kind else None)
                             momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
                         else:
-                            momentum_update = soap_precondition_momentum(momentum_update, state, sink=self.sink_of(p))
+                            momentum_update = soap_precondition_momentum(momentum_update, state)
                             self._capture(p, "soap", momentum_update)
-                            if self.newton is not None and NEWTON_MODE in ("soap", "right"):
-                                momentum_update = self.newton.apply(momentum_update, p)
-                                self._capture(p, "newton", momentum_update)
-                    update = (snr_weighted_update(momentum_update, self.snrw[p]) if p in self.snrw
-                              else muon_update(momentum_update))
+                    update = muon_update(momentum_update)
                     self._capture(p, "ns", update)
-                    if self.probe_capture and vo_dirs is not None:
-                        self._capture(p, "vo_ns", update)
-                        for k, d in dirs_or_real(vo_dirs, update, VOVariants.names[1:]).items():
-                            self._capture(p, k, d)
                     update = scale_radial_update(update, p)
-                    # u/w-floor. SOAP and non-SOAP params can use different floors.
-                    p_fro = p.float().norm().clamp_min(1e-8)
-                    u_fro = update.float().norm().clamp_min(1e-8)
-                    cur_uw = u_fro / p_fro
-                    target_uw = (SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW) * group.get("floor_mult", 1.0)
-                    if ROWFLOOR and p.ndim == 2:
-                        # (B) RowFloor: boost each under-updated OUTPUT ROW to its target update/weight
-                        # ratio. Per-row SHAPE change; magnitude is re-pinned below, so only the shape
-                        # survives the radius pin. RHO=1.0 -> the clamp is the whole floor.
-                        r_row = p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
-                        s_row = update.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
-                        f_row = torch.clamp(target_uw * r_row / s_row, min=1.0).pow(ROWFLOOR_RHO)
-                        update = (update.float() * f_row).to(update.dtype)
-                    else:
-                        scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
-                        update = update * scale.to(update.dtype)
-                    if self.anat is not None and p.ndim == 2:
+                    # RowFloor: boost each under-updated OUTPUT ROW to its target update/weight ratio. Per-row SHAPE
+                    # change; magnitude is re-pinned below, so only the shape survives the radius pin.
+                    target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
+                    r_row = p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
+                    s_row = update.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
+                    f_row = torch.clamp(target_uw * r_row / s_row, min=1.0).pow(ROWFLOOR_RHO)
+                    update = (update.float() * f_row).to(update.dtype)
+                    if self.anat is not None:
                         a_uw = update.float().norm(dim=1) / p.float().norm(dim=1).clamp_min(1e-8)
-                        a_floor = (f_row.squeeze(1) > 1).float() if ROWFLOOR else torch.zeros_like(a_uw)
+                        a_floor = (f_row.squeeze(1) > 1).float()
                         a_gain = torch.zeros_like(a_uw)
-                    gain = (p in self.row_gain_params and self.step_count >= ROW_GAIN_START
-                            and (ROW_GAIN_END == 0 or self.step_count < ROW_GAIN_END))
-                    row_ctl = (ROW_PIN or gain) and p.ndim == 2
-                    ax = 0 if gain and p in self.col_gain_params else 1   # the gains' unit: rows (1) or columns (0)
-                    keep_fro = gain and p in self.keep_fro_params
-                    if keep_fro:
-                        target_radius = target_radius_after_update(p, update, group["lr"])
-                    if row_ctl:
+                    # row gains: the step is angular per row (rows rescaled back to their lengths), then each row
+                    # length takes its own Adam step; otherwise the whole-matrix radius pin
+                    gain = p in self.row_gain_params and self.step_count >= ROW_GAIN_START
+                    if gain:
                         p_before = p.float()
-                        r_rows = p_before.norm(dim=ax, keepdim=True).clamp_min(1e-8)
-                        if gain and ROW_GAIN_MODE == "matrix":
-                            r_rows = p_before.norm().clamp_min(1e-8).reshape(1, 1)
-                        target_rows = r_rows if gain else (
-                            r_rows - group["lr"] * (update.float() * p_before).sum(dim=1, keepdim=True) / r_rows)
-                        target_rows = target_rows.clamp_min(1e-8)
+                        r_rows = p_before.norm(dim=1, keepdim=True).clamp_min(1e-8)
                     else:
                         target_radius = target_radius_after_update(p, update, group["lr"])
                     # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
-                    cwd_on = CWD > 0.0 and p.ndim == 2 and not (gain and ROW_GAIN_NO_CWD) and p not in self.no_cwd
+                    cwd_on = CWD > 0.0 and not gain
                     if cwd_on:
-                        # (C) Cautious Weight Decay: mask the coords where -lr*update already shrinks |p|
+                        # Cautious Weight Decay: mask the coords where -lr*update already shrinks |p|
                         # (update*p>0); decay only those (never fight a coord the optimizer wants to grow).
                         cwd_mask = (update.float() * p.float() > 0).to(p.dtype)
                     p.add_(update, alpha=-group["lr"])
-                    if row_ctl:
-                        cur = (p.float().norm().reshape(1, 1) if gain and ROW_GAIN_MODE == "matrix"
-                               else p.float().norm(dim=ax, keepdim=True))
-                        p.mul_((target_rows / cur.clamp_min(1e-8)).to(p.dtype))
-                        if gain and not ROW_GAIN_FIXED:
-                            g_row = ((grad.float() * p_before).sum().reshape(1, 1) if ROW_GAIN_MODE == "matrix"
-                                     else (grad.float() * p_before).sum(dim=ax, keepdim=True)) / r_rows
-                            if "row_m" not in state:
-                                state["row_m"], state["row_v"], state["row_t"] = torch.zeros_like(g_row), torch.zeros_like(g_row), 0
-                            state["row_t"] += 1
-                            state["row_m"].lerp_(g_row, 1 - ROW_GAIN_B1)
-                            state["row_v"].lerp_(g_row.square(), 1 - ROW_GAIN_B2)
-                            adam = (state["row_m"] / (1 - ROW_GAIN_B1 ** state["row_t"])) / (
-                                (state["row_v"] / (1 - ROW_GAIN_B2 ** state["row_t"])).sqrt() + 1e-12)
-                            if ROW_GAIN_CLIP > 0:
-                                adam = adam.clamp(-ROW_GAIN_CLIP, ROW_GAIN_CLIP)
-                            gstep = ROW_GAIN_LR * group["lr"] / group["initial_lr"] * adam
-                            p.mul_((1 - gstep).to(p.dtype))
-                            if self.anat is not None and ax == 1:
-                                a_gain = gstep.reshape(-1).expand(p.size(0)).clone()
-                        if keep_fro:
-                            rescale_to_radius(p, target_radius)
+                    if gain:
+                        cur = p.float().norm(dim=1, keepdim=True)
+                        p.mul_((r_rows / cur.clamp_min(1e-8)).to(p.dtype))
+                        g_row = (grad.float() * p_before).sum(dim=1, keepdim=True) / r_rows
+                        if "row_m" not in state:
+                            state["row_m"], state["row_v"], state["row_t"] = torch.zeros_like(g_row), torch.zeros_like(g_row), 0
+                        state["row_t"] += 1
+                        state["row_m"].lerp_(g_row, 1 - ROW_GAIN_B1)
+                        state["row_v"].lerp_(g_row.square(), 1 - ROW_GAIN_B2)
+                        adam = (state["row_m"] / (1 - ROW_GAIN_B1 ** state["row_t"])) / (
+                            (state["row_v"] / (1 - ROW_GAIN_B2 ** state["row_t"])).sqrt() + 1e-12)
+                        gstep = ROW_GAIN_LR * group["lr"] / group["initial_lr"] * adam
+                        p.mul_((1 - gstep).to(p.dtype))
+                        if self.anat is not None:
+                            a_gain = gstep.reshape(-1).expand(p.size(0)).clone()
                     else:
                         rescale_to_radius(p, target_radius)
                     if cwd_on:
                         # apply AFTER the radius pin (POST) so the per-coord shape change is preserved.
                         p.mul_(1.0 - (group["lr"] * CWD) * cwd_mask)
-                    if self.anat is not None and p.ndim == 2:
+                    if self.anat is not None:
                         self.anat.setdefault(p, []).append(torch.stack([a_uw, a_floor, a_gain]).half())
                     if use_soap:
-                        if VO_HEAD and p in self.vo_params:
-                            if self.head_mask is None:
-                                h = p.size(0) // HEAD_DIM
-                                self.head_mask = torch.block_diag(*[torch.ones(HEAD_DIM, HEAD_DIM, device=p.device)] * h)
-                            # heads live on V's output side (rows) and O's input side (columns)
-                            soap_update_preconditioner(grad, state, row_mask=self.head_mask if p in self.v_params else None,
-                                                       col_mask=None if p in self.v_params else self.head_mask)
-                        else:
-                            soap_update_preconditioner(grad, state, kl=SOAP_KL and self.in_scope(p, SOAP_KL_SCOPE))
+                        soap_update_preconditioner(grad, state)
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
         self.step_count += 1
 
@@ -1138,48 +636,8 @@ class Adam(torch.optim.Optimizer):
                 exp_avg.lerp_(grad, 1 - beta1)
                 exp_avg_sq.lerp_(grad.float().square(), 1 - beta2)
                 num = exp_avg.float()
-                if group.get("nesterov"):
-                    num = beta1 * num + (1 - beta1) * grad.float()
-                if group.get("msm"):
-                    # multi-scale momentum (AdEMAMix-style): + alpha_t * slow EMA of the gradient
-                    alpha, beta3, warm = group["msm"]
-                    state["step"] = state.get("step", 0) + 1
-                    if "exp_avg_slow" not in state:
-                        state["exp_avg_slow"] = torch.zeros_like(p, dtype=torch.float32)
-                    state["exp_avg_slow"].lerp_(grad.float(), 1 - beta3)
-                    num = num + alpha * min(1.0, state["step"] / max(warm, 1)) * state["exp_avg_slow"]
                 adam_dir = num / (exp_avg_sq.sqrt() + eps)
                 p.add_(adam_dir.to(p.dtype), alpha=-group["lr"])
-
-
-class NAdamW(torch.optim.Optimizer):
-    """torch AdamW (bias-corrected, decoupled weight decay) with an optional per-group Nesterov numerator (NADAM):
-    m_hat = beta1 * m_t / (1 - beta1^(t+1)) + (1 - beta1) * g_t / (1 - beta1^t). Same state keys as torch AdamW, so a
-    checkpoint of either loads into the other."""
-    def __init__(self, params, lr, betas, eps, weight_decay):
-        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, nesterov=False))
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            (b1, b2), eps, lr, wd = group["betas"], group["eps"], group["lr"], group["weight_decay"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g, st = p.grad.float(), self.state[p]
-                if len(st) == 0:
-                    st["step"] = torch.tensor(0.0)
-                    st["exp_avg"], st["exp_avg_sq"] = torch.zeros_like(p), torch.zeros_like(p)
-                t = float(st["step"]) + 1
-                st["step"] = torch.tensor(t)
-                m, v = st["exp_avg"], st["exp_avg_sq"]
-                m.lerp_(g.to(m.dtype), 1 - b1)
-                v.lerp_(g.square().to(v.dtype), 1 - b2)
-                mh = (b1 * m.float() / (1 - b1 ** (t + 1)) + (1 - b1) * g / (1 - b1 ** t) if group["nesterov"]
-                      else m.float() / (1 - b1 ** t))
-                # decay and step in fp32, rounded once (as fused AdamW): on the bf16 embedding a separate
-                # p.mul_(1 - lr*wd) rounds back to p (lr*wd = 3e-4 < half a bf16 ulp) and the decay is lost
-                p.copy_(p.float() * (1 - lr * wd) - lr * mh / ((v.float() / (1 - b2 ** t)).sqrt() + eps))
 
 
 class EMA_Nesterov(torch.optim.Optimizer):
@@ -1197,137 +655,12 @@ class EMA_Nesterov(torch.optim.Optimizer):
         self.it = 0
         self.lookahead_status = False
         self.current_lookahead_stepsize = 0
-        self.gset = set()   # parameters with their own jump (configure_group)
-        self.xspec = {}     # extra groups: param -> (mult, dir) (configure_extra)
-        self.soda = {}      # param -> init p0 (float32) (configure_soda)
-        self.head_gain = None   # (opt, group, lr, start, betas) (configure_head_gain)
+        self.gset, self.g_mult, self.g_beta, self.g_active = set(), 1.0, 0.0, False   # configure_group
         self.initialize_buffers()
 
-    def configure_group(self, params, mult, start, end, auto, auto_max, ls, log_path=None):
-        self.gset, self.g_mult, self.g_start, self.g_end = set(params), mult, start, end
-        self.g_auto, self.g_max, self.g_ls, self.g_log = auto, auto_max, ls, log_path
-        self.g_sbar, self.g_active, self.g_dirs = 0.0, False, {}
-        self.g_zm, self.g_zq, self.g_zn, self.g_pre = 0.0, 0.0, 0, {}
-        self.g_ls_buf, self.g_w = {}, [0.0, 0.0, 0.0]   # S0, S1 per param; W0, W1, W2
-
-    def configure_extra(self, specs):
-        """specs: list of (params, mult, dir) -> per-param jump multiplier and direction (dir: 'buf' or 'ema<b>')."""
-        for params, mult, d in specs:
-            for p in params:
-                self.xspec[p] = (mult, d)
-
-    def configure_head_gain(self, opt, group, lr, start, betas):
-        """HEAD_GAIN_LR: row gains on the LM head (opt.param_groups[group] holds only the head weight)."""
-        self.head_gain = (opt, opt.param_groups[group], lr, start, betas)
-
-    @torch.no_grad()
-    def head_gain_before(self):
-        opt, group, lr, start, betas = self.head_gain
-        if self.it < start:
-            return None
-        p = group["params"][0]
-        r = p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
-        w0 = p.float().clone() if HEAD_GAIN_DRIFT else None
-        return p, r, (p.grad.float() * p.float()).sum(dim=1, keepdim=True) / r, w0   # g_i = <grad_i, W_i/|W_i|>
-
-    @torch.no_grad()
-    def head_gain_after(self, p, r, g, w0):
-        """The head's step becomes direction-only per row, then each row length takes its own Adam step."""
-        opt, group, lr, start, (b1, b2) = self.head_gain
-        st = opt.state[p]
-        if w0 is not None:
-            # HEAD_GAIN_DRIFT: rtil_i is the length row i would have from the tangential steps alone (plain AdamW lengthens
-            # a row by |W+D|^2 = |W|^2 + |D_perp|^2); the tangential step is scaled by r_i / rtil_i, so the row turns by the
-            # angle |D_perp| / rtil_i it would turn without the gains.
-            d = p.float() - w0
-            d_perp = d - (d * w0).sum(dim=1, keepdim=True) / r.square() * w0
-            if "hg_rtil" not in st:
-                st["hg_rtil"] = r.clone()
-            st["hg_rtil"] = (st["hg_rtil"].square() + d_perp.square().sum(dim=1, keepdim=True)).sqrt()
-            p.copy_((w0 + d_perp * (r / st["hg_rtil"])).to(p.dtype))
-        p.mul_((r / p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)).to(p.dtype))
-        if "hg_m" not in st:
-            st["hg_m"], st["hg_v"], st["hg_t"] = torch.zeros_like(g), torch.zeros_like(g), 0
-        st["hg_t"] += 1
-        st["hg_m"].lerp_(g, 1 - b1)
-        st["hg_v"].lerp_(g.square(), 1 - b2)
-        adam = (st["hg_m"] / (1 - b1 ** st["hg_t"])) / ((st["hg_v"] / (1 - b2 ** st["hg_t"])).sqrt() + 1e-12)
-        p.mul_((1 - lr * group["lr"] / group["initial_lr"] * adam).to(p.dtype))
-
-    def configure_soda(self, params, c, k0):
-        self.soda = {p: p.detach().float().clone() for p in params}
-        self.soda_c, self.soda_k0 = c, k0
-
-    @torch.no_grad()
-    def soda_anchor(self):
-        """SODA: p -= c (p - p0) / (k + k0), primal averaging anchored at the init."""
-        a = self.soda_c / (self.it + self.soda_k0)
-        for p, p0 in self.soda.items():
-            p.sub_((p.float() - p0).mul_(a).to(p.dtype))
-
-    def _dir(self, p, d):
-        if d == "buf":
-            return self.state[p]['lookahead_buffer'][0]
-        st = self.state[p]
-        if 'dir_ema' not in st:
-            st['dir_ema'] = st['lookahead_buffer'][0].clone()
-        return st['dir_ema']
-
-    def _group_dir(self, p):
-        if ENA_G_DIR != "buf":
-            return self._dir(p, ENA_G_DIR)
-        if self.g_ls:
-            W0, W1, W2 = self.g_w
-            den = W0 * W2 - W1 * W1
-            if p in self.g_ls_buf and den > 1e-9:
-                S0, S1 = self.g_ls_buf[p]
-                return (S0 * W1 - S1 * W0) / den   # slope of the weighted LS line through the past weights
-        return self.state[p]['lookahead_buffer'][0]
-
-    @torch.no_grad()
-    def slope_feedback(self, step_log):
-        """After the gradient is ready: slope along the group's jump, and the self-tuning update of its size."""
-        if not self.gset or not self.g_active:
-            return
-        self.g_s = sum((p.grad.float() * d.float()).sum() for p, d in self.g_dirs.items()).item()
-        self.g_dn = sum(d.float().square().sum() for d in self.g_dirs.values()).item() ** 0.5
-        self.g_sbar = 0.9 * self.g_sbar + 0.1 * (1.0 if self.g_s > 0 else -1.0 if self.g_s < 0 else 0.0)
-        self.g_step_log = step_log
-        if ENA_G_SIGNAL == "update_z":
-            self.g_pre = {p: p.detach().float().clone() for p in self.g_dirs}
-
-    def _zscore(self, x):
-        """z-score of the mean of x over ~50 steps, from EMAs (0.98) of x and x^2."""
-        self.g_zn += 1
-        a = 0.02 if self.g_zn > 1 else 1.0
-        self.g_zm += a * (x - self.g_zm)
-        self.g_zq += a * (x * x - self.g_zq)
-        n = min(self.g_zn, 50)
-        if self.g_zn < 3:   # no spread yet: the first samples would give an arbitrary huge z
-            return 0.0
-        return self.g_zm / max((self.g_zq - self.g_zm ** 2) / n, 1e-60) ** 0.5
-
-    @torch.no_grad()
-    def tune_after_step(self):
-        """After the inner step: the self-tuning update of the group's jump size, and the log line."""
-        if not self.gset or not self.g_active:
-            return
-        c = z = None
-        if ENA_G_SIGNAL == "slope":
-            factor = math.exp(-self.g_auto * self.g_sbar)
-        elif ENA_G_SIGNAL == "slope_z":
-            z = self._zscore(self.g_s)
-            factor = math.exp(-self.g_auto * min(max(z / 2, -1.0), 1.0))
-        else:
-            c = sum(((p.detach().float() - q) * self.g_dirs[p].float()).sum() for p, q in self.g_pre.items()).item()
-            z = self._zscore(c)
-            factor = math.exp(self.g_auto * min(max(z / 2, -1.0), 1.0))
-        if self.g_auto:
-            self.g_mult = min(max(self.g_mult * factor, ENA_G_MIN), self.g_max)
-        if self.g_log:
-            with open(self.g_log, "a") as f:
-                f.write(json.dumps(dict(it=self.g_step_log, s=self.g_s, sbar=self.g_sbar, c=c, z=z, mult=self.g_mult,
-                                        beta=self.g_beta, dnorm=self.g_dn)) + "\n")
+    def configure_group(self, params, mult):
+        """One parameter group jumps mult times the global jump (in the global window)."""
+        self.gset, self.g_mult = set(params), mult
 
     def __setstate__(self, state):
         super(EMA_Nesterov, self).__setstate__(state)
@@ -1358,34 +691,18 @@ class EMA_Nesterov(torch.optim.Optimizer):
         else:
             lookahead_stepsize = self.lookahead_stepsize
         self.current_lookahead_stepsize = lookahead_stepsize if self.global_active else 0
-        mult = getattr(self, "g_mult", 1.0)
-        if self.gset and ENA_G_SWITCH and not self.g_auto and self.it >= ENA_G_SWITCH:
-            mult = ENA_G_MULT_AFTER
-        self.g_beta, self.g_dirs = lookahead_stepsize * mult, {}
+        self.g_beta = lookahead_stepsize * self.g_mult
 
         for group in self.param_groups:
             for p in group['params']:
+                lookahead = self.state[p]['lookahead_buffer'][0]
                 if p in self.gset:
                     if self.g_active:
-                        d = self._group_dir(p)
-                        self.g_dirs[p] = d
-                        p.add_(d, alpha=self.g_beta)
+                        p.add_(lookahead, alpha=self.g_beta)
                     continue
                 if not self.global_active:
                     continue
-                if p in self.xspec:
-                    mult_x, d = self.xspec[p]
-                    if mult_x:
-                        p.add_(self._dir(p, d), alpha=lookahead_stepsize * mult_x)
-                    continue
-
-                param_state = self.state[p]
-
-                lookahead = param_state['lookahead_buffer'][0]
-
                 p.add_(lookahead, alpha=lookahead_stepsize)
-
-
 
     @torch.no_grad()
     def accum_lookahead(self):
@@ -1400,29 +717,15 @@ class EMA_Nesterov(torch.optim.Optimizer):
                 buf = param_state['lookahead_buffer'][0]
 
                 param_state['lookahead_buffer'] = (buf.lerp_(look, 1 - lookahead_ema), self.it) # m^{t+1} = beta * m^t + (1-beta) * look
-                d = ENA_G_DIR if p in self.gset else self.xspec.get(p, (0, "buf"))[1]
-                if d != "buf":
-                    self._dir(p, d).lerp_(look, 1 - float(d[3:]))
 
                 # update prev_params buffer
                 param_state['prev_params'] = (param_state['prev_params'][0].copy_(p), self.it)
 
-                if self.gset and self.g_ls and p in self.gset:
-                    # S0 <- theta + lam S0, S1 <- lam (S1 + S0_old): sums over ages a of lam^a theta_{t-a} and a lam^a theta
-                    S0, S1 = self.g_ls_buf.get(p) or (torch.zeros_like(p, dtype=torch.float32), torch.zeros_like(p, dtype=torch.float32))
-                    S1.add_(S0).mul_(self.g_ls)
-                    S0.mul_(self.g_ls).add_(p.float())
-                    self.g_ls_buf[p] = (S0, S1)
-        if self.gset and self.g_ls:
-            lam, (W0, W1, W2) = self.g_ls, self.g_w
-            self.g_w = [1.0 + lam * W0, lam * (W1 + W0), lam * (W2 + 2 * W1 + W0)]
-
-
     @torch.no_grad()
     def nesterov_step(self):
         self.global_active = self.it + 1 > self.prefill_steps and self.it < self.rest_steps
-        self.g_active = bool(self.gset) and self.it + 1 > self.g_start and self.it < (self.g_end or self.rest_steps)
-        if (self.global_active or self.g_active) and not self.lookahead_status:
+        self.g_active = bool(self.gset) and self.global_active
+        if self.global_active and not self.lookahead_status:
             self.lookahead_step()
         else:
             self.current_lookahead_stepsize = 0
@@ -1433,18 +736,12 @@ class EMA_Nesterov(torch.optim.Optimizer):
     def step(self):
         if not self.lookahead_status:
             raise ValueError("optimizer.nesterov_step() should be invoked before model forward pass.")
-        head_r = self.head_gain_before() if self.head_gain else None
         if isinstance(self.inner_optimizer, list):
             for opt in self.inner_optimizer:
                 opt.step()
         else:
             self.inner_optimizer.step()
-        if head_r is not None:
-            self.head_gain_after(*head_r)
 
-        self.tune_after_step()
-        if self.soda:
-            self.soda_anchor()
         self.accum_lookahead()
 
         self.lookahead_status = False
@@ -1491,18 +788,8 @@ print0(f"Experiment={EXPERIMENT_NAME}")
 print0(f"Intuition={EXPERIMENT_INTUITION}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
 print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
-print0(f"Using newton_muon={NEWTON_MUON} mode={NEWTON_MODE} refresh={NEWTON_REFRESH} cov_ema={NEWTON_COV_EMA} damping={NEWTON_DAMPING} block={NEWTON_BLOCK} muon_lr_mult={MUON_LR_MULT}")
-print0(f"Using vo_lr_mult={VO_LR_MULT} vo_floor_mult={VO_FLOOR_MULT} vo_variants={VO_VARIANTS} "
-       f"v_gate={V_GATE} vo_denom_power={VO_DENOM_POWER} vo_head={VO_HEAD} row_pin={ROW_PIN} row_gain_lr={ROW_GAIN_LR} "
-       f"row_gain_scope={sorted(ROW_GAIN_SCOPE)} row_gain_mode={ROW_GAIN_MODE} "
-       f"row_gain_start/end={ROW_GAIN_START}/{ROW_GAIN_END} row_gain_fixed={ROW_GAIN_FIXED} row_gain_no_cwd={ROW_GAIN_NO_CWD} anatomy={ANATOMY} "
-       f"row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} clip={ROW_GAIN_CLIP} row_gain_cols={sorted(ROW_GAIN_COLS)} keep_fro={sorted(ROW_GAIN_KEEP_FRO)} "
-       f"head_gain_lr/start/betas/drift={HEAD_GAIN_LR}/{HEAD_GAIN_START}/{HEAD_GAIN_B1},{HEAD_GAIN_B2}/{HEAD_GAIN_DRIFT} "
-       f"head_wd={HEAD_WD} embed_wd={EMBED_WD} nadam={sorted(NADAM)} knob_start={KNOB_START} mars={sorted(MARS)}/{MARS_GAMMA}/{MARS_CLIP} aux_beta1_tie={AUX_BETA1_TIE} "
-       f"soap_sink={SOAP_SINK}/{SOAP_SINK_SCOPE} soap_kl={SOAP_KL}/{SOAP_KL_SCOPE} ena_rest={ENA_REST} "
-       f"ena_group={ENA_GROUP} mult={ENA_G_MULT} window={ENA_G_START}/{ENA_G_END} auto={ENA_G_AUTO}/{ENA_G_MAX} ls={ENA_G_LS} "
-       f"switch={ENA_G_SWITCH}->{ENA_G_MULT_AFTER} signal={ENA_G_SIGNAL} min={ENA_G_MIN} dir={ENA_G_DIR} extra={ENA_X}")
-print0(f"Using 1-D Adam gain_beta2={GAIN_BETA2} aux_beta1={AUX_BETA1} aux_lr_mult={AUX_LR_MULT} msm={MSM}/{MSM_GROUPS}")
+print0(f"Using row_gain_lr={ROW_GAIN_LR} row_gain_start={ROW_GAIN_START} row_gain_betas={ROW_GAIN_B1},{ROW_GAIN_B2} "
+       f"ena_g_mult={ENA_G_MULT} tailema_start/tau/lambda={TAILEMA_START}/{TAILEMA_TAU}/{TAILEMA_LAMBDA} anatomy={ANATOMY}")
 print0(f"Using mu={MU}")
 print0(f"Using muon_lr={MUON_LR}")
 print0(f"Using target_uw={TARGET_UW}")
@@ -1633,14 +920,9 @@ with torch.no_grad():
         block.norm2.gains.data.copy_((1.0 + _CGI_ALPHA * s).to(block.norm2.gains.dtype))
 
 # create the optimizer(s)
-if NADAM & {"embed", "head"}:
-    optimizer1 = NAdamW([dict(params=[model.embed.weight], lr=0.3, weight_decay=EMBED_WD, nesterov="embed" in NADAM),
-                         dict(params=[model.proj.weight], lr=1/320, weight_decay=HEAD_WD, nesterov="head" in NADAM)],
-                        lr=0.3, betas=(0.8, 0.99), eps=1e-10, weight_decay=0)
-else:
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3, weight_decay=EMBED_WD),
-                        dict(params=[model.proj.weight], lr=1/320, weight_decay=HEAD_WD)],
-                       betas=(0.8, 0.99), eps=1e-10, weight_decay=0, fused=True)
+optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3, weight_decay=0),
+                    dict(params=[model.proj.weight], lr=1/320, weight_decay=0)],
+                   betas=(0.8, 0.99), eps=1e-10, weight_decay=0, fused=True)
 gain_aux_params = [p for n, p in model.named_parameters() if p.ndim < 2 and n.endswith(".gains")]
 attn_proj_bias_params = [p for n, p in model.named_parameters() if n.endswith(".attn.proj.bias")]
 other_aux_params = [p for n, p in model.named_parameters()
@@ -1651,26 +933,12 @@ other_aux_params = [p for n, p in model.named_parameters()
 # NOTE: we do NOT use torch.optim.AdamW here because AdamW applies (1-beta^t) bias
 # correction, which CenterShrinkAdam does not -- they are not equivalent.
 optimizer3 = Adam([
-        dict(params=gain_aux_params, lr=0.01 * AUX_LR_MULT, betas=(GAIN_BETA1, GAIN_BETA2)),
-        dict(params=other_aux_params, lr=0.01 * AUX_LR_MULT, betas=(AUX_BETA1, 0.997)),
-        dict(params=attn_proj_bias_params, lr=0.01 * AUX_LR_MULT, betas=(AUX_BETA1, 0.9965)),
+        dict(params=gain_aux_params, lr=0.01, betas=(0.8, 0.99)),
+        dict(params=other_aux_params, lr=0.01, betas=(0.8, 0.997)),
+        dict(params=attn_proj_bias_params, lr=0.01, betas=(0.8, 0.9965)),
     ],
     lr=0.01, betas=(0.8, 0.99), eps=1e-10)
-for group in optimizer3.param_groups:
-    group["nesterov"] = "aux" in NADAM
-_knob_on = {id(g): {k: g[k] for k in ("betas", "nesterov", "weight_decay") if k in g}
-            for opt in (optimizer1, optimizer3) for g in opt.param_groups}
-def set_knobs(on):
-    for opt in (optimizer1, optimizer3):
-        for g in opt.param_groups:
-            for k, v in _knob_on[id(g)].items():
-                g[k] = v if on else dict(betas=(0.8, g["betas"][1]), nesterov=False, weight_decay=0)[k]
-if KNOB_START:
-    set_knobs(False)
-# Skylight-001: NorMuon-lite (per-row variance) + u/w-floor + lr=0.0375.
-newton = NewtonPreconditioner(model) if NEWTON_MUON else None
-optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
-                  lr=MUON_LR, mu=MU, newton=newton)
+optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2], lr=MUON_LR, mu=MU)
 optimizers = [optimizer1, optimizer2, optimizer3]
 optimizers = [EMA_Nesterov(
         [p for p in model.parameters()],
@@ -1679,43 +947,20 @@ optimizers = [EMA_Nesterov(
         use_scheduled_lookahead_stepsize=True,
         lookahead_ema=0.99,
         prefill_steps=300,
-        rest_steps=ENA_REST or train_steps - 950,
+        rest_steps=train_steps - 950,
     )]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
-if ENA_GROUP:
-    _ena_sel = dict(norm=lambda n, p: "norm" in n and n.endswith("gains"), embed=lambda n, p: n == "embed.weight",
-                    head=lambda n, p: n == "proj.weight", bias=lambda n, p: n.endswith(".bias"),
-                    hidden=lambda n, p: n.startswith("blocks.") and p.ndim == 2)[ENA_GROUP]
-    optimizers[0].configure_group([p for n, p in model.named_parameters() if _ena_sel(n, p)], ENA_G_MULT, ENA_G_START,
-                                  ENA_G_END, ENA_G_AUTO, ENA_G_MAX, ENA_G_LS,
-                                  logfile.replace(".txt", ".ena.jsonl") if dist.get_rank() == 0 else None)
-if ENA_X:
-    _x_sel = dict(bbias=lambda n, p: n.startswith("blocks.") and n.endswith(".bias"), lmbias=lambda n, p: n == "proj.bias",
-                  norm=lambda n, p: "norm" in n and n.endswith("gains"), embed=lambda n, p: n == "embed.weight",
-                  head=lambda n, p: n == "proj.weight", hidden=lambda n, p: n.startswith("blocks.") and p.ndim == 2)
-    _x_specs = []
-    for _spec in ENA_X.split(","):
-        _g, _m, _d = _spec.split(":")
-        _ps = [p for n, p in model.named_parameters() if _x_sel[_g](n, p)]
-        assert not set(_ps) & optimizers[0].gset, f"ENA_X group {_g} overlaps ENA_GROUP"
-        _x_specs.append((_ps, float(_m), _d))
-    optimizers[0].configure_extra(_x_specs)
+optimizers[0].configure_group([p for n, p in model.named_parameters() if "norm" in n and n.endswith("gains")], ENA_G_MULT)
 for opt in optimizers[0].inner_optimizer:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 optimizer1.param_groups[0]["power_c"] = ADAM_EMBED_POWER_C
 optimizer1.param_groups[1]["power_c"] = ADAM_PROJ_POWER_C
-if HEAD_GAIN_LR > 0:
-    optimizers[0].configure_head_gain(optimizer1, 1, HEAD_GAIN_LR, HEAD_GAIN_START, (HEAD_GAIN_B1, HEAD_GAIN_B2))
 for group in optimizer3.param_groups:
-    group["power_c"] = ADAM_OTHER_POWER_C * AUX_LR_MULT
-if MSM:
-    _msm = [float(x) for x in MSM.split(",")]
-    for i in dict(gains=[0], bias=[1, 2], all=[0, 1, 2])[MSM_GROUPS]:
-        optimizer3.param_groups[i]["msm"] = (_msm[0], _msm[1], _msm[2] if len(_msm) > 2 else 500)
+    group["power_c"] = ADAM_OTHER_POWER_C
 for group in optimizer2.param_groups:
-    group["power_c"] = MUON_POWER_C * group.get("lr_mult", 1.0)
+    group["power_c"] = MUON_POWER_C
 
 # learning rate schedule: stable then decay
 def _lr(step, initial_lr, power_c, power=1.0):
@@ -1742,33 +987,6 @@ def _muon_mu_at_step(step, train_steps):
     else:
         return _MU_MAX
 
-_mars_prev = {}
-def _mars_groups():
-    if "muon" in MARS:
-        for g in optimizer2.param_groups:
-            yield g["params"], g["mu"]
-    for i, k in ((0, "embed"), (1, "head")):
-        if k in MARS:
-            yield optimizer1.param_groups[i]["params"], optimizer1.param_groups[i]["betas"][0]
-    if "aux" in MARS:
-        for g in optimizer3.param_groups:
-            yield g["params"], g["betas"][0]
-
-@torch.no_grad()
-def mars_correct():
-    """MARS: p.grad <- g + gamma * beta/(1-beta) * (g - g_prev), after the all-reduce and set_hparams (beta = this step's)."""
-    for params, beta in _mars_groups():
-        for p in params:
-            g = p.grad.float()
-            prev = _mars_prev.get(p)
-            _mars_prev[p] = g.clone()
-            if prev is None:
-                continue
-            c = g + MARS_GAMMA * beta / (1 - beta) * (g - prev)
-            if MARS_CLIP:
-                c = c / c.norm().clamp(min=1.0)
-            p.grad.copy_(c)
-
 def set_hparams(step):
     progress = step / FINAL_SCHEDULE_STEPS
     # progress >= 1 is allowed when t_end (FINAL_SCHEDULE_STEPS) < train end: LR is clamped to 0
@@ -1780,9 +998,6 @@ def set_hparams(step):
             group["lr"] = _lr(step, group["initial_lr"], group["power_c"], FINAL_LR_POWER)
     for group in optimizer2.param_groups:
         group["mu"] = mu
-    if AUX_BETA1_TIE:
-        for group in optimizer3.param_groups:
-            group["betas"] = (1 - AUX_BETA1_TIE * (1 - mu), group["betas"][1])
 
 
 
@@ -1799,21 +1014,16 @@ _tailema = None   # (A) Tail-EMA buffer: one fp32 tensor per non-embed param; la
 dist.barrier()
 t0 = time.perf_counter()
 H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None,
-                    probe_loss_fn=probe_loss_fn, gns_loss_fn=gns_loss_fn, config=dict(train_steps=train_steps, newton_muon=NEWTON_MUON, newton_mode=NEWTON_MODE,
-                                   newton_refresh=NEWTON_REFRESH, newton_damping=NEWTON_DAMPING,
-                                   muon_lr_mult=MUON_LR_MULT, gain_beta2=GAIN_BETA2,
-                                   aux_beta1=AUX_BETA1, aux_lr_mult=AUX_LR_MULT,
-                                   vo_lr_mult=VO_LR_MULT, vo_floor_mult=VO_FLOOR_MULT,
-                                   v_gate=V_GATE, vo_denom_power=VO_DENOM_POWER, vo_head=VO_HEAD))
+                    probe_loss_fn=probe_loss_fn, gns_loss_fn=gns_loss_fn, config=dict(train_steps=train_steps, row_gain_lr=ROW_GAIN_LR,
+                                   row_gain_start=ROW_GAIN_START, row_gain_betas=(ROW_GAIN_B1, ROW_GAIN_B2),
+                                   ena_g_mult=ENA_G_MULT, tailema=(TAILEMA_START, TAILEMA_TAU, TAILEMA_LAMBDA)))
 
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
-_ckpt_env = ("ROW_GAIN_START", "ROW_GAIN_END", "ROW_GAIN_FIXED", "ROW_GAIN_NO_CWD", "ENA_GROUP", "ENA_G_MULT", "ENA_G_START", "ENA_G_END", "ENA_G_AUTO", "ENA_G_MAX", "ENA_G_LS", "ENA_G_SWITCH", "ENA_G_MULT_AFTER", "ENA_G_SIGNAL", "ENA_G_MIN", "TAILEMA_START", "TAILEMA_TAU", "TAILEMA_LAMBDA", "ROW_GAIN_SCOPE", "ROW_GAIN_MODE", "SOAP_SINK", "SOAP_KL", "ENA_REST", "ROW_PIN", "ROW_GAIN_LR", "NEWTON_MUON", "GAIN_BETA2", "GAIN_BETA1", "AUX_BETA1", "AUX_LR_MULT", "MUON_LR_MULT", "VO_LR_MULT", "VO_FLOOR_MULT",
-             "V_GATE", "VO_DENOM_POWER", "VO_HEAD", "MSM", "MSM_GROUPS", "ENA_G_DIR", "ENA_X", "SODA", "SNRW", "SNRW_EVERY", "SNRW_FLOOR",
-             "ROW_GAIN_BETAS", "ROW_GAIN_CLIP", "ROW_GAIN_COLS", "ROW_GAIN_KEEP_FRO", "HEAD_GAIN_LR", "HEAD_GAIN_START", "HEAD_GAIN_BETAS", "HEAD_GAIN_DRIFT", "HEAD_WD", "EMBED_WD", "NADAM", "KNOB_START", "MARS", "MARS_GAMMA", "MARS_CLIP", "AUX_BETA1_TIE")
+_ckpt_env = ("ROW_GAIN_LR", "ROW_GAIN_START", "ROW_GAIN_BETAS", "ENA_G_MULT", "TAILEMA_START", "TAILEMA_TAU",
+             "TAILEMA_LAMBDA")
 
 def save_checkpoint(step):
-    assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
     d = Path(CKPT_DIR) / f"step{step}"
     d.mkdir(parents=True, exist_ok=True)
     rank = dist.get_rank()
@@ -1835,7 +1045,6 @@ def save_checkpoint(step):
 
 def load_checkpoint(path):
     global _tailema, training_time, _heldout_n
-    assert not NEWTON_MUON, "checkpoints do not cover the Newton-Muon state"
     meta = json.load(open(f"{path}/meta.json"))
     assert meta["world_size"] == dist.get_world_size()
     ck = torch.load(f"{path}/common.pt", map_location=device, weights_only=False)
@@ -1847,8 +1056,7 @@ def load_checkpoint(path):
             opt.state[p_of[n]] = st
     optimizers[0].it = ck["ema_nesterov"]["it"]
     optimizer2.step_count = ck["muon_step_count"]
-    # Muon states are sharded by rank; read every shard and keep the params this rank owns now (ownership can change
-    # when a knob regroups the params)
+    # Muon states are sharded by rank; read every shard and keep the params this rank owns
     ws, rank = dist.get_world_size(), dist.get_rank()
     owned = {p for g in optimizer2.param_groups for i, p in enumerate(g["params"]) if i % ws == rank}
     n_loaded = 0
@@ -2279,8 +1487,7 @@ def soap_noise(E, caps):
     """The SOAP map (same state and norm rescale as the step) applied to the noise samples E."""
     q_row, q_col, eas, power = caps["soap_state"]
     denom = eas.clamp_min(1e-16).pow(power)
-    L = (lambda Z: q_row @ ((q_row.mT @ Z) / denom)) if q_col is None else (
-        lambda Z: q_row @ ((q_row.mT @ Z @ q_col) / denom) @ q_col.mT)
+    L = lambda Z: q_row @ ((q_row.mT @ Z @ q_col) / denom) @ q_col.mT
     X = caps["momentum"]
     return L(E) * (gram_frobenius_norm_estimate(X, eps=1e-8) / gram_frobenius_norm_estimate(L(X), eps=1e-8))
 
@@ -2298,7 +1505,6 @@ def snr_diag(step, gathered):
     tau2 of Y, the noise variance tau2_dir along each singular pair (u_i, v_i), and the singular values s_w of the
     Kronecker-whitened Yw = Abar^-1/2 Y Bbar^-1/2 sqrt(E|Z|^2) (noise covariance ~ A (x) B with E[Z Z^T] = c sum_r e_r e_r^T,
     E[Z^T Z] likewise), whose noise is ~iid with unit variance."""
-    assert not SOAP_SINK, "SNR_DIAG assumes the plain SOAP denominator"
     W, rank = dist.get_world_size(), dist.get_rank()
     mu, f, c = _snr_noise_factor()
     recs = []
@@ -2324,37 +1530,6 @@ def snr_diag(step, gathered):
         d = Path(logfile.replace(".txt", ".snr"))
         d.mkdir(exist_ok=True)
         torch.save(dict(step=step, mu=mu, f=f, W=W, recs=[r for rs in out for r in rs]), d / f"step{step}.pt")
-
-
-@torch.no_grad()
-def snrw_refresh(step, gathered):
-    """SNRW: refresh each owned matrix's noise model of Muon's input Y (the SOAP form): Kronecker factors
-    Abar = E[Z Z^T], Bbar = E[Z^T Z] and E|Z|^2 (EMA 0.5 over refreshes), and their (inverse) square roots.
-    Logs the mean weight w and the share of w > 0.5 by matrix type since the last refresh."""
-    _, _, c = _snr_noise_factor()
-    stats = []
-    for p, (E, caps) in gathered.items():
-        Ex = soap_noise(E, caps) if "soap_state" in caps else E
-        A, B = c * (Ex @ Ex.mT).sum(0), c * (Ex.mT @ Ex).sum(0)
-        nz = optimizer2.snrw.get(p)
-        if nz is None:
-            nz = optimizer2.snrw[p] = dict(A=A, B=B, wsum=0.0, whalf=0.0, wn=0)
-        else:
-            nz["A"].lerp_(A, 0.5)
-            nz["B"].lerp_(B, 0.5)
-        _noise_roots(nz)
-        if nz["wn"]:
-            stats.append((pname[p], nz["wsum"] / nz["wn"], nz["whalf"] / nz["wn"]))
-        nz["wsum"], nz["whalf"], nz["wn"] = 0.0, 0.0, 0
-    if step % (10 * SNRW_EVERY) == 0:
-        out = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
-        dist.gather_object(stats, out, dst=0)
-        if dist.get_rank() == 0 and any(out):
-            by = {}
-            for n, wm, wh in (x for o in out for x in o):
-                by.setdefault(n.split(".", 2)[2].rsplit(".", 1)[0], []).append((wm, wh))
-            print0(f"snrw step:{step} " + " ".join(f"{k}:w={sum(a for a, _ in v) / len(v):.3f}/half={sum(b for _, b in v) / len(v):.3f}"
-                                                   for k, v in by.items()), console=True)
 
 
 def _noise_roots(nz):
@@ -2448,40 +1623,8 @@ def tsnr_after_step(step):
 tsnr_state = {}
 
 
-def snr_weighted_update(Y, nz):
-    """SNRW: Muon's orthogonalized step with soft per-direction weights, sum_i w_i u_i v_i^T over the exact singular pairs
-    of Y (the Newton-Schulz input), w_i = SNR_i / (SNR_i + c). SNR_i: the signal along (u_i, v_i) of the BBP-denoised
-    signal estimate Shat (BBP inversion on the Kronecker-whitened spectrum, bulk directions dropped, unwhitened), over
-    the noise variance along (u_i, v_i), (u_i^T Abar u_i)(v_i^T Bbar v_i)/E|Z|^2, in units of the BBP threshold sqrt(mn)
-    (so it reduces to the iid BBP SNR for isotropic noise). c = 0: w = 1 (exact polar factor, the SVD control)."""
-    Yf = Y.float()
-    m, n = Yf.shape
-    if SNRW_C == 0:
-        U, S, Vh = torch.linalg.svd(Yf, full_matrices=False)
-        w = torch.ones_like(S)
-    else:
-        U, S, Vh, snr = direction_snr(Yf, nz)
-        w = (snr / (snr + SNRW_C)).clamp_min(SNRW_FLOOR)
-    nz["wsum"] += w.mean().item()
-    nz["whalf"] += (w > 0.5).float().mean().item()
-    nz["wn"] += 1
-    return ((U * w) @ Vh * max(1, m / n) ** 0.5).bfloat16()
-
-if SODA:
-    _sc, _c, _k0 = SODA.split(":")
-    _s_sel = dict(all=lambda n, p: True, hidden=lambda n, p: n.startswith("blocks.") and p.ndim == 2,
-                  mlpproj=lambda n, p: n.endswith("mlp.proj.weight"), aux=lambda n, p: p.ndim < 2,
-                  embed=lambda n, p: n == "embed.weight", head=lambda n, p: n == "proj.weight")
-    _sps = [p for n, p in model.named_parameters() if any(_s_sel[g](n, p) for g in _sc.split("+"))]
-    optimizers[0].configure_soda(_sps, float(_c), float(_k0))   # after the init broadcast, before any checkpoint load
-    optimizer2.no_cwd = set(_sps)
-    print0(f"SODA scope={_sc} c={_c} k0={_k0} params={len(_sps)} numel={sum(p.numel() for p in _sps)}", console=True)
 if RESUME_FROM:
     load_checkpoint(RESUME_FROM)
-if SODA:
-    _d = sum((p.float() - p0).square().sum() for p, p0 in optimizers[0].soda.items()).item() ** 0.5
-    _n = sum(p0.square().sum() for p0 in optimizers[0].soda.values()).item() ** 0.5
-    print0(f"SODA |p - p0| / |p0| = {_d / max(_n, 1e-12):.4f} at start (step {optimizers[0].it})", console=True)
 path_eff = (optim_dynamics.PathEfficiency(model, harness.NANOGPT_RULES, every=50, ks=(50, 200),
                                           out_path=logfile.replace(".txt", ".patheff.jsonl"))
             if PATH_EFF and dist.get_rank() == 0 else None)
@@ -2556,9 +1699,6 @@ for step in range(RESUME_STEP, train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    if KNOB_START and step == max(KNOB_START, RESUME_STEP):
-        set_knobs(True)
-        print0(f"KNOB_START: knobs on at step {step}", console=True)
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
@@ -2567,9 +1707,6 @@ for step in range(RESUME_STEP, train_steps + 1):
     optimizers[0].nesterov_step()
     if traj is not None:
         traj.after_jump()
-    newton_capture = newton is not None and newton.is_refresh_step(step)
-    if newton_capture:
-        newton.enable_capture()
     train_loss = 0
     for i in range(len(inputs) // mbs):
         loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
@@ -2578,12 +1715,9 @@ for step in range(RESUME_STEP, train_steps + 1):
             raise RuntimeError(f"non-finite train loss at step {step} mb {i}: {loss.item()}")
         loss.backward()
         train_loss = train_loss + loss.detach()
-    if newton_capture:
-        newton.disable_capture()
     snr_on = SNR_DIAG > 0 and step > 0 and step % SNR_DIAG == 0
-    snrw_on = bool(SNRW) and step % SNRW_EVERY == 0
     tsnr_on = TSNR_EVERY > 0 and step > 0 and step % TSNR_EVERY == 0
-    if snr_on or snrw_on or tsnr_on:
+    if snr_on or tsnr_on:
         snr_local = {p: p.grad.float().clone() for g in optimizer2.param_groups for p in g["params"]}
         optimizer2.snr_capture = True
     for name, p in model.named_parameters():
@@ -2592,13 +1726,10 @@ for step in range(RESUME_STEP, train_steps + 1):
     track_radial()
     if TSNR_EVERY:
         tsnr_accum(step)
-    optimizers[0].slope_feedback(step)
     if ANATOMY:
         anat_pre_step(step)
     # set optimization hyperparameters and take a step
     set_hparams(step)
-    if MARS:
-        mars_correct()
     if traj is not None:
         _ena = optimizers[0]
         traj.after_grad(step, lr_aux=optimizer3.param_groups[0]["lr"], lr_scale=_ena.get_lr_lambda(),
@@ -2607,13 +1738,11 @@ for step in range(RESUME_STEP, train_steps + 1):
     H.before_step()
     for opt in optimizers:
         opt.step()
-    if snr_on or snrw_on or tsnr_on:
+    if snr_on or tsnr_on:
         optimizer2.snr_capture = False
         snr_gathered = snr_gather(snr_local)
         if snr_on:
             snr_diag(step, snr_gathered)
-        if snrw_on:
-            snrw_refresh(step, snr_gathered)
         if tsnr_on:
             tsnr_anchor(step, snr_gathered)
         del snr_gathered

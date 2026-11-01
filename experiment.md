@@ -1037,3 +1037,17 @@ Val-loss gap over training (×1e-4): tie −98 / −58 / −23 / −15 / −12 /
 - **The parent set is no longer skewed.** The mean of 6 parents is +0.00025 against the 16-seed default; the old 3 were +0.00100. The parents spread with SD 0.0015, about the same as across seeds (0.0013).
 - **The same seed does not reproduce a run.** Same-seed differences (SD 0.0021 over 6 seeds) are as large as differences between seeds. Seed-paired full-run comparisons are therefore effectively unpaired. The paired SEs already reported come from the paired differences, so they remain valid, but pairing by seed gains nothing.
 - **Control forks drift from their parent** by SD ≈ 0.0005 from step 50 and ≈ 0.00012 from step 1000.
+
+## 2026-11-01 — Cleanup: knobs removed, `train_gpt_record.py`
+
+- **`train_gpt.py` keeps the record's training math, logging, checkpoints/forks and the diagnostics** (ANATOMY, SNR_DIAG, TSNR_DIAG, HEAD_DIAG, PATH_EFF, TRAJ_REC, READOUT_LAB, SNAP_STEPS, ROW_TRANSPLANT).
+  - The only tunable knobs left are `ROW_GAIN_LR`, `ROW_GAIN_START`, `ROW_GAIN_BETAS`, `ENA_G_MULT` and `TAILEMA_*`.
+  - Every knob that did not help is gone; the version before this commit (`20cc71b`) has them.
+  - Removed: Newton-Muon, V/O variants, SOAP sink and KL, ENA group selection and its auto/LS/dir/switch options, `ENA_X`, SODA, SNRW, MSM, row-pin, row-gain mode/fixed/end/clip/cols/keep-fro/scope, head gains, head/embedding WD, NADAM, KNOB_START, MARS, the 1-D Adam β knobs and `AUX_BETA1_TIE`.
+  - Old checkpoints still load (the state layout is unchanged).
+- **`train_gpt_record.py`** is the same training in one file with hardcoded hyperparameters and no logging. It stops at 2640 and prints `val_loss` / `val_ema_loss`.
+- **Equivalence check** (8 GPUs, seed 0, commit `20cc71b` vs the new scripts):
+  - Step 0 (init) and step 1: all 173 tensors are bitwise identical across all three.
+  - Step 5: old vs new differs exactly as much as two launches of the old script (worst tensor: the zero-initialized attn.proj, relative difference 1.12; median 0.06 in both cases).
+  - From `b99-s0/step1000` to step 1005: old vs new 1.5e-3 global relative difference, old vs record script 1.4e-3, two launches of the old script 1.5e-3.
+- **Run-to-run nondeterminism starts within the first few steps.** Two launches with the same seed are bitwise equal after step 1 but not after step 5. This is why same-seed full runs do not reproduce (SD 0.0021 at 2690).

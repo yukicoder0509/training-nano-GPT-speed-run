@@ -1,6 +1,19 @@
 # Optimizer step (math)
 
-This is the update that `train_gpt.py` at this commit performs on each training step. The defaults are the current record, 2640 steps: rec-46 + row gains + Tail-EMA 2100/200 + no CWD on the row-gain matrices (`ROW_GAIN_NO_CWD=1`) + a 2.5× EMA-Nesterov jump on the norm gains (`ENA_GROUP=norm ENA_G_MULT=2.5`), with the row-gain length Adam at β = 0.99, 0.99 (`ROW_GAIN_BETAS`; the 2640 record used 0.9, 0.95, set `ROW_GAIN_BETAS=0.9,0.95` to reproduce it). The 2665 record is `ROW_GAIN_NO_CWD=0 ENA_GROUP= STOP_STEP=2665`; to get rec-46 set `NEWTON_MUON=0 ROW_GAIN_LR=0 TAILEMA_START=2400 TAILEMA_TAU=150 STOP_STEP=2690` or run the `rec-46` tag. Keep this file in sync with the code: any commit that changes the optimizer updates this file in the same commit.
+This is the update that `train_gpt.py` and `train_gpt_record.py` perform on each training step: the current record, rec-46 plus four additions:
+- row gains on the hidden matrices, with no CWD while they are active;
+- the Tail-EMA readout at 2100/200;
+- a 2.5× EMA-Nesterov jump on the norm gains;
+- a length Adam at β = 0.99, 0.99.
+
+It passes from step 2635 with n = 8 and with n = 16. `record.env` keeps `STOP_STEP=2640`.
+
+The experimental knobs of the earlier record chain were removed from the script after commit `20cc71b`; their definitions and results are in that commit's version of this file and in experiment.md. These knobs stay in `train_gpt.py` (environment):
+- `ROW_GAIN_LR`, `ROW_GAIN_START`, `ROW_GAIN_BETAS`;
+- `ENA_G_MULT`;
+- `TAILEMA_START`, `TAILEMA_TAU`, `TAILEMA_LAMBDA`.
+
+Keep this file in sync with the code: any commit that changes the optimizer updates this file in the same commit.
 
 Notation: t is the loop step; g = ∇L, the gradient summed over ranks. W is a parameter and η_t its learning rate. ‖X‖_S4 = ‖XᵀX‖_F^½ is the Schatten-4 norm, which is what `gram_frobenius_norm_estimate` computes. ⊙ is elementwise multiplication.
 
@@ -18,32 +31,19 @@ Notation: t is the loop step; g = ∇L, the gradient summed over ranks. W is a p
 
 The wrapper keeps a buffer b and the previous weights W_prev for every parameter.
 
-- **Before the forward pass, only when 300 ≤ t < 1950** (the end is `ENA_REST`, default 1950):
-  W ← W + β_t·b, with β_t = 0.3·η_{t−1}/η₀.
+- **Before the forward pass, only when 300 ≤ t < 1950:** W ← W + β_t·b, with β_t = 0.3·η_{t−1}/η₀.
   - The LR ratio is taken from the embedding Adam group, using the previous step's LR.
+  - The norm gains jump 2.5·β_t instead (`ENA_G_MULT`).
   - The shift is not undone afterwards.
 - The forward and backward passes then run at the shifted point, and the inner optimizers step W → W′.
 - **After the inner step:**
   - b ← 0.99·b + 0.01·(W′ − W_prev)
   - W_prev ← W′
 
-- **Per-group jump (env; default `ENA_GROUP=norm`, `ENA_G_MULT=2.5`, the 2640 record; `ENA_GROUP=` turns it off):** `ENA_GROUP` = norm | embed | head | bias | hidden gives one group its own jump W ← W + β_g·d, all others keep the one above.
-  - β_g = `ENA_G_MULT`·β_t (default 2.5), active for `ENA_G_START` < t + 1 and t < `ENA_G_END` (defaults 300 and the global end).
-  - `ENA_G_AUTO`=κ: s_t = ⟨g_t, d⟩ with g_t the gradient at the jumped-to point; s̄ ← 0.9·s̄ + 0.1·sign(s_t); `ENA_G_MULT` ← clip(`ENA_G_MULT`·e^(−κ·s̄), 0, `ENA_G_MAX`) on every active step.
-  - `ENA_G_SWITCH`=t₁, `ENA_G_MULT_AFTER`=m₂: the multiplier is `ENA_G_MULT` before step t₁ and m₂ from t₁ on.
-  - `ENA_G_SIGNAL` (with `ENA_G_AUTO`=κ): `slope` (above, one batch at a time); `slope_z`: z = mean(s)/√(var(s)/50) from EMAs (0.98) of s and s², `ENA_G_MULT` ← `ENA_G_MULT`·e^(−κ·clip(z/2, −1, 1)); `update_z`: the same z-score of c_t = ⟨u_t, d⟩ with u_t the inner optimizer's own step on the group, `ENA_G_MULT` ← `ENA_G_MULT`·e^(+κ·clip(z/2, −1, 1)) (the optimizer moving on along the jump grows it, moving back shrinks it). `ENA_G_MIN` is the lower clip (default 0).
-  - `ENA_G_LS`=λ: d is the exponentially weighted least-squares velocity of the group's weights (weights λ^age; S0 ← θ + λS0, S1 ← λ(S1 + S0_old), d = (W1·S0 − W0·S1)/(W0·W2 − W1²)) instead of b.
-  - `ENA_G_DIR`=ema⟨b'⟩ (default `buf` = b): d is the group's own EMA of the per-step displacement, d ← b'·d + (1−b')·(W′ − W_prev), initialised from b (so a fork starts warm).
-- **Extra jump groups (env, off by default):** `ENA_X`="grp:m:dir,…" with grp = bbias (Linear biases in the blocks) | lmbias (lm_head bias) | norm | embed | head | hidden: that group jumps W ← W + m·β_t·d in the global window, d = b (`buf`) or its own EMA (`ema⟨b'⟩`, as above); m = 0 turns its jump off.
-- **SODA anchor (env, off by default; Pethick et al., arXiv 2605.11172):** `SODA`="scope[+scope]:c:k₀" with scope = all | hidden (block matrices) | mlpproj | aux (1-D) | embed | head. After the inner step and before the buffer update (so b sees it): W′ ← W′ − c·(W′ − W₀)/(t + k₀), W₀ = the init of the run's seed (regenerated, so a fork anchors to its parent's init). c = 1, k₀ = 2 is the paper's uniform primal averaging. Muon's CWD is off on the anchored matrices.
-
 ## 2. Muon: hidden 2-D matrices (q, k, v, attn.proj, mlp.fc, mlp.proj)
 
-Each parameter is updated on one rank and then all-gathered.
+Each parameter is updated on one rank and then all-gathered. η₀ = 0.0375.
 
-0. **Newton-Muon on the gradient, only when `NEWTON_MODE=grad`** (as in record #15):
-   - g ← g·K_ℓ, with no rescale (§2a).
-   - Every later use of g in this section (momentum, the trust gate's cos(·,g), and the L/R statistics) then sees g·K_ℓ.
 1. **Momentum (Nesterov form):**
    - m ← μ·m + (1−μ)·g
    - U = (1−μ)·g + μ·m
@@ -52,106 +52,58 @@ Each parameter is updated on one rank and then all-gathered.
    - Second moment: V ← 0.9·V + 0.1·P²
    - Precondition and rotate back: S = Q_L·(P / √V)·Q_Rᵀ, then rescale so ‖S‖_S4 = ‖U‖_S4.
    - On step 0 there is no eigenbasis yet, so S = U.
-   - **One-sided when `NEWTON_MODE=right`:** R and Q_R are not kept, and Q_R = I. So P = Q_Lᵀ·U and S = Q_L·(P / √V), and K_ℓ takes over the input (column) side.
-3. **Newton-Muon right preconditioning, off by default** (`NEWTON_MUON=1` turns it on; it applies when `NEWTON_MODE` is `soap` (the default) or `right`; record #15 / PR #281):
-   - Ŝ = S·K_ℓ, rescaled so ‖Ŝ‖_S4 = ‖S‖_S4.
-   - K_ℓ is the preconditioner for this layer's input space (§2a).
-   - For mlp.proj (input width 3072), K_ℓ is block-diagonal with 4 blocks of 768×768.
-   - With `NEWTON_MODE=grad`, this step is skipped and Ŝ = S.
-4. **Trust gate (attn.proj only).** For q, k, v and the MLP matrices, U ← Ŝ directly.
-   - a = clip((cos(Ŝ,U) − 0.2)/0.8, 0, 1)
-   - b = clip(cos(Ŝ,g) / cos(U,g), 0, 1)
+3. **Trust gate (attn.proj only).** For q, k, v and the MLP matrices, U ← S directly.
+   - a = clip((cos(S,U) − 0.2)/0.8, 0, 1)
+   - b = clip(cos(S,g) / cos(U,g), 0, 1)
    - γ = clip(a·b, floor_t, cap_t)
      - floor_t is 0.45 for t < 1375, then falls linearly to 0 at t = 1625.
      - cap_t is 0.85 for t < 1625, then 1.
-   - Blend: U ← (U + γ·(Ŝ − U)), rescaled to ‖U‖_S4.
-5. **Orthogonalize:** O = NS₁₂(U / ‖U‖_S4) · √max(1, rows/cols).
+   - Blend: U ← (U + γ·(S − U)), rescaled to ‖U‖_S4.
+4. **Orthogonalize:** O = NS₁₂(U / ‖U‖_S4) · √max(1, rows/cols).
    - NS₁₂ is 12 Newton–Schulz iterations in bf16: X ← 2X − 1.5(XXᵀ)X + 0.5(XXᵀ)²X.
-   - **SNR-weighted variant (env, off by default):** `SNRW`=c replaces NS₁₂ by O = Σᵢ wᵢ uᵢvᵢᵀ · √max(1, rows/cols) over the exact SVD U = Σ σᵢuᵢvᵢᵀ, wᵢ = max(SNRᵢ/(SNRᵢ + c), `SNRW_FLOOR`) (floor default 0); c = 0 gives wᵢ = 1 (exact polar factor, the control).
-     - Noise model of U, refreshed every `SNRW_EVERY` (10) steps from the 8 ranks' local-gradient deviations eᵣ = gᵣ − G/8, mapped through this step's SOAP map: Kronecker factors Ā = κΣᵣeᵣeᵣᵀ, B̄ = κΣᵣeᵣᵀeᵣ (EMA 0.5 over refreshes), E‖Z‖² = tr Ā, κ = f(μ)·8/7 with f(μ) = (1−μ²)² + μ⁴(1−μ)/(1+μ).
-     - Whitened U_w = Ā^{−1/2} U B̄^{−1/2} √E‖Z‖² = Σ σ_j a_j b_jᵀ (noise ≈ iid, unit variance). BBP inversion: ŝ_j² = (B_j + √(B_j² − 4mn))/2 with B_j = σ_j² − (m+n) for σ_j > √m + √n, else 0. Signal estimate Ŝ = Ā^{1/2}(Σ ŝ_j a_j b_jᵀ)B̄^{1/2}/√E‖Z‖².
-     - SNRᵢ = (uᵢᵀŜvᵢ)² / [(uᵢᵀĀuᵢ)(vᵢᵀB̄vᵢ)/E‖Z‖² · √(mn)] (1 = the BBP threshold).
-6. **Damp the radial part:**
+5. **Damp the radial part:**
    - c = ⟨O,W⟩ / ‖W‖²
    - O ← (O − c·W) + s·c·W
    - s = 0.5 when the step would grow ‖W‖ (c < 0), and 1 otherwise.
-7. **RowFloor:** for each output row i, O_i ← max(1, 0.3825·‖W_i‖ / ‖O_i‖)·O_i.
-8. **Radius pin, then cautious weight decay:**
-   - Target norm: r* = ‖W‖ − η·⟨O,W⟩ / ‖W‖
-   - Step: W ← W − η·O, then W ← W · r* / ‖W‖
-   - Decay: W ← W ⊙ (1 − 0.025·η·1[O ⊙ W_old > 0]). The mask is taken from the weights before the step. Skipped on q, k, v, o, fc while their row gains are active (`ROW_GAIN_NO_CWD=1`, the default).
-9. **Update the SOAP statistics with the raw gradient** (used from the next step on):
+6. **RowFloor:** for each output row i, O_i ← max(1, 0.3825·‖W_i‖ / ‖O_i‖)·O_i.
+7. **Step and length control.**
+   - **Before Muon step 1000, and always on mlp.proj: radius pin, then cautious weight decay.**
+     - Target norm: r* = ‖W‖ − η·⟨O,W⟩ / ‖W‖
+     - Step: W ← W − η·O, then W ← W · r* / ‖W‖
+     - Decay: W ← W ⊙ (1 − 0.025·η·1[O ⊙ W_old > 0]). The mask is taken from the weights before the step.
+   - **From Muon step 1000 on q, k, v, attn.proj, mlp.fc: row gains, no decay.**
+     - Angular step per row: W ← W − η·O, then each row is rescaled back to its length before the step, ‖W_i‖.
+     - Each row length then takes its own Adam step:
+       - g_i = ⟨∇W_i, W_i/‖W_i‖⟩, from the raw gradient and the weights before the step;
+       - Adam(β = 0.99, 0.99, bias-corrected);
+       - W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i), a = 0.02.
+     - β₁ ≤ √β₂ keeps m̂/√v̂ bounded.
+8. **Update the SOAP statistics with the raw gradient** (used from the next step on):
    - L ← 0.9·L + 0.1·g·gᵀ
-   - R ← 0.9·R + 0.1·gᵀ·g (skipped in `right` mode)
+   - R ← 0.9·R + 0.1·gᵀ·g
    - Q_L ← qr(L·Q_L) and Q_R ← qr(R·Q_R): one power-iteration step every step, after sorting by eigenvalue.
 
 There is no gradient clipping and no other weight decay.
 
-**Muon learning rate:** η₀ = 0.0375 · m_type.
-- The multipliers m_type are set by `MUON_LR_MULT` = "m_qkv, m_attn.proj, m_mlp", default "1,1,1". #15's ratios are 0.8, 1, 1.2.
-- Each type's PowerCool constant is c·m_type, so η_t = m_type·η_t^(base) and every type starts decaying at the same step.
-- V/O SOAP knobs (env, defaults = rec-46):
-  - `V_GATE=1`: the trust gate of step 4 is also applied on attn.v (default: attn.proj only).
-  - `VO_DENOM_POWER` = p: for attn.v and attn.proj, step 2 divides by V^p instead of V^½ (default 0.5).
-  - `VO_HEAD=1`: step 9's new statistics are masked to the 6 head blocks (128×128) on V's output side (L) and O's input side (R), so those bases are block-diagonal per head.
-- Per-row norm control (Muown #23; env). Default: row gains on q,k,v,o,fc from step 1000 with a = 0.02 (the current record); `ROW_GAIN_LR=0` restores rec-46.
-  - `ROW_PIN=1`: step 8's pin is per row: r*_i = ‖W_i‖ − η⟨O_i,W_i⟩/‖W_i‖ and each row is rescaled to r*_i.
-  - `ROW_GAIN_SCOPE` (types among q,k,v,o,fc,proj; default q,k,v,o,fc) limits the row gains to those matrices (mlp.proj keeps the rec-46 pin); `ROW_GAIN_MODE=matrix` uses one gain per matrix (pure angular step for the whole matrix, g = ⟨∇W, W/‖W‖⟩) instead of one per row.
-  - `ROW_GAIN_START` = t₀ (default 1000): the row gains are used only from step t₀ on (before it, step 8 is the rec-46 pin). `ROW_GAIN_END` = t₁ (default 0 = never): from step t₁ on, step 8 is the rec-46 pin again.
-  - `ROW_GAIN_FIXED=1`: step 8 is the direction-only step per row (r*_i = ‖W_i‖) without the Adam length step, so row lengths change only through CWD (ablation: "drop the radial part" vs "learn the lengths").
-  - `ROW_GAIN_NO_CWD` (default 1): no CWD on those matrices while their row gains are active, i.e. from step 1000 on q, k, v, o, fc only mlp.proj keeps CWD; with `ROW_GAIN_FIXED=1` every row length stays exactly constant. `ROW_GAIN_NO_CWD=0` is the 2665 record.
-  - `ROW_GAIN_LR` = a > 0 (default 0.02): step 8 is purely angular per row (r*_i = ‖W_i‖), then each row norm takes its own Adam step: g_i = ⟨∇W_i, W_i/‖W_i‖⟩ (raw gradient), Adam(β = `ROW_GAIN_BETAS`, bias-corrected), W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i). CWD still follows.
-  - `ROW_GAIN_BETAS`="β₁,β₂" (default 0.99,0.99; 0.9,0.95 = the 2640 record): the betas of that length Adam. β₁ ≤ √β₂ keeps m̂/√v̂ bounded; 0.99,0.95 diverged on 1 of 8 seeds.
-  - `ROW_GAIN_CLIP` = c > 0 (default 0 = off): m̂_i/√v̂_i is clipped to [−c, c]. For β₁ > √β₂ the ratio is unbounded and a row can flip sign (1 − a·ratio < 0).
-  - `ROW_GAIN_COLS` (types, default none; e.g. proj): those matrices get one gain per column (input unit; for mlp.proj, one per MLP neuron) instead of per row: step 8 is purely angular per column and c_j = ‖W_{:,j}‖ takes the Adam step on g_j = ⟨∇W_{:,j}, W_{:,j}/‖W_{:,j}‖⟩. A type is either in `ROW_GAIN_SCOPE` or here.
-  - `ROW_GAIN_KEEP_FRO` (types, default none): after the gain step, those matrices are rescaled to the rec-46 whole-matrix pin's target r* (step 8), so the gains only redistribute length between rows (columns) and cannot change the matrix's total scale.
-- SOAP variants (env, defaults = rec-46; scope `SOAP_*_SCOPE` = all | vo):
-  - `SOAP_SINK=cur|ema`: step 2's P/√V is replaced by √r_i·P_ij·√c_j, with r, c the Sinkhorn scalings (10 iterations) that give r_i B_ij c_j uniform row and column marginals; B = P² (cur, as SinkSOAP #26) or B = V (ema, a factored second moment).
-  - `SOAP_KL=1`: step 9's statistics become KL-SOAP's coupled estimates (#19/#25): L ← 0.9·L + 0.1·G·Q_R·diag(1/λ_R)·Q_Rᵀ·Gᵀ/n and R ← 0.9·R + 0.1·Gᵀ·Q_L·diag(1/λ_L)·Q_Lᵀ·G/m, where λ_L, λ_R are EMAs (0.9) of the row/column energies of Q_Lᵀ·G·Q_R whitened by the other side. The first KL step replaces L and R instead of mixing.
-- Screening only: `VO_VARIANTS=1` also computes V/O SOAP variant directions (per-head statistics, a shared V–O basis, V^¼ denominator, trust gate on V; class `VOVariants`) and records them on probe steps. They are never applied, so the update above is unchanged.
-- V/O ablation knobs (env, default 1 = rec-46): `VO_LR_MULT` multiplies m_type for attn.v and attn.proj (same PowerCool scaling), and `VO_FLOOR_MULT` multiplies their RowFloor target (0.3825 in step 7).
-
-### 2a. Newton-Muon preconditioner K_ℓ
-
-ℓ indexes the input spaces, 4 per block:
-- the shared input of q/k/v (output of norm1);
-- the input of attn.proj (attention output);
-- the input of mlp.fc (output of norm2);
-- the input of mlp.proj (relu² activations), split into 4 blocks of 768.
-
-- **Collect statistics, only on refresh steps** (t + 1 ≡ 0 mod 64). Each layer's `Linear.forward` accumulates C_ℓ = mean over tokens of x·xᵀ for that step's batch. C_ℓ is averaged over ranks and microbatches.
-- **Refresh, at the start of that same step's Muon update:**
-  - Σ_ℓ ← 0.95·Σ_ℓ + 0.05·C_ℓ
-  - K_ℓ = (Σ_ℓ + (δ·tr(Σ_ℓ)/d + 10⁻⁸)·I)⁻¹, computed by Cholesky.
-  - The damping is δ = `NEWTON_DAMPING`, default 0.2 (#15's value). A larger δ makes K_ℓ closer to a scaled identity, i.e. weaker preconditioning.
-  - If the Cholesky fails, K_ℓ = I.
-- **Initial values:** Σ_ℓ = 0.001·I. K_ℓ = I until the first refresh at t = 63, so Newton-Muon has no effect on steps 0–62.
-
 ## 3. Adam groups
 
-- **Embedding and lm_head:** `torch.optim.AdamW`.
+- **Embedding and lm_head:** `torch.optim.AdamW` (fused).
   - β = (0.8, 0.99), ε = 1e-10, no weight decay, standard bias correction.
   - η₀ is 0.3 for the embedding and 1/320 for lm_head.
-  - `HEAD_WD` / `EMBED_WD` (default 0): decoupled weight decay W ← W·(1 − η_t·wd) on lm_head / the embedding.
-  - `NADAM` (comma list of embed, head, aux; default none): Nesterov numerator. For embed/head (class `NAdamW`, otherwise the same bias-corrected AdamW): m̂ = β₁·m_t/(1 − β₁^(t+1)) + (1 − β₁)·g_t/(1 − β₁^t). For aux (all 1-D groups, no bias correction): the step uses β₁·m_t + (1 − β₁)·g_t instead of m_t.
-  - `NAdamW` applies the decay and the step in fp32 with one rounding, as fused AdamW does. Before commit after `f2efd47` it decayed the bf16 embedding separately, which rounds to a no-op at lr·wd = 3e-4, so `EMBED_WD` with `NADAM` ∋ embed/head did nothing.
-  - `MARS` (comma list of muon, embed, head, aux; default none): MARS-approx (Yuan et al. 2024). Before the step, each listed parameter's gradient becomes c_t = g_t + γ·β/(1 − β)·(g_t − g_{t−1}), with g_{t−1} the previous step's gradient (previous batch, so still one forward-backward per step) and β the group's momentum this step (Muon μ, AdamW or 1-D Adam β₁). The optimizer then runs on c_t unchanged. `MARS_GAMMA` = γ (default 0.025). `MARS_CLIP=1` rescales c_t to unit norm per tensor when its norm is above 1. g_{t−1} is not checkpointed, so the first step of a fork is uncorrected.
-  - `AUX_BETA1_TIE` = c > 0 (default 0 = off): each step, the 1-D Adam groups get 1 − β₁(t) = c·(1 − μ(t)), with μ(t) the Muon momentum (0.85 → 0.95 over the first 300 steps, back to 0.85 over the last 200 of the schedule). So the Adam first moment averages over 1/c times as many steps as Muon's. Overrides `AUX_BETA1` and `GAIN_BETA1`.
-  - `KNOB_START` (default 0): keep the 1-D Adam β₁ (`AUX_BETA1`, `GAIN_BETA1`), `HEAD_WD` / `EMBED_WD` and `NADAM` at their defaults (β₁ 0.8, no decay, no Nesterov) until this step, then switch them on. `KNOB_START=50` reproduces in a full run what a fork from a step-50 checkpoint sees.
-  - Head row gains (`HEAD_GAIN_LR` = a > 0, default 0 = off; from step `HEAD_GAIN_START`, default 1000, since lm_head is zero-initialized): with r_i = ‖W_i‖ and g_i = ⟨∇W_i, W_i/r_i⟩ taken before the AdamW step, each row is rescaled back to r_i after it (direction-only step per vocabulary row), then W_i ← W_i·(1 − a·(η_t/η₀)·m̂_i/√v̂_i), Adam on g_i with betas `HEAD_GAIN_BETAS` (default = `ROW_GAIN_BETAS`), bias-corrected. Applied inside EMA-Nesterov's step, before the lookahead accumulation.
-    - `HEAD_GAIN_DRIFT=1`: before the rescale, row i's tangential part D⊥_i of the AdamW step is scaled by r_i/r̃_i, where r̃_i ← √(r̃_i² + ‖D⊥_i‖²) from r̃_i = r_i at the start: the length plain AdamW's tangential steps alone would give the row. The row then turns at the same angle per step as without the gains.
-- **1-D parameters (norm gains and biases):** Adam without bias correction, η₀ = 0.01·a.
+- **1-D parameters (norm gains and biases):** Adam without bias correction, η₀ = 0.01.
   - m ← β₁·m + (1−β₁)·g, with β₁ = 0.8
   - v ← β₂·v + (1−β₂)·g²
   - W ← W − η·m / (√v + 1e-10)
   - β₂ is 0.99 for gains, 0.9965 for the attn.proj bias, and 0.997 for everything else.
-  - Ablation knobs (env), defaults = rec-46: `GAIN_BETA2` (gains' β₂, 0.99), `AUX_BETA1` (β₁ for all 1-D params, 0.8), `GAIN_BETA1` (β₁ for the norm gains only, default `AUX_BETA1`), `AUX_LR_MULT` = a (1.0). a scales the PowerCool constant too, so η_t = a·η_t^(base).
-  - Multi-scale momentum (off by default): `MSM`="α,β₃[,T]" adds a slow gradient EMA, m_s ← β₃·m_s + (1−β₃)·g, and the step becomes W ← W − η·(m + α_t·m_s) / (√v + 1e-10), α_t = α·min(1, n/T) with n the steps since the knob became active (T default 500). `MSM_GROUPS` = `gains` (default) | `bias` (the other two groups) | `all`.
 
 ## 4. Evaluation only: Tail-EMA (training is unaffected)
 
-- For 2100 ≤ t < 2900, every parameter except the token embedding keeps an average: ē ← ē + (W − ē)/200. (env `TAILEMA_START`, `TAILEMA_TAU`, `TAILEMA_LAMBDA`; defaults 2100 / 200 / 0.6; rec-46 used 2400 / 150.)
+- For 2100 ≤ t < 2900, every parameter except the token embedding keeps an average: ē ← ē + (W − ē)/200.
 - Validation is scored on the blend (1 − 0.6)·W + 0.6·ē. This is the reported `val_ema_loss`.
-- Validation runs every 125 steps, at the stop step, and densely every 5 steps over 2650–2690 (`DENSE_VAL`, "lo:hi:stride"), so a run can be scored at the earliest step that passes.
-- Readout lab (`READOUT_LAB=1`, eval only): keeps weight snapshots after `LAB_REF_STEPS` and update-EMAs m_β (β = 0.9, 0.97) of Δθ from `LAB_VEL_START`; at the stop step scores θ_eval = base + γ·(base − θ_ref) and base + γ·m_β, for base = raw W or the Tail-EMA blend, plus a λ grid of the Tail-EMA blend. Results go to `<log>.readout.json`.
+- In `train_gpt.py`, validation runs:
+  - every 125 steps;
+  - at the stop step;
+  - every 5 steps over 2650–2690 (`DENSE_VAL`, "lo:hi:stride"), so a run can be scored at the earliest step that passes.
+
+  `train_gpt_record.py` validates only at the stop step.
 - Checkpoint/fork (`CKPT_STEPS`, `RESUME_FROM`) restores the exact training state above (weights, Muon/SOAP, Adam, EMA-Nesterov, Tail-EMA, data position); it does not change the update.
