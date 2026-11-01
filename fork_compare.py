@@ -80,7 +80,7 @@ def main():
     ap.add_argument("variants", nargs="*", help="variant run-name prefixes (e.g. fork-vgate)")
     ap.add_argument("--parent", default="ckpt-rec46", help="parent run-name prefix (also a control replica)")
     ap.add_argument("--control", default="fork-ctrl", help="control-fork run-name prefix")
-    ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4, 5])
     ap.add_argument("--ks", nargs="+", type=int, default=[1000, 1500, 2000])
     ap.add_argument("--end", type=int, default=2690)
     ap.add_argument("--target", type=float, default=3.28)

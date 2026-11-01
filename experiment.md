@@ -1020,3 +1020,20 @@ Val-loss gap over training (×1e-4): tie −98 / −58 / −23 / −15 / −12 /
   - MARS: +6.6 vs ≈ −14 ± 12.
   
   The full-run effects of β₁ and MARS are all within ±10 steps of zero.
+
+## 2026-11-01 — Three more fork parents (`b99` seeds 3–5)
+
+`b99-s3`, `b99-s4` and `b99-s5` (commit `a37f45f`, the new default, `CKPT_STEPS=50,1000`, stop 2690), with control forks `b99-ctrl-s{3,4,5}-k{50,1000}`. `fork_compare.py` now defaults to `--seeds 0 1 2 3 4 5`. Seeds with no fork are skipped, so old 3-seed results score as before.
+
+| Parent | val_ema@2690 | vs `rgb9999` 16-seed mean (3.27541) | vs same-seed `rgb9999` | Control fork k50 − parent | Control fork k1000 − parent |
+|---|---|---|---|---|---|
+| s0 | 3.27532 | −0.00009 | +0.00020 | +0.00034 | −0.00013 |
+| s1 | 3.27616 | +0.00075 | +0.00229 | +0.00030 | +0.00015 |
+| s2 | 3.27774 | +0.00233 | +0.00451 | −0.00039 | +0.00008 |
+| s3 | 3.27479 | −0.00062 | −0.00123 | −0.00061 | −0.00007 |
+| s4 | 3.27656 | +0.00115 | −0.00119 | +0.00010 | +0.00011 |
+| s5 | 3.27337 | −0.00204 | +0.00003 | −0.00075 | −0.00012 |
+
+- **The parent set is no longer skewed.** The mean of 6 parents is +0.00025 against the 16-seed default; the old 3 were +0.00100. The parents spread with SD 0.0015, about the same as across seeds (0.0013).
+- **The same seed does not reproduce a run.** Same-seed differences (SD 0.0021 over 6 seeds) are as large as differences between seeds. Seed-paired full-run comparisons are therefore effectively unpaired. The paired SEs already reported come from the paired differences, so they remain valid, but pairing by seed gains nothing.
+- **Control forks drift from their parent** by SD ≈ 0.0005 from step 50 and ≈ 0.00012 from step 1000.
