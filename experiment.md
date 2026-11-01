@@ -1003,3 +1003,20 @@ Val-loss gap over training (×1e-4, mean over the seeds that finished):
 - **Both values of c lose.** They show the `sa97` pattern: far ahead early, behind at the end.
 - **c = 0.2 (no Nesterov, no row-gain changes) reproduces `sa97`'s final loss almost exactly** (+46 vs +47). The early damage in `sa97` therefore came from β₁ 0.97 in the first steps, not from Nesterov on the embedding.
 - **Even β₁ 0.91 at step 0 (c = 0.6) costs about +15.** Any c ≤ 0.6 starts above 0.91, because μ(0) = 0.85. So under the tie, the early phase wants β₁ near 0.8 and c near 4/3. That gives 0.8 at step 0 and 0.933 after step 300: the Adam average spans 0.75× as many steps as Muon's.
+
+**`AUX_BETA1_TIE=4/3` and `MARS=muon MARS_GAMMA=0.01` in full runs** (commit `3829c07`, seeds 0–3, stop 2690, paired with `rgb9999`, `WANDB_INIT_TIMEOUT=600`):
+
+| Run | Δ val_ema@2690 (SE) | Seeds | Passes from |
+|---|---|---|---|
+| tie c = 4/3 (β₁ 0.8 → 0.933 over steps 0–300) | −0.00016 (48) | −0.00121 / +0.00055 / +0.00076 / −0.00075 | 2640 |
+| MARS Muon γ 0.01 | +0.00081 (73) | +0.00238 / +0.00027 / +0.00152 / −0.00094 | 2645 |
+
+Val-loss gap over training (×1e-4): tie −98 / −58 / −23 / −15 / −12 / −6 / −3 / −1 at steps 125 / 250 / 500 / 1000 / 1500 / 2000 / 2500 / 2690. MARS 0 / −28 / −3 / −62 / −48 / −26 / −1 / +6.
+
+- **The tie at c = 4/3 no longer shows the early damage.** It is ahead the whole way, but the lead fades to zero by the end. The net effect is about +3 steps ± 8, so neutral.
+- **MARS is ahead mid-run** (−0.006 at step 1000) **and slightly behind at the end.** The fork's +6.6 steps does not carry over.
+- **Forks have now overstated every optimizer change tested in full runs:**
+  - the stack: +27 in forks vs ≈ +9 ± 12 in full runs;
+  - MARS: +6.6 vs ≈ −14 ± 12.
+  
+  The full-run effects of β₁ and MARS are all within ±10 steps of zero.
