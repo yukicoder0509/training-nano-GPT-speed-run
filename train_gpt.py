@@ -94,6 +94,7 @@ READOUT_LAB = os.environ.get("READOUT_LAB", "0") == "1"
 LAB_REF_STEPS = [int(x) for x in os.environ.get("LAB_REF_STEPS", "2000,2200,2375").split(",") if x]
 LAB_EMAS = [tuple(int(v) for v in x.split(":")) for x in
             os.environ.get("LAB_EMAS", "2000:300,2200:150,2200:250,2400:100,2400:250").split(",") if x]
+LAB_LAMBDAS = [float(x) for x in os.environ.get("LAB_LAMBDAS", "0.5,0.6,0.7,0.8").split(",") if x]
 LAB_RRE_K, LAB_RRE_EVERY = 4, 5   # RRE (#34) from the iterates at STOP_STEP - k*every, ..., STOP_STEP
 # Dense validation near the end, "lo:hi:stride" (inclusive), to score a run at the earliest step that passes.
 DENSE_VAL = os.environ.get("DENSE_VAL", "2650:2690:5")
@@ -148,6 +149,17 @@ TAILEMA_END = 2900
 TAILEMA_LAMBDA = float(os.environ.get("TAILEMA_LAMBDA", 0.6))
 # EMA-Nesterov lookahead: the norm gains jump ENA_G_MULT times the global jump, in the global window [300, 1950).
 ENA_G_MULT = float(os.environ.get("ENA_G_MULT", 2.5))
+# River-schedule experiments (docs/RIVER.md). Muon's PowerCool lr = min(lr0, c*(T_end - t)^power): MUON_DECAY_START s
+# and/or MUON_LR_POWER p set c = lr0 / (T_end - s)^p, keeping T_end (unset s = the record's start, step 516).
+# NO_DECAY=muon|all keeps those groups at lr0 for the whole run.
+MUON_DECAY_START = int(os.environ.get("MUON_DECAY_START", 0))
+MUON_LR_POWER = float(os.environ.get("MUON_LR_POWER", FINAL_LR_POWER))
+NO_DECAY = os.environ.get("NO_DECAY", "")
+# Schedule-free (Defazio et al. 2024) around Muon (all hidden matrices), from SF_START (default: the resume step):
+# the gradient is taken at y = (1-SF_BETA)*z + SF_BETA*x, Muon steps the base iterate z, x is the lr^2-weighted average
+# of z (c_t = lr_t^2 / sum lr^2), and validation evaluates x. SF_BETA=0 -> off. Use with NO_DECAY=muon, TAILEMA_TAU=0.
+SF_BETA = float(os.environ.get("SF_BETA", 0))
+SF_START = int(os.environ.get("SF_START", -1))
 # Row gains: from Muon step ROW_GAIN_START, the Muon step on the q/k/v/attn.proj/mlp.fc matrices is purely angular per
 # row and each row length moves by its own bias-corrected Adam (ROW_GAIN_BETAS) on g_i = <grad_i, W_i/|W_i|>:
 # |W_i| *= 1 - ROW_GAIN_LR * (lr/lr0) * adam_i. ROW_GAIN_LR=0 turns them off.
@@ -962,6 +974,14 @@ for group in optimizer3.param_groups:
     group["power_c"] = ADAM_OTHER_POWER_C
 for group in optimizer2.param_groups:
     group["power_c"] = MUON_POWER_C
+    if MUON_DECAY_START or MUON_LR_POWER != FINAL_LR_POWER:
+        s0 = MUON_DECAY_START or FINAL_SCHEDULE_STEPS - (group["initial_lr"] / MUON_POWER_C) ** (1 / FINAL_LR_POWER)
+        group["lr_power"] = MUON_LR_POWER
+        group["power_c"] = group["initial_lr"] / (FINAL_SCHEDULE_STEPS - s0) ** MUON_LR_POWER
+        print0(f"Muon PowerCool: decay from step {s0:.0f}, power {MUON_LR_POWER}, c={group['power_c']:.4e}", console=True)
+for opt in (optimizer2,) if NO_DECAY == "muon" else optimizers[0].inner_optimizer if NO_DECAY == "all" else ():
+    for group in opt.param_groups:
+        group["no_decay"] = True
 
 # learning rate schedule: stable then decay
 def _lr(step, initial_lr, power_c, power=1.0):
@@ -988,6 +1008,35 @@ def _muon_mu_at_step(step, train_steps):
     else:
         return _MU_MAX
 
+# Schedule-free state for the Muon params (SF_BETA > 0): base iterate z and average x in fp32; the live weights are y.
+_sf = None
+_sf_params = [p for g in optimizer2.param_groups for p in g["params"]]
+
+@torch.no_grad()
+def sf_init():
+    global _sf
+    _sf = dict(z=[p.detach().float().clone() for p in _sf_params], x=[p.detach().float().clone() for p in _sf_params],
+               wsum=0.0)
+
+@torch.no_grad()
+def sf_to_z():
+    """Before the inner step: Muon steps the base iterate z. An EMA-Nesterov jump made on y this step moves z too."""
+    jumped = optimizers[0].current_lookahead_stepsize != 0 or optimizers[0].g_active
+    for p, z, x in zip(_sf_params, _sf["z"], _sf["x"]):
+        if jumped:
+            z.add_(p.float() - torch.lerp(z, x, SF_BETA))
+        p.copy_(z.to(p.dtype))
+
+@torch.no_grad()
+def sf_after_step():
+    lr = optimizer2.param_groups[0]["lr"]
+    _sf["wsum"] += lr * lr
+    c = lr * lr / _sf["wsum"]
+    for p, z, x in zip(_sf_params, _sf["z"], _sf["x"]):
+        z.copy_(p.float())
+        x.lerp_(z, c)
+        p.copy_(torch.lerp(z, x, SF_BETA).to(p.dtype))
+
 def set_hparams(step):
     progress = step / FINAL_SCHEDULE_STEPS
     # progress >= 1 is allowed when t_end (FINAL_SCHEDULE_STEPS) < train end: LR is clamped to 0
@@ -996,7 +1045,8 @@ def set_hparams(step):
     mu = _muon_mu_at_step(step, FINAL_TRAIN_STEPS)
     for opt in optimizers[0].inner_optimizer:
         for group in opt.param_groups:
-            group["lr"] = _lr(step, group["initial_lr"], group["power_c"], FINAL_LR_POWER)
+            group["lr"] = group["initial_lr"] if group.get("no_decay") else \
+                _lr(step, group["initial_lr"], group["power_c"], group.get("lr_power", FINAL_LR_POWER))
     for group in optimizer2.param_groups:
         group["mu"] = mu
 
@@ -1022,7 +1072,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_LR", "ROW_GAIN_START", "ROW_GAIN_BETAS", "ENA_G_MULT", "TAILEMA_START", "TAILEMA_TAU",
-             "TAILEMA_LAMBDA")
+             "TAILEMA_LAMBDA", "MUON_DECAY_START", "MUON_LR_POWER", "NO_DECAY", "SF_BETA")
 
 def save_checkpoint(step):
     d = Path(CKPT_DIR) / f"step{step}"
@@ -1148,7 +1198,7 @@ def run_readout_lab(step):
         score(f"tailema lam={lam}", mix(tail, lam))
     base_t = mix(tail, TAILEMA_LAMBDA)
     for (start, tau), e in sorted(_lab_ema.items()):
-        for lam in (0.5, 0.6, 0.7, 0.8):
+        for lam in LAB_LAMBDAS:
             score(f"ema{start}:{tau} lam={lam}", mix(e, lam))
     for r, ref in sorted(_lab_ref.items()):
         for g in (-0.1, -0.075, -0.05, -0.025):
@@ -1650,6 +1700,11 @@ for step in range(RESUME_STEP, train_steps + 1):
         dist.barrier()
         training_time += time.perf_counter() - t0
         model.eval()
+        if _sf is not None:   # schedule-free: evaluate the average x
+            sf_stash = [p.detach().clone() for p in _sf_params]
+            with torch.no_grad():
+                for p, x in zip(_sf_params, _sf["x"]):
+                    p.copy_(x.to(p.dtype))
         val_loss = 0
         with torch.no_grad():
             assert len(val_inputs) % mbs == 0
@@ -1672,6 +1727,10 @@ for step in range(RESUME_STEP, train_steps + 1):
                 dist.all_reduce(val_ema_loss, op=dist.ReduceOp.SUM)
                 val_ema_loss /= val_tokens
                 for p, s in zip(model.parameters(), stash):
+                    p.copy_(s)
+        if _sf is not None:
+            with torch.no_grad():
+                for p, s in zip(_sf_params, sf_stash):
                     p.copy_(s)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} val_ema_loss:{val_ema_loss:.5f} train_time:{training_time:.3f}s"
                + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
@@ -1703,6 +1762,8 @@ for step in range(RESUME_STEP, train_steps + 1):
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
+    if SF_BETA > 0 and _sf is None and step >= (SF_START if SF_START >= 0 else RESUME_STEP):
+        sf_init()
     if traj is not None:
         traj.before_jump()
     optimizers[0].nesterov_step()
@@ -1737,8 +1798,12 @@ for step in range(RESUME_STEP, train_steps + 1):
                         beta=_ena.current_lookahead_stepsize, beta_g=getattr(_ena, "g_beta", 0.0) if _ena.g_active else 0.0,
                         loss=train_loss.item() / inputs.numel())
     H.before_step()
+    if _sf is not None:
+        sf_to_z()
     for opt in optimizers:
         opt.step()
+    if _sf is not None:
+        sf_after_step()
     if snr_on or tsnr_on:
         optimizer2.snr_capture = False
         snr_gathered = snr_gather(snr_local)
