@@ -64,3 +64,28 @@ Control forks reproduce their parents to SD 0.00007 at 2690 (pooled, 3 dof), so 
 - **More lr hurts at once and is never paid back.** `d800` differs from the record only over 514–800, by at most 14 % more Muon lr (5 % at step 625), and it is already behind at step 625 (seed 0: 3.7543 vs 3.7479); it stays behind to 2690. On this stack, the extra steps on the river buy no later progress that offsets the extra noise. The trade-off's best point, if it is not the record's, lies on the other side: earlier or more decay.
 - **Averaging closes about half of the no-decay gap.** Without Muon decay the raw weights are 0.230 worse than the control's readout; the best weight average (the last ≈ 150 steps, λ = 1) recovers 0.114 of it and leaves +0.115. Longer windows (τ 300–800, starts 1500–2000) are worse, i.e. the iterate is moving along the river fast enough that old weights hurt.
 - **Schedule-free (β 0.9) recovers far more than an EMA**, 83 % of the no-decay gap (3.505 → 3.313 vs the decayed 3.275), but is still ≈ 0.038 behind the decayed schedule. β 0.7 is much worse and unstable across seeds (Δ 0.149–0.181). This is new evidence for Track 3: a schedule-free Muon/SOAP without tuning (Muon momentum kept, no warmup re-weighting, lr0 unchanged) does not beat PowerCool + Tail-EMA here.
+
+### Schedule-free, round 2: no base momentum, early iterates discounted (2026-11-02)
+
+Commit `9fc98d3`: `SF_MU0=1` sets Muon's momentum to 0 while schedule-free is on (pure schedule-free has no base momentum); `SF_R=r` weights the average by t^r · lr² (t from the schedule-free start), so r > 0 discounts the early iterates. All arms β 0.9, Muon flat, same step-500 forks and controls.
+
+| Arm | Muon momentum | r | Δ val at 2690 ± SE |
+|---|---|---|---|
+| `sf90` (round 1) | 0.95 | 0 | +0.03797 ± 0.00074 |
+| `sf90-m0` | 0 | 0 | +0.13386 ± 0.00179 |
+| `sf90-m0-r1` | 0 | 1 | +0.08470 ± 0.00014 |
+| `sf90-m0-r2` | 0 | 2 | +0.07637 ± 0.00016 |
+| `sf90-r2` | 0.95 | 2 | +0.06702 ± 0.00067 |
+
+val of x, mean of 3 seeds (control: its Tail-EMA readout):
+
+| Step | 1000 | 1500 | 2000 | 2500 | 2690 |
+|---|---|---|---|---|---|
+| control | 3.6225 | 3.5068 | 3.3894 | 3.2885 | 3.2753 |
+| `sf90` | **3.5404** | **3.4545** | **3.3793** | 3.3258 | 3.3132 |
+| `sf90-m0` | 3.5731 | 3.5796 | 3.5563 | 3.4422 | 3.4091 |
+| `sf90-m0-r2` | 3.5502 | 3.4853 | 3.4180 | 3.3652 | 3.3516 |
+| `sf90-r2` | 3.5999 | 3.4938 | 3.4088 | 3.3526 | 3.3423 |
+
+- **Both "fairer" changes make it worse.** Without Muon momentum, schedule-free stalls (x barely moves from 1000 to 2000, 3.573 → 3.556); discounting the early iterates helps that arm (+0.134 → +0.076) but not enough. With momentum kept, r = 2 is worse than r = 0 (+0.067 vs +0.038). On this stack Muon/SOAP's momentum is doing work the y-interpolation does not replace, and the long uniform average is the useful part.
+- **Schedule-free is ahead of the decayed schedule until ≈ step 2000** (`sf90`: −0.082 at 1000, −0.052 at 1500, −0.010 at 2000) and loses only in the last ≈ 600 steps, where the decay settles the weights and the Tail-EMA readout kicks in. So schedule-free does buy the "river" progress early; what it lacks is the final settle. A hybrid (schedule-free with flat lr, then a short decay at the end, starting from z or from x) is the natural next test; it is not run here.
