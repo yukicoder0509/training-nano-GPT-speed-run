@@ -89,3 +89,31 @@ val of x, mean of 3 seeds (control: its Tail-EMA readout):
 
 - **Both "fairer" changes make it worse.** Without Muon momentum, schedule-free stalls (x barely moves from 1000 to 2000, 3.573 → 3.556); discounting the early iterates helps that arm (+0.134 → +0.076) but not enough. With momentum kept, r = 2 is worse than r = 0 (+0.067 vs +0.038). On this stack Muon/SOAP's momentum is doing work the y-interpolation does not replace, and the long uniform average is the useful part.
 - **Schedule-free is ahead of the decayed schedule until ≈ step 2000** (`sf90`: −0.082 at 1000, −0.052 at 1500, −0.010 at 2000) and loses only in the last ≈ 600 steps, where the decay settles the weights and the Tail-EMA readout kicks in. So schedule-free does buy the "river" progress early; what it lacks is the final settle. A hybrid (schedule-free with flat lr, then a short decay at the end, starting from z or from x) is the natural next test; it is not run here.
+
+### Schedule-free → decay hybrid (2026-11-02)
+
+Commit `9c5cdcb`: `SF_END=T` stops schedule-free at the top of step T, sets the Muon weights to x (`SF_END_FROM=x`) or z, resets EMA-Nesterov's previous weights to them, and lets Muon decay from there (`MUON_DECAY_START`, `MUON_LR_POWER`); the usual Tail-EMA 2100/200/0.6 is the readout. Before the switch every arm is `sf90` (β 0.9, Muon momentum kept, flat lr). Same step-500 forks and controls.
+
+| Arm | Switch | Weights from | Muon lr after the switch | lr at 2690 | Δ val_ema at 2690 ± SE |
+|---|---|---|---|---|---|
+| `sf90` (no switch) | — | — | flat | 1 | +0.03797 ± 0.00074 |
+| `hyb-x2000p2` | 2000 | x | 1 → 0, power 2 | 0.054 | +0.05189 ± 0.00011 |
+| `hyb-x2000p3` | 2000 | x | 1 → 0, power 3 | 0.013 | +0.05060 ± 0.00004 |
+| `hyb-x1700p2` | 1700 | x | 1 → 0, power 2 | 0.031 | +0.03745 ± 0.00015 |
+| `hyb-z2000p2` | 2000 | z | 1 → 0, power 2 | 0.054 | +0.31566 ± 0.00113 |
+| `hyb-x2000drop` | 2000 | x | 0.36 at the switch, power 2 | 0.020 | **+0.02118 ± 0.00005** |
+
+val_ema, mean of 3 seeds:
+
+| Step | 1750 | 2000 | 2125 | 2250 | 2500 | 2690 |
+|---|---|---|---|---|---|---|
+| control | 3.4494 | 3.3894 | 3.3491 | 3.3175 | 3.2885 | **3.2753** |
+| `sf90` | 3.4198 | 3.3793 | 3.3599 | 3.3458 | 3.3258 | 3.3132 |
+| `hyb-x2000p2` | 3.4198 | 3.3793 | 3.4951 | 3.4214 | 3.3548 | 3.3272 |
+| `hyb-x1700p2` | 3.6064 | 3.4981 | 3.4236 | 3.3739 | 3.3296 | 3.3127 |
+| `hyb-z2000p2` | 3.4205 | 3.3796 | 4.3980 | 4.0399 | 3.6953 | 3.5909 |
+| `hyb-x2000drop` | 3.4195 | 3.3794 | 3.3788 | 3.3405 | 3.3087 | 3.2964 |
+
+- **No hybrid beats the decayed schedule.** The best, switching to x at 2000 with the lr dropped to 0.36, ends +0.021 (≈ 360 steps) behind; switching at full lr is worse than not switching at all.
+- **x's lead cannot be cashed in by training from it.** Right after the switch the loss jumps (x at 2000: 3.379; 125 steps later 3.495 at full lr, 3.379 with the drop): x is an average that sits off the trajectory, Muon's momentum and SOAP statistics belong to z, and at a high lr the weights return to the noisy level of the iterate within a few dozen steps. z itself is far off (4.40 at 2125), so schedule-free's z travels much further than a normally trained iterate.
+- **So schedule-free's mid-run lead is a readout effect**, like a weight average of the decayed run would be (the control's raw weights are what the 2000 comparison uses), not progress that the final settle can build on. On this stack the PowerCool decay with the Tail-EMA readout remains the best schedule tested; every alternative here (later, slower, absent, schedule-free, or hybrid) loses.
