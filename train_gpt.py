@@ -160,6 +160,10 @@ NO_DECAY = os.environ.get("NO_DECAY", "")
 # of z (c_t = lr_t^2 / sum lr^2), and validation evaluates x. SF_BETA=0 -> off. Use with NO_DECAY=muon, TAILEMA_TAU=0.
 SF_BETA = float(os.environ.get("SF_BETA", 0))
 SF_START = int(os.environ.get("SF_START", -1))
+# SF_MU0=1: Muon momentum 0 while schedule-free is on (pure schedule-free has no base momentum). SF_R=r: polynomial
+# weighting of the average, c_t = w_t / sum w with w_t = t^r * lr_t^2, t counted from SF start (r = 0: lr^2 only).
+SF_MU0 = os.environ.get("SF_MU0", "0") == "1"
+SF_R = float(os.environ.get("SF_R", 0))
 # Row gains: from Muon step ROW_GAIN_START, the Muon step on the q/k/v/attn.proj/mlp.fc matrices is purely angular per
 # row and each row length moves by its own bias-corrected Adam (ROW_GAIN_BETAS) on g_i = <grad_i, W_i/|W_i|>:
 # |W_i| *= 1 - ROW_GAIN_LR * (lr/lr0) * adam_i. ROW_GAIN_LR=0 turns them off.
@@ -1016,7 +1020,7 @@ _sf_params = [p for g in optimizer2.param_groups for p in g["params"]]
 def sf_init():
     global _sf
     _sf = dict(z=[p.detach().float().clone() for p in _sf_params], x=[p.detach().float().clone() for p in _sf_params],
-               wsum=0.0)
+               wsum=0.0, t=0)
 
 @torch.no_grad()
 def sf_to_z():
@@ -1030,8 +1034,10 @@ def sf_to_z():
 @torch.no_grad()
 def sf_after_step():
     lr = optimizer2.param_groups[0]["lr"]
-    _sf["wsum"] += lr * lr
-    c = lr * lr / _sf["wsum"]
+    _sf["t"] += 1
+    w = _sf["t"] ** SF_R * lr * lr
+    _sf["wsum"] += w
+    c = w / _sf["wsum"]
     for p, z, x in zip(_sf_params, _sf["z"], _sf["x"]):
         z.copy_(p.float())
         x.lerp_(z, c)
@@ -1048,7 +1054,7 @@ def set_hparams(step):
             group["lr"] = group["initial_lr"] if group.get("no_decay") else \
                 _lr(step, group["initial_lr"], group["power_c"], group.get("lr_power", FINAL_LR_POWER))
     for group in optimizer2.param_groups:
-        group["mu"] = mu
+        group["mu"] = 0.0 if _sf is not None and SF_MU0 else mu
 
 
 
@@ -1072,7 +1078,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_LR", "ROW_GAIN_START", "ROW_GAIN_BETAS", "ENA_G_MULT", "TAILEMA_START", "TAILEMA_TAU",
-             "TAILEMA_LAMBDA", "MUON_DECAY_START", "MUON_LR_POWER", "NO_DECAY", "SF_BETA")
+             "TAILEMA_LAMBDA", "MUON_DECAY_START", "MUON_LR_POWER", "NO_DECAY", "SF_BETA", "SF_MU0", "SF_R")
 
 def save_checkpoint(step):
     d = Path(CKPT_DIR) / f"step{step}"
