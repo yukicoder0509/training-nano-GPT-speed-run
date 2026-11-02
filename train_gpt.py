@@ -164,6 +164,10 @@ SF_START = int(os.environ.get("SF_START", -1))
 # weighting of the average, c_t = w_t / sum w with w_t = t^r * lr_t^2, t counted from SF start (r = 0: lr^2 only).
 SF_MU0 = os.environ.get("SF_MU0", "0") == "1"
 SF_R = float(os.environ.get("SF_R", 0))
+# Hybrid: at the top of step SF_END schedule-free stops, the Muon weights become SF_END_FROM (x = the average, or z),
+# and Muon's lr decays from there with MUON_DECAY_START / MUON_LR_POWER (set MUON_DECAY_START = SF_END). 0 = never.
+SF_END = int(os.environ.get("SF_END", 0))
+SF_END_FROM = os.environ.get("SF_END_FROM", "x")
 # Row gains: from Muon step ROW_GAIN_START, the Muon step on the q/k/v/attn.proj/mlp.fc matrices is purely angular per
 # row and each row length moves by its own bias-corrected Adam (ROW_GAIN_BETAS) on g_i = <grad_i, W_i/|W_i|>:
 # |W_i| *= 1 - ROW_GAIN_LR * (lr/lr0) * adam_i. ROW_GAIN_LR=0 turns them off.
@@ -1043,6 +1047,20 @@ def sf_after_step():
         x.lerp_(z, c)
         p.copy_(torch.lerp(z, x, SF_BETA).to(p.dtype))
 
+@torch.no_grad()
+def sf_end():
+    """Leave schedule-free: weights <- x (or z), Muon decays from now on; EMA-Nesterov's previous weights follow the
+    switch so it does not count it as a step."""
+    global _sf
+    for p, w in zip(_sf_params, _sf[SF_END_FROM]):
+        p.copy_(w.to(p.dtype))
+        prev = optimizers[0].state[p]["prev_params"]
+        prev[0].copy_(p)
+    for group in optimizer2.param_groups:
+        group["no_decay"] = False
+    _sf = None
+    print0(f"schedule-free off at step {SF_END}: weights <- {SF_END_FROM}, Muon decays from here", console=True)
+
 def set_hparams(step):
     progress = step / FINAL_SCHEDULE_STEPS
     # progress >= 1 is allowed when t_end (FINAL_SCHEDULE_STEPS) < train end: LR is clamped to 0
@@ -1078,7 +1096,7 @@ H = harness.Harness(model, optimizers, logfile if dist.get_rank() == 0 else None
 pname = {p: n for n, p in model.named_parameters()}
 p_of = {n: p for n, p in model.named_parameters()}
 _ckpt_env = ("ROW_GAIN_LR", "ROW_GAIN_START", "ROW_GAIN_BETAS", "ENA_G_MULT", "TAILEMA_START", "TAILEMA_TAU",
-             "TAILEMA_LAMBDA", "MUON_DECAY_START", "MUON_LR_POWER", "NO_DECAY", "SF_BETA", "SF_MU0", "SF_R")
+             "TAILEMA_LAMBDA", "MUON_DECAY_START", "MUON_LR_POWER", "NO_DECAY", "SF_BETA", "SF_MU0", "SF_R", "SF_END", "SF_END_FROM")
 
 def save_checkpoint(step):
     d = Path(CKPT_DIR) / f"step{step}"
@@ -1768,8 +1786,10 @@ for step in range(RESUME_STEP, train_steps + 1):
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
-    if SF_BETA > 0 and _sf is None and step >= (SF_START if SF_START >= 0 else RESUME_STEP):
+    if SF_BETA > 0 and _sf is None and (SF_START if SF_START >= 0 else RESUME_STEP) <= step < (SF_END or 1 << 30):
         sf_init()
+    if _sf is not None and step == SF_END:
+        sf_end()
     if traj is not None:
         traj.before_jump()
     optimizers[0].nesterov_step()
