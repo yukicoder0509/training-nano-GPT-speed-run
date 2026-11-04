@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96  # 12 per GPU (partition max)
 #SBATCH --gpus-per-node=8
-#SBATCH --exclude=25a-hgpn001,25a-hgpn003,25a-hgpn062,25a-hgpn157  # hgpn062: a rank saw 7 GPUs (job 618348)
+#SBATCH --exclude=25a-hgpn001,25a-hgpn003,25a-hgpn039,25a-hgpn062,25a-hgpn083,25a-hgpn157  # hgpn062: a rank saw 7 GPUs (job 618348); hgpn039, hgpn083: ~2.6x slower on every run
 #SBATCH --time=6:00:00
 #SBATCH --output=logs/%x-%j.out
 
